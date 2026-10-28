@@ -1,1 +1,7 @@
 /target
+/.cargo/
+.env
+.env.*
+!.env.example
+*.log
+/data/

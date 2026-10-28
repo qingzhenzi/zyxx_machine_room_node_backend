@@ -1,0 +1,61 @@
+// Grafana Alloy：通过 Docker API 读取容器 stdout，推送到 Loki。
+logging {
+  level = "info"
+}
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "filter" {
+  targets = discovery.docker.containers.targets
+
+  // 只采集本 compose 项目的容器；项目名在 compose.yaml 中固定为 qestudio。
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = "qestudio"
+    action        = "keep"
+  }
+
+  // 不采集 Alloy 自己：Loki 不可用时 Alloy 会不断打印推送错误，
+  // 若再把这些错误采集回 Loki 会形成回环。排查 Alloy 用 docker logs。
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "alloy"
+    action        = "drop"
+  }
+}
+
+discovery.relabel "labels" {
+  targets = discovery.relabel.filter.output
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_log_stream"]
+    target_label  = "stream"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.relabel.filter.output
+  relabel_rules = discovery.relabel.labels.rules
+  labels        = {"job" = "docker"}
+  forward_to    = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

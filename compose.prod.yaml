@@ -1,0 +1,13 @@
+# 生产环境覆盖文件：使用 CI 推送的镜像，不再本地构建，也不暴露数据库端口。
+# 用法：docker compose -f compose.yaml -f compose.prod.yaml pull
+#       docker compose -f compose.yaml -f compose.prod.yaml up -d
+services:
+  api:
+    build: !reset null
+    image: ${BACKEND_IMAGE:?请设置 BACKEND_IMAGE，例如 registry.example.com/team/backend:latest}
+
+  postgres:
+    ports: !reset []
+
+  redis:
+    ports: !reset []

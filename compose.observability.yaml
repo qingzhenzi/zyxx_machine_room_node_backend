@@ -1,0 +1,79 @@
+# 可选可观测性栈：默认不启动，只有显式带 --profile observability 才生效。
+#
+#   docker compose -f compose.yaml -f compose.observability.yaml --profile observability up -d
+#
+# 不想要时：
+#   docker compose -f compose.yaml -f compose.observability.yaml --profile observability stop loki alloy grafana
+name: qestudio
+
+x-observability-logging: &observability-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  loki:
+    image: ${LOKI_IMAGE:-grafana/loki:3.6.2}
+    profiles: ["observability"]
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./deploy/observability/loki.yaml:/etc/loki/config.yaml:ro
+      - lokidata:/loki
+    ports:
+      - "127.0.0.1:${LOKI_PORT:-3100}:3100"
+    restart: unless-stopped
+    logging: *observability-logging
+    networks:
+      - backend
+
+  alloy:
+    image: ${ALLOY_IMAGE:-grafana/alloy:v1.21.2}
+    profiles: ["observability"]
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - --disable-reporting
+      - /etc/alloy/config.alloy
+    volumes:
+      # Alloy 通过 Docker API 直接读取容器日志，不需要访问 docker 数据目录。
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./deploy/observability/alloy.alloy:/etc/alloy/config.alloy:ro
+      - alloydata:/var/lib/alloy/data
+    ports:
+      - "127.0.0.1:${ALLOY_PORT:-12345}:12345"
+    depends_on:
+      loki:
+        condition: service_started
+    restart: unless-stopped
+    logging: *observability-logging
+    networks:
+      - backend
+
+  grafana:
+    image: ${GRAFANA_IMAGE:-grafana/grafana:13.2.5}
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./deploy/observability/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/loki.yaml:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      loki:
+        condition: service_started
+    restart: unless-stopped
+    logging: *observability-logging
+    networks:
+      - backend
+
+volumes:
+  lokidata:
+  alloydata:
+  grafanadata:

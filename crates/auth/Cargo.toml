@@ -1,0 +1,18 @@
+[package]
+name = "qe-auth"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "QEStudio 认证原语：密码哈希、JWT、刷新令牌会话、权限判定"
+
+[dependencies]
+argon2 = "0.5"
+chrono = "0.4"
+hex = "0.4"
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }

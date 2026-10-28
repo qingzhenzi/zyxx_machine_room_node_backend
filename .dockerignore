@@ -1,0 +1,13 @@
+target
+.git
+.gitignore
+.gitea
+.cargo
+.env
+.env.*
+!.env.example
+deploy
+compose.yaml
+compose.prod.yaml
+README.md
+Makefile
