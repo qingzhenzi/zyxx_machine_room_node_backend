@@ -2,7 +2,7 @@
 //!
 //! 这个 crate 只依赖算法与存储抽象，**不认识** Axum、PostgreSQL、业务实体和
 //! `AppState`。存储侧通过 [`session::TokenStore`] 与 [`permission::PermissionCache`]、
-//! [`permission::PermissionSource`] 三个端口接入，具体实现留在 `backend`。
+//! [`permission::PermissionSource`] 三个端口接入，具体实现分别在 `qe-cache` 与 `qe-db`。
 //!
 //! 这样做的目的不是「为了拆而拆」，而是让认证代码无法反向依赖业务代码：
 //! 哪天真要把它独立成服务，替换端口实现即可，不需要重写内部逻辑。

@@ -2,11 +2,10 @@ use std::{fmt, str::FromStr};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 use uuid::Uuid;
 
 /// 用户实体。`password_hash` 只用于服务端校验，不会出现在任何 API 响应中。
-#[derive(Clone, FromRow)]
+#[derive(Clone)]
 pub struct User {
     pub id: Uuid,
     pub username: String,
@@ -18,7 +17,7 @@ pub struct User {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, FromRow)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UserSummary {
     pub id: Uuid,
     pub username: String,
@@ -42,7 +41,7 @@ pub struct UserProfile {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, FromRow)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Role {
     pub id: Uuid,
     pub code: String,
@@ -53,7 +52,7 @@ pub struct Role {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, FromRow)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RoleSummary {
     pub id: Uuid,
     pub code: String,
@@ -65,7 +64,7 @@ pub struct RoleSummary {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, FromRow)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Permission {
     pub id: Uuid,
     pub code: String,
@@ -74,9 +73,7 @@ pub struct Permission {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "text")]
-#[sqlx(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AnnouncementStatus {
     Draft,
@@ -113,7 +110,7 @@ impl FromStr for AnnouncementStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, FromRow)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Announcement {
     pub id: Uuid,
     pub title: String,

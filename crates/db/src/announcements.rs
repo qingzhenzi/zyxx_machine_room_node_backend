@@ -1,10 +1,9 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{
-    domain::models::{Announcement, AnnouncementStatus, Page},
-    error::AppResult,
-};
+use qe_domain::models::{Announcement, AnnouncementStatus, Page};
+
+use crate::{error::DbResult, rows::AnnouncementRow};
 
 #[derive(Clone)]
 pub struct AnnouncementRepo {
@@ -22,8 +21,9 @@ impl AnnouncementRepo {
         keyword: &str,
         page: i64,
         page_size: i64,
-    ) -> AppResult<Page<Announcement>> {
+    ) -> DbResult<Page<Announcement>> {
         let offset = (page - 1) * page_size;
+        let status = status.map(AnnouncementStatus::as_str);
 
         let total: i64 = sqlx::query_scalar(
             "SELECT count(*)
@@ -38,7 +38,7 @@ impl AnnouncementRepo {
         .fetch_one(&self.db)
         .await?;
 
-        let items = sqlx::query_as::<_, Announcement>(
+        let rows = sqlx::query_as::<_, AnnouncementRow>(
             "SELECT a.id,
                     a.title,
                     a.content,
@@ -64,12 +64,13 @@ impl AnnouncementRepo {
         .bind(offset)
         .fetch_all(&self.db)
         .await?;
+        let items = rows.into_iter().map(Announcement::from).collect();
 
         Ok(Page::new(items, total, page, page_size))
     }
 
-    pub async fn get(&self, id: Uuid) -> AppResult<Option<Announcement>> {
-        Ok(sqlx::query_as::<_, Announcement>(
+    pub async fn get(&self, id: Uuid) -> DbResult<Option<Announcement>> {
+        let row = sqlx::query_as::<_, AnnouncementRow>(
             "SELECT a.id,
                     a.title,
                     a.content,
@@ -86,7 +87,8 @@ impl AnnouncementRepo {
         )
         .bind(id)
         .fetch_optional(&self.db)
-        .await?)
+        .await?;
+        Ok(row.map(Announcement::from))
     }
 
     pub async fn create(
@@ -96,8 +98,8 @@ impl AnnouncementRepo {
         content: &str,
         status: AnnouncementStatus,
         is_pinned: bool,
-    ) -> AppResult<Announcement> {
-        Ok(sqlx::query_as::<_, Announcement>(
+    ) -> DbResult<Announcement> {
+        let row = sqlx::query_as::<_, AnnouncementRow>(
             "WITH inserted AS (
                 INSERT INTO announcements (title, content, status, is_pinned, author_id, published_at)
                 VALUES (
@@ -125,11 +127,12 @@ impl AnnouncementRepo {
         )
         .bind(title)
         .bind(content)
-        .bind(status)
+        .bind(status.as_str())
         .bind(is_pinned)
         .bind(author_id)
         .fetch_one(&self.db)
-        .await?)
+        .await?;
+        Ok(Announcement::from(row))
     }
 
     pub async fn update(
@@ -139,8 +142,8 @@ impl AnnouncementRepo {
         content: Option<&str>,
         is_pinned: Option<bool>,
         status: Option<AnnouncementStatus>,
-    ) -> AppResult<Option<Announcement>> {
-        Ok(sqlx::query_as::<_, Announcement>(
+    ) -> DbResult<Option<Announcement>> {
+        let row = sqlx::query_as::<_, AnnouncementRow>(
             "WITH updated AS (
                 UPDATE announcements SET
                     title = COALESCE($2, title),
@@ -171,12 +174,13 @@ impl AnnouncementRepo {
         .bind(title)
         .bind(content)
         .bind(is_pinned)
-        .bind(status)
+        .bind(status.map(AnnouncementStatus::as_str))
         .fetch_optional(&self.db)
-        .await?)
+        .await?;
+        Ok(row.map(Announcement::from))
     }
 
-    pub async fn delete(&self, id: Uuid) -> AppResult<bool> {
+    pub async fn delete(&self, id: Uuid) -> DbResult<bool> {
         let deleted = sqlx::query("DELETE FROM announcements WHERE id = $1")
             .bind(id)
             .execute(&self.db)

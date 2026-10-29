@@ -1,7 +1,7 @@
 use crate::{
     auth::{authorization, password},
     domain::{rbac::roles, validation},
-    error::{AppError, AppResult},
+    error::AppResult,
     state::AppState,
 };
 
@@ -51,10 +51,10 @@ pub async fn ensure_bootstrap_admin(state: &AppState) -> AppResult<()> {
             );
         }
         // 多副本同时启动时另一个副本可能已经创建成功。
-        Err(AppError::Conflict(_)) => {
+        Err(crate::db::DbError::Conflict(_)) => {
             tracing::info!(%username, "引导管理员已被其他副本创建，跳过");
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     }
 
     Ok(())

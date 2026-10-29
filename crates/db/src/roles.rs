@@ -1,9 +1,11 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use qe_domain::models::{Permission, Role, RoleSummary};
+
 use crate::{
-    domain::models::{Permission, Role, RoleSummary},
-    error::{AppError, AppResult},
+    error::{DbError, DbResult},
+    rows::{PermissionRow, RoleRow, RoleSummaryRow},
 };
 
 #[derive(Clone)]
@@ -16,8 +18,8 @@ impl RoleRepo {
         Self { db }
     }
 
-    pub async fn list(&self) -> AppResult<Vec<RoleSummary>> {
-        Ok(sqlx::query_as::<_, RoleSummary>(
+    pub async fn list(&self) -> DbResult<Vec<RoleSummary>> {
+        let rows = sqlx::query_as::<_, RoleSummaryRow>(
             "SELECT r.id,
                     r.code,
                     r.name,
@@ -37,11 +39,12 @@ impl RoleRepo {
              ORDER BY r.is_system DESC, r.code",
         )
         .fetch_all(&self.db)
-        .await?)
+        .await?;
+        Ok(rows.into_iter().map(RoleSummary::from).collect())
     }
 
-    pub async fn find_summary(&self, id: Uuid) -> AppResult<Option<RoleSummary>> {
-        Ok(sqlx::query_as::<_, RoleSummary>(
+    pub async fn find_summary(&self, id: Uuid) -> DbResult<Option<RoleSummary>> {
+        let row = sqlx::query_as::<_, RoleSummaryRow>(
             "SELECT r.id,
                     r.code,
                     r.name,
@@ -62,33 +65,31 @@ impl RoleRepo {
         )
         .bind(id)
         .fetch_optional(&self.db)
-        .await?)
+        .await?;
+        Ok(row.map(RoleSummary::from))
     }
 
-    pub async fn find_by_code(&self, code: &str) -> AppResult<Option<Role>> {
-        Ok(
-            sqlx::query_as::<_, Role>("SELECT * FROM roles WHERE code = $1")
-                .bind(code)
-                .fetch_optional(&self.db)
-                .await?,
-        )
+    pub async fn find_by_code(&self, code: &str) -> DbResult<Option<Role>> {
+        let row = sqlx::query_as::<_, RoleRow>("SELECT * FROM roles WHERE code = $1")
+            .bind(code)
+            .fetch_optional(&self.db)
+            .await?;
+        Ok(row.map(Role::from))
     }
 
-    pub async fn find_by_id(&self, id: Uuid) -> AppResult<Option<Role>> {
-        Ok(
-            sqlx::query_as::<_, Role>("SELECT * FROM roles WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.db)
-                .await?,
-        )
+    pub async fn find_by_id(&self, id: Uuid) -> DbResult<Option<Role>> {
+        let row = sqlx::query_as::<_, RoleRow>("SELECT * FROM roles WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.db)
+            .await?;
+        Ok(row.map(Role::from))
     }
 
-    pub async fn list_permissions(&self) -> AppResult<Vec<Permission>> {
-        Ok(
-            sqlx::query_as::<_, Permission>("SELECT * FROM permissions ORDER BY code")
-                .fetch_all(&self.db)
-                .await?,
-        )
+    pub async fn list_permissions(&self) -> DbResult<Vec<Permission>> {
+        let rows = sqlx::query_as::<_, PermissionRow>("SELECT * FROM permissions ORDER BY code")
+            .fetch_all(&self.db)
+            .await?;
+        Ok(rows.into_iter().map(Permission::from).collect())
     }
 
     pub async fn create(
@@ -97,10 +98,10 @@ impl RoleRepo {
         name: &str,
         description: &str,
         permission_codes: &[String],
-    ) -> AppResult<RoleSummary> {
+    ) -> DbResult<RoleSummary> {
         let mut transaction = self.db.begin().await?;
 
-        let role = sqlx::query_as::<_, Role>(
+        let row = sqlx::query_as::<_, RoleRow>(
             "INSERT INTO roles (code, name, description, is_system)
              VALUES ($1, $2, $3, FALSE)
              RETURNING *",
@@ -110,6 +111,7 @@ impl RoleRepo {
         .bind(description)
         .fetch_one(&mut *transaction)
         .await?;
+        let role = Role::from(row);
 
         if !permission_codes.is_empty() {
             let inserted = sqlx::query(
@@ -125,21 +127,21 @@ impl RoleRepo {
 
             if inserted != permission_codes.len() as u64 {
                 transaction.rollback().await?;
-                return Err(AppError::bad_request("包含不存在的权限"));
+                return Err(DbError::bad_request("包含不存在的权限"));
             }
         }
 
         transaction.commit().await?;
         self.find_summary(role.id)
             .await?
-            .ok_or_else(|| AppError::internal("创建角色后无法读取角色信息"))
+            .ok_or_else(|| DbError::internal("创建角色后无法读取角色信息"))
     }
 
     pub async fn set_permissions(
         &self,
         role_id: Uuid,
         permission_codes: &[String],
-    ) -> AppResult<()> {
+    ) -> DbResult<()> {
         let mut transaction = self.db.begin().await?;
 
         sqlx::query("DELETE FROM role_permissions WHERE role_id = $1")
@@ -161,7 +163,7 @@ impl RoleRepo {
 
             if inserted != permission_codes.len() as u64 {
                 transaction.rollback().await?;
-                return Err(AppError::bad_request("包含不存在的权限"));
+                return Err(DbError::bad_request("包含不存在的权限"));
             }
         }
 
@@ -170,7 +172,7 @@ impl RoleRepo {
     }
 
     /// 返回是否真的删除了记录。系统角色由调用方拦截。
-    pub async fn delete(&self, role_id: Uuid) -> AppResult<bool> {
+    pub async fn delete(&self, role_id: Uuid) -> DbResult<bool> {
         let deleted = sqlx::query("DELETE FROM roles WHERE id = $1 AND is_system = FALSE")
             .bind(role_id)
             .execute(&self.db)
@@ -180,7 +182,7 @@ impl RoleRepo {
     }
 
     /// 保证系统管理员角色始终拥有当前全部权限（包括后续迁移新增的权限）。
-    pub async fn grant_all_permissions_to_admin(&self) -> AppResult<u64> {
+    pub async fn grant_all_permissions_to_admin(&self) -> DbResult<u64> {
         let inserted = sqlx::query(
             "INSERT INTO role_permissions (role_id, permission_id)
              SELECT r.id, p.id

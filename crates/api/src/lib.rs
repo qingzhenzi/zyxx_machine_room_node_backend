@@ -2,16 +2,19 @@ pub mod api;
 pub mod auth;
 pub mod bootstrap;
 pub mod config;
-pub mod domain;
 pub mod error;
-pub mod infra;
 pub mod state;
+
+// qe-api 作为 HTTP/装配层依赖下层 crate，而不是反过来。
+pub use qe_cache as cache;
+pub use qe_db as db;
+pub use qe_domain as domain;
 
 use anyhow::Context;
 use tokio::net::TcpListener;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{config::Config, state::AppState};
+use crate::{cache::Cache, config::Config, db::Db, state::AppState};
 
 /// 启动入口：加载配置 → 连接依赖 → 迁移/引导 → 启动 HTTP 服务。
 pub async fn run() -> anyhow::Result<()> {
@@ -22,18 +25,16 @@ pub async fn run() -> anyhow::Result<()> {
 
     tracing::info!(addr = %config.bind_addr, "正在启动 backend");
 
-    let db = infra::db::connect(&config.database_url, config.db_max_connections)
+    let db = Db::connect(&config.database_url, config.db_max_connections)
         .await
         .context("连接 PostgreSQL 失败")?;
 
     if config.run_migrations {
-        infra::db::migrate(&db)
-            .await
-            .context("执行数据库迁移失败")?;
+        db.migrate().await.context("执行数据库迁移失败")?;
         tracing::info!("数据库迁移完成");
     }
 
-    let cache = infra::cache::Cache::connect(&config.redis_url)
+    let cache = Cache::connect(&config.redis_url)
         .await
         .context("连接 Redis 失败")?;
 

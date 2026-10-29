@@ -20,48 +20,66 @@
 | 可观测性 | trace_id + JSON 日志；可选 Alloy/Loki/Grafana | 默认轻量，需要时用 profile 启用采集 |
 | 部署 | Docker Compose + nginx | 2 个 API 副本，`least_conn` + Docker DNS 动态发现 |
 
-### 工作区结构：`crates/auth` + 其余单 crate
+### 工作区结构：5 个 crate
 
-认证是唯一需要编译期边界的地方：它不该反过来依赖 Axum、PostgreSQL 或业务实体，否则以后想独立部署时改不动。所以它单独成 crate（包名 `qe-auth`），其余仍是单 crate + 模块分层。
+根目录是 **virtual workspace**，只放 workspace 配置、迁移和部署文件；HTTP 层也独立成 `qe-api`。
 
 ```text
-backend/
-├── crates/auth/          # 认证原语，不认识 AppState
-│   └── src/
-│       ├── password.rs   Argon2id 哈希 / 校验
-│       ├── jwt.rs        HS256 访问令牌
-│       ├── session.rs    刷新令牌 + TokenStore 端口
-│       ├── permission.rs 权限判定 + 缓存端口
-│       └── error.rs      AuthError
-├── src/
-│   ├── auth.rs           适配层：把 Cache / UserRepo 接到上面的端口
-│   ├── api/              路由、handler、DTO、鉴权 extractor
-│   ├── domain/           实体、RBAC 权限点与角色、输入校验
-│   ├── infra/            PostgreSQL 仓储、Redis 缓存
-│   ├── bootstrap.rs      管理员初始化
-│   ├── config.rs         环境变量
-│   ├── error.rs          统一错误 → HTTP（含 AuthError 映射）
-│   ├── state.rs          共享 AppState
-│   ├── lib.rs            启动流程
-│   └── main.rs           二进制入口
+.                              # virtual workspace（没有 root package）
+├── Cargo.toml                 # [workspace] members + release profile
+├── crates/
+│   ├── api/                   # qe-api：Axum handler、config、state、bootstrap、main
+│   │   └── src/
+│   │       ├── api/           # 路由、handler、DTO、鉴权 extractor
+│   │       ├── auth.rs        # AppState 级授权胶水
+│   │       ├── bootstrap.rs   # 管理员初始化
+│   │       ├── config.rs      # 环境变量
+│   │       ├── error.rs       # Domain/Db/Cache/Auth -> AppError
+│   │       ├── state.rs       # 共享 AppState
+│   │       ├── lib.rs         # 启动流程
+│   │       └── main.rs        # 二进制入口（qe-api）
+│   ├── auth/                  # qe-auth：Argon2/JWT/刷新令牌/权限算法 + 存储端口
+│   ├── domain/                # qe-domain：纯实体、RBAC 常量、校验、DomainError
+│   ├── db/                    # qe-db：PostgreSQL 连接池/迁移/FromRow 行模型/仓储
+│   │   └── src/auth_ports.rs  # 实现 PermissionSource（UserRepo）
+│   └── cache/                 # qe-cache：Redis 刷新令牌与权限缓存
+│       └── src/auth_ports.rs  # 实现 TokenStore / PermissionCache（Cache）
+├── migrations/
+├── deploy/
+└── compose*.yaml / Dockerfile
 ```
 
-边界靠三个端口维持，`qe-auth` 只认 trait 不认实现：
+依赖方向：
 
-| 端口 | 作用 | 后端实现 |
+```text
+qe-api ──► qe-db ──► qe-domain ──► qe-auth
+   │          └────────────────────► qe-auth
+   ├──► qe-cache ──────────────────► qe-auth
+   └───────────────────────────────► qe-auth
+```
+
+规则：
+
+- `qe-auth` 不依赖其他 workspace crate，也不依赖 Axum/SQLx/Redis。
+- `qe-domain` 只依赖 `qe-auth`（复用权限匹配算法），不依赖 Axum/SQLx/Redis。
+- `qe-db` 负责 PostgreSQL：连接池、迁移、`#[derive(FromRow)]` 行模型、SQL 与实体映射；错误是 `DbError`。
+- `qe-cache` 负责 Redis：刷新令牌与权限缓存；错误是 `CacheError`。
+- `qe-api` 负责 HTTP 状态码、`IntoResponse`、CORS、路由和依赖装配；不直接依赖 SQLx/Redis，只持有 `qe_db::Db` 与 `qe_cache::Cache`。`AppError` 在这一层统一映射四种下层错误。
+
+`qe-auth` 的存储端口分别由两个适配器 crate 实现（trait 与类型分属不同 crate，只有实现方 crate 能写 impl）：
+
+| 端口 | 作用 | 实现位置 |
 | --- | --- | --- |
-| `session::TokenStore` | 刷新令牌存取（`set_ex` / `GETDEL` / `del`） | `Cache`（Redis） |
-| `permission::PermissionCache` | 按 RBAC 代际的权限缓存 | `Cache`（Redis） |
-| `permission::PermissionSource` | 权限的事实来源 | `UserRepo`（PostgreSQL） |
+| `session::TokenStore` | 刷新令牌存取（`set_ex` / `GETDEL` / `del`） | `qe-cache/src/auth_ports.rs` |
+| `permission::PermissionCache` | 按 RBAC 代际的权限缓存 | `qe-cache/src/auth_ports.rs` |
+| `permission::PermissionSource` | 权限的事实来源 | `qe-db/src/auth_ports.rs`（`UserRepo`） |
 
-因此 `qe-auth` 不依赖 axum：`AuthUser` extractor、`IntoResponse` 和状态码留在后端，由 `AppError` 统一。真要把它拆成独立服务时，替换三个端口的实现即可，内部逻辑不用重写。
-
-`domain` 仍然只依赖 `error`，以后要拆 `crates/domain`、`crates/infra` 同样是平移，不需要推翻结构。
+这样 5 个 crate 都能独立测试；换数据库只改 `qe-db`，换缓存只改 `qe-cache`，换 HTTP 框架只改 `qe-api`。
 
 ### 关于 Axum vs Actix / SQLx vs ORM
 
 - **Axum**：Tower 中间件（超时、CORS、trace、body limit）直接复用；`FromRequestParts` 写 `AuthUser` 干净；utoipa/OpenAPI 生态更统一。Actix 性能基准略高，但业务 API 的瓶颈通常在数据库，不构成理由。
-- **SQLx**：RBAC 的多表 join、公告过滤用 SQL 写更透明；迁移内嵌到二进制。代价是没有 SeaORM 的实体关系便利。数据访问集中在 `infra/`，真要换 ORM 只改这一层。
+- **SQLx**：RBAC 的多表 join、公告过滤用 SQL 写更透明；迁移内嵌到二进制。代价是没有 SeaORM 的实体关系便利。SQL 在 `qe-db`、缓存访问在 `qe-cache`，真要换 ORM 只改 `qe-db`。
 
 ## 快速开始（Docker）
 
@@ -209,7 +227,7 @@ curl -i -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 ### 日志
 
 - 应用只写 stdout，容器日志由 Docker `json-file` 驱动保存；compose 已限制 `max-size=10m`、`max-file=3`，避免无限增长。
-- 容器内固定 `LOG_FORMAT=json`（`tracing-subscriber` JSON），本地 `cargo run` 仍可用 `.env` 的 `LOG_FORMAT=pretty`。
+- 容器内固定 `LOG_FORMAT=json`（`tracing-subscriber` JSON），本地 `cargo run -p qe-api` 仍可用 `.env` 的 `LOG_FORMAT=pretty`。
 - JSON 日志里的 `span.trace_id`、`span.request_id` 可直接用于检索。
 - 应用日志不是审计日志。谁改了哪个公告/角色/用户，需要单独建 `audit_logs` 表，不要只依赖日志。
 
@@ -296,8 +314,8 @@ Grafana Explore 里可以直接查：
 ```bash
 cp .env.example .env
 docker compose up -d postgres redis   # 只起依赖
-cargo run                             # 启动 API（自动迁移 + 创建管理员）
-cargo test --workspace                # 单元测试（含 crates/auth）
+cargo run -p qe-api                    # 启动 API（自动迁移 + 创建管理员）
+cargo test --workspace                # 单元测试（5 个 crate）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -342,7 +360,7 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d
 
 工作流：`.gitea/workflows/ci.yml`
 
-1. `test` job：`cargo fmt --all --check` → `cargo clippy --workspace -D warnings` → `cargo test --workspace`。
+1. `test` job：`cargo fmt --all --check` → `cargo clippy --workspace --all-targets -D warnings` → `cargo test --workspace`。
 2. `image` job（push/tag 触发）：构建镜像并推送，标签为 `sha-<短 commit>` 与 `latest`（默认分支）。
 
 在 Gitea 仓库 **Settings → Actions** 配置：
@@ -383,6 +401,23 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d api
 - 公告列表未缓存；如需高读吞吐可按 RBAC 同样的代际思路加缓存。
 - 集成测试需要真实 PG/Redis，目前只有单元测试。
 
+## 数据库抖动与故障处理
+
+当前实现按“快速失败 + 状态语义正确 + 可恢复”处理：
+
+- 连接池：`min_connections=1`、`acquire_timeout=3s`、`idle_timeout=10m`、`max_lifetime=30m`，取连接前用 `test_before_acquire` 探活；数据库重启后会丢弃坏连接并重新建立。
+- 每条连接设置 `statement_timeout=10s`、`lock_timeout=3s`、`idle_in_transaction_session_timeout=15s`；慢查询、锁等待和事务悬挂不会无限占用连接。
+- 错误分类：`PoolTimedOut`、`PoolClosed`、`Io`、SQLSTATE `08*` / `57P*`，以及锁超时/死锁/连接数打满（`55P03` / `40001` / `40P01` / `53300` / `57014` / `25P03`）映射为 `DbError::Unavailable` → HTTP `503 service_unavailable`；唯一键/外键/检查约束仍是 409/400。nginx 的 `proxy_next_upstream http_503` 会对幂等请求尝试其他副本。
+- `/readyz` 在数据库或 Redis 不可用时返回 503；`/healthz` 只表示进程存活，不因数据库抖动触发容器重启。
+- 启动阶段迁移/引导管理员失败会让进程退出，由 compose `restart` 或编排系统重启；多副本迁移有 advisory lock。
+- 写请求不自动重试：POST/PATCH 可能已经被数据库提交但响应丢失，盲目重试会重复写入；需要幂等键或业务去重。
+- Redis 里的权限缓存命中时，数据库短时不可用仍可完成权限判断；但登录、公告列表、用户查询仍依赖 PostgreSQL。
+- 连接数 = 副本数 × `DB_MAX_CONNECTIONS`（默认 10）；副本多或单副本连接多时加 PgBouncer；读写分离则引入只读副本和独立连接串。
+- 建议监控：503 比例、`PoolTimedOut` 日志、PostgreSQL 连接数/锁等待/慢查询、请求 P99；告警优先看 `/readyz` 和 5xx。
+- 大表 DDL 请用独立迁移 job，并把应用设为 `RUN_MIGRATIONS=false`，避免 10s `statement_timeout` 中断迁移。
+
+公共公告列表目前没有 Redis 降级缓存，数据库不可用时会直接 503。如果业务要求“数据库挂了仍可读公告”，可以加短 TTL 缓存 + 写时失效，代价是短暂旧数据。
+
 ## 排障
 
 | 现象 | 排查 |
@@ -394,3 +429,7 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d api
 | 403 缺少权限 | 检查用户角色；`GET /auth/me` 看 permissions |
 | CORS 失败 | `CORS_ALLOWED_ORIGINS` 是否包含前端 origin，需带协议和端口 |
 | 构建镜像很慢 | 首次构建要编译全部依赖；CI 用 registry cache，本地可配 crates 镜像 |
+
+## License
+
+MIT © 2026 QEStudio. See [LICENSE](LICENSE).

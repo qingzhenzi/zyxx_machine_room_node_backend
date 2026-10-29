@@ -24,7 +24,7 @@ use tower_http::{
     timeout::TimeoutLayer,
 };
 
-use crate::{infra, state::AppState};
+use crate::state::AppState;
 
 pub fn router(state: AppState) -> Router {
     let cors = build_cors(&state);
@@ -120,7 +120,7 @@ async fn healthz(State(state): State<AppState>) -> Json<Value> {
 
 /// 就绪探针：数据库与 Redis 都可用才返回 200，供负载均衡摘流。
 async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let database_ok = infra::db::ping(&state.db).await.is_ok();
+    let database_ok = state.db.ping().await.is_ok();
     let cache_ok = state.cache.ping().await.is_ok();
     let healthy = database_ok && cache_ok;
 

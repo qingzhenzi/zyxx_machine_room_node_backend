@@ -62,10 +62,15 @@ impl Config {
             bail!("设置了 BOOTSTRAP_ADMIN_PASSWORD 但缺少 BOOTSTRAP_ADMIN_USERNAME");
         }
 
+        let db_max_connections = env_parse("DB_MAX_CONNECTIONS", 10_u32)?;
+        if db_max_connections == 0 {
+            bail!("DB_MAX_CONNECTIONS 必须大于 0");
+        }
+
         Ok(Self {
             bind_addr,
             database_url,
-            db_max_connections: env_parse("DB_MAX_CONNECTIONS", 10_u32)?,
+            db_max_connections,
             redis_url,
             jwt_secret,
             access_token_ttl_secs,

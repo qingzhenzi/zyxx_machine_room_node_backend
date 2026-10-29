@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "QEStudio 认证原语：密码哈希、JWT、刷新令牌会话、权限判定"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [dependencies]
 argon2 = "0.5"

@@ -1,0 +1,19 @@
+[package]
+name = "qe-domain"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "QEStudio 领域模型、RBAC 权限点与输入校验"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+qe-auth = { path = "../auth" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+serde_json = "1"

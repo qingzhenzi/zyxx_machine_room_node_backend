@@ -18,10 +18,10 @@ test: ## 运行单元测试
 check: fmt-check clippy test ## 本地完整检查
 
 build: ## 构建 release 二进制
-	cargo build --release --locked
+	cargo build --release --locked -p qe-api
 
 run: ## 本地启动（需要 .env 中的 PG/Redis）
-	cargo run
+	cargo run -p qe-api
 
 up: ## 构建并启动完整环境（nginx + 2 个 API 副本 + PG + Redis）
 	docker compose up -d --build

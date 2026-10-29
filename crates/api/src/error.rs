@@ -24,6 +24,8 @@ pub enum AppError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    ServiceUnavailable(String),
+    #[error("{0}")]
     Internal(String),
 }
 
@@ -48,6 +50,10 @@ impl AppError {
         Self::Conflict(message.into())
     }
 
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self::ServiceUnavailable(message.into())
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
@@ -59,6 +65,7 @@ impl AppError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -70,37 +77,38 @@ impl AppError {
             Self::Forbidden(_) => "forbidden",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
+            Self::ServiceUnavailable(_) => "service_unavailable",
             Self::Internal(_) => "internal_error",
         }
     }
 }
 
-impl From<sqlx::Error> for AppError {
-    fn from(error: sqlx::Error) -> Self {
-        if let sqlx::Error::Database(database_error) = &error {
-            if database_error.is_unique_violation() {
-                return Self::conflict("资源已存在");
-            }
-            if database_error.is_foreign_key_violation() {
-                return Self::bad_request("引用的资源不存在");
-            }
-            if database_error.is_check_violation() {
-                return Self::bad_request("数据不满足约束条件");
-            }
+impl From<qe_domain::error::DomainError> for AppError {
+    fn from(error: qe_domain::error::DomainError) -> Self {
+        match error {
+            qe_domain::error::DomainError::BadRequest(message) => Self::BadRequest(message),
+            qe_domain::error::DomainError::NotFound(message) => Self::NotFound(message),
+            qe_domain::error::DomainError::Conflict(message) => Self::Conflict(message),
+            qe_domain::error::DomainError::Internal(message) => Self::Internal(message),
         }
-        Self::internal(format!("database error: {error}"))
     }
 }
 
-impl From<redis::RedisError> for AppError {
-    fn from(error: redis::RedisError) -> Self {
-        Self::internal(format!("redis error: {error}"))
+impl From<qe_db::error::DbError> for AppError {
+    fn from(error: qe_db::error::DbError) -> Self {
+        match error {
+            qe_db::error::DbError::BadRequest(message) => Self::BadRequest(message),
+            qe_db::error::DbError::NotFound(message) => Self::NotFound(message),
+            qe_db::error::DbError::Conflict(message) => Self::Conflict(message),
+            qe_db::error::DbError::Unavailable(message) => Self::ServiceUnavailable(message),
+            qe_db::error::DbError::Internal(message) => Self::Internal(message),
+        }
     }
 }
 
-impl From<serde_json::Error> for AppError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::internal(format!("json error: {error}"))
+impl From<qe_cache::CacheError> for AppError {
+    fn from(error: qe_cache::CacheError) -> Self {
+        Self::Internal(error.to_string())
     }
 }
 
@@ -133,8 +141,14 @@ struct ErrorBody {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
-        let message = if status.is_server_error() {
-            tracing::error!(error = %self, "request failed with internal error");
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            tracing::warn!(error = %self, "request failed with service unavailable");
+        } else if status.is_server_error() {
+            tracing::error!(error = %self, "request failed with server error");
+        }
+        let message = if status == StatusCode::SERVICE_UNAVAILABLE {
+            "服务暂时不可用，请稍后重试".to_owned()
+        } else if status.is_server_error() {
             "服务器内部错误".to_owned()
         } else {
             self.to_string()

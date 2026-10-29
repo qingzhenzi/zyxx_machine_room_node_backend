@@ -1,0 +1,26 @@
+[package]
+name = "qe-db"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "QEStudio PostgreSQL 适配器：连接池、迁移、行模型与仓储"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+qe-auth = { path = "../auth" }
+qe-domain = { path = "../domain" }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "postgres",
+    "uuid",
+    "chrono",
+    "migrate",
+    "macros",
+] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }

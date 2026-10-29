@@ -1,9 +1,11 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use qe_domain::models::{Page, User, UserSummary};
+
 use crate::{
-    domain::models::{Page, User, UserSummary},
-    error::{AppError, AppResult},
+    error::{DbError, DbResult},
+    rows::{UserRow, UserSummaryRow},
 };
 
 #[derive(Clone)]
@@ -16,22 +18,20 @@ impl UserRepo {
         Self { db }
     }
 
-    pub async fn find_by_id(&self, id: Uuid) -> AppResult<Option<User>> {
-        Ok(
-            sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.db)
-                .await?,
-        )
+    pub async fn find_by_id(&self, id: Uuid) -> DbResult<Option<User>> {
+        let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.db)
+            .await?;
+        Ok(row.map(User::from))
     }
 
-    pub async fn find_by_username(&self, username: &str) -> AppResult<Option<User>> {
-        Ok(
-            sqlx::query_as::<_, User>("SELECT * FROM users WHERE username = $1")
-                .bind(username)
-                .fetch_optional(&self.db)
-                .await?,
-        )
+    pub async fn find_by_username(&self, username: &str) -> DbResult<Option<User>> {
+        let row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE username = $1")
+            .bind(username)
+            .fetch_optional(&self.db)
+            .await?;
+        Ok(row.map(User::from))
     }
 
     pub async fn list(
@@ -39,7 +39,7 @@ impl UserRepo {
         page: i64,
         page_size: i64,
         keyword: &str,
-    ) -> AppResult<Page<UserSummary>> {
+    ) -> DbResult<Page<UserSummary>> {
         let offset = (page - 1) * page_size;
 
         let total: i64 = sqlx::query_scalar(
@@ -52,7 +52,7 @@ impl UserRepo {
         .fetch_one(&self.db)
         .await?;
 
-        let items = sqlx::query_as::<_, UserSummary>(
+        let rows = sqlx::query_as::<_, UserSummaryRow>(
             "SELECT u.id,
                     u.username,
                     u.email,
@@ -80,12 +80,13 @@ impl UserRepo {
         .bind(keyword)
         .fetch_all(&self.db)
         .await?;
+        let items = rows.into_iter().map(UserSummary::from).collect();
 
         Ok(Page::new(items, total, page, page_size))
     }
 
-    pub async fn find_summary(&self, id: Uuid) -> AppResult<Option<UserSummary>> {
-        Ok(sqlx::query_as::<_, UserSummary>(
+    pub async fn find_summary(&self, id: Uuid) -> DbResult<Option<UserSummary>> {
+        let row = sqlx::query_as::<_, UserSummaryRow>(
             "SELECT u.id,
                     u.username,
                     u.email,
@@ -106,7 +107,8 @@ impl UserRepo {
         )
         .bind(id)
         .fetch_optional(&self.db)
-        .await?)
+        .await?;
+        Ok(row.map(UserSummary::from))
     }
 
     pub async fn create_with_roles(
@@ -116,10 +118,10 @@ impl UserRepo {
         display_name: &str,
         password_hash: &str,
         role_codes: &[String],
-    ) -> AppResult<User> {
+    ) -> DbResult<User> {
         let mut transaction = self.db.begin().await?;
 
-        let user = sqlx::query_as::<_, User>(
+        let row = sqlx::query_as::<_, UserRow>(
             "INSERT INTO users (username, email, display_name, password_hash)
              VALUES ($1, $2, $3, $4)
              RETURNING *",
@@ -130,6 +132,7 @@ impl UserRepo {
         .bind(password_hash)
         .fetch_one(&mut *transaction)
         .await?;
+        let user = User::from(row);
 
         if !role_codes.is_empty() {
             let inserted = sqlx::query(
@@ -145,7 +148,7 @@ impl UserRepo {
 
             if inserted != role_codes.len() as u64 {
                 transaction.rollback().await?;
-                return Err(AppError::bad_request("包含不存在的角色"));
+                return Err(DbError::bad_request("包含不存在的角色"));
             }
         }
 
@@ -160,13 +163,13 @@ impl UserRepo {
         display_name: Option<String>,
         password_hash: Option<String>,
         is_active: Option<bool>,
-    ) -> AppResult<Option<User>> {
+    ) -> DbResult<Option<User>> {
         let (email_changed, email_value) = match email_change {
             Some(value) => (true, value),
             None => (false, None),
         };
 
-        Ok(sqlx::query_as::<_, User>(
+        let row = sqlx::query_as::<_, UserRow>(
             "UPDATE users SET
                 email = CASE WHEN $2 THEN $3 ELSE email END,
                 display_name = COALESCE($4, display_name),
@@ -182,10 +185,11 @@ impl UserRepo {
         .bind(password_hash)
         .bind(is_active)
         .fetch_optional(&self.db)
-        .await?)
+        .await?;
+        Ok(row.map(User::from))
     }
 
-    pub async fn roles_of(&self, user_id: Uuid) -> AppResult<Vec<String>> {
+    pub async fn roles_of(&self, user_id: Uuid) -> DbResult<Vec<String>> {
         Ok(sqlx::query_scalar::<_, String>(
             "SELECT r.code
              FROM user_roles ur
@@ -198,7 +202,7 @@ impl UserRepo {
         .await?)
     }
 
-    pub async fn permissions_of(&self, user_id: Uuid) -> AppResult<Vec<String>> {
+    pub async fn permissions_of(&self, user_id: Uuid) -> DbResult<Vec<String>> {
         Ok(sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT p.code
              FROM user_roles ur
@@ -214,7 +218,7 @@ impl UserRepo {
     }
 
     /// 全量替换用户角色。调用方负责校验“最后一个管理员”等业务规则。
-    pub async fn set_roles(&self, user_id: Uuid, role_codes: &[String]) -> AppResult<()> {
+    pub async fn set_roles(&self, user_id: Uuid, role_codes: &[String]) -> DbResult<()> {
         let mut transaction = self.db.begin().await?;
 
         sqlx::query("DELETE FROM user_roles WHERE user_id = $1")
@@ -236,7 +240,7 @@ impl UserRepo {
 
             if inserted != role_codes.len() as u64 {
                 transaction.rollback().await?;
-                return Err(AppError::bad_request("包含不存在的角色"));
+                return Err(DbError::bad_request("包含不存在的角色"));
             }
         }
 
@@ -245,7 +249,7 @@ impl UserRepo {
     }
 
     /// 统计仍处于启用状态、且拥有指定角色的用户数。
-    pub async fn count_active_with_role(&self, role_code: &str) -> AppResult<i64> {
+    pub async fn count_active_with_role(&self, role_code: &str) -> DbResult<i64> {
         Ok(sqlx::query_scalar::<_, i64>(
             "SELECT count(*)
              FROM user_roles ur
