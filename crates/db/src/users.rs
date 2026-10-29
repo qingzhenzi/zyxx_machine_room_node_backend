@@ -34,6 +34,37 @@ impl UserRepo {
         Ok(row.map(User::from))
     }
 
+    pub async fn find_by_email(&self, email: &str) -> DbResult<Option<User>> {
+        let row =
+            sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE lower(email) = lower($1)")
+                .bind(email)
+                .fetch_optional(&self.db)
+                .await?;
+        Ok(row.map(User::from))
+    }
+
+    pub async fn set_password(&self, id: Uuid, password_hash: &str) -> DbResult<bool> {
+        let updated =
+            sqlx::query("UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1")
+                .bind(id)
+                .bind(password_hash)
+                .execute(&self.db)
+                .await?
+                .rows_affected();
+        Ok(updated > 0)
+    }
+
+    pub async fn mark_email_verified(&self, id: Uuid) -> DbResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE users SET email_verified_at = now(), updated_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&self.db)
+        .await?
+        .rows_affected();
+        Ok(updated > 0)
+    }
+
     pub async fn list(
         &self,
         page: i64,

@@ -1,4 +1,5 @@
 pub mod announcements;
+pub mod audit;
 pub mod roles;
 pub mod users;
 
@@ -27,4 +28,5 @@ pub fn router() -> Router<AppState> {
         .route("/roles/{id}", delete_route(roles::delete))
         .route("/roles/{id}/permissions", put(roles::set_permissions))
         .route("/permissions", get(roles::list_permissions))
+        .route("/audit-logs", get(audit::list))
 }

@@ -15,6 +15,16 @@ x-api-environment: &api-environment
   REFRESH_TOKEN_TTL_SECONDS: ${REFRESH_TOKEN_TTL_SECONDS:-604800}
   REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-30}
   DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-10}
+  LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-5}
+  LOGIN_WINDOW_SECONDS: ${LOGIN_WINDOW_SECONDS:-300}
+  LOGIN_LOCK_SECONDS: ${LOGIN_LOCK_SECONDS:-900}
+  ANNOUNCEMENT_CACHE_SECONDS: ${ANNOUNCEMENT_CACHE_SECONDS:-30}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:5173}
+  PASSWORD_RESET_TTL_SECONDS: ${PASSWORD_RESET_TTL_SECONDS:-1800}
+  EMAIL_VERIFICATION_TTL_SECONDS: ${EMAIL_VERIFICATION_TTL_SECONDS:-86400}
+  EMAIL_DRIVER: ${EMAIL_DRIVER:-log}
+  SMTP_URL: ${SMTP_URL:-smtp://127.0.0.1:1025}
+  SMTP_FROM: ${SMTP_FROM:-QEStudio <no-reply@qestudio.local>}
   CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173}
   RUN_MIGRATIONS: "true"
   BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
@@ -23,6 +33,10 @@ x-api-environment: &api-environment
   # 容器日志统一 JSON，便于 Loki/ELK 采集；本地 cargo run 由 .env 控制。
   LOG_FORMAT: json
   RUST_LOG: ${RUST_LOG:-info,sqlx=warn}
+  # 留空则只写 stdout；设置后启用 OTLP/HTTP trace 导出。
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+  OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-qestudio-backend}
+  OTEL_LOGS_ENABLED: ${OTEL_LOGS_ENABLED:-false}
 
 services:
   postgres:
@@ -54,6 +68,8 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redisdata:/data
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

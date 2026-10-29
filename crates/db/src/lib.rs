@@ -4,11 +4,13 @@
 //! 行到实体的转换，以及 `qe-auth` 权限来源端口的实现。
 
 pub mod announcements;
+pub mod audit;
 pub mod auth_ports;
 mod db;
 pub mod error;
 pub mod roles;
 pub mod rows;
+pub mod security;
 pub mod users;
 
 pub use db::Db;

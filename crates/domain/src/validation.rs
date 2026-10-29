@@ -173,8 +173,14 @@ pub fn normalize_announcement_title(raw: &str) -> DomainResult<String> {
     Ok(title)
 }
 
+pub fn sanitize_announcement_content(raw: &str) -> String {
+    ammonia::clean(raw)
+}
+
 pub fn normalize_announcement_content(raw: &str) -> DomainResult<String> {
-    let content = raw.trim().to_owned();
+    // 公告允许有限的富文本；写入前统一清洗，避免存储型 XSS。
+    // 前端仍应使用 DOMPurify 等库做第二道防线。
+    let content = sanitize_announcement_content(raw.trim());
     let length = content.chars().count();
     if !(1..=100_000).contains(&length) {
         return Err(DomainError::bad_request("公告正文长度需为 1-100000 个字符"));
@@ -226,6 +232,17 @@ mod tests {
         assert!(normalize_username("ab").is_err());
         assert!(normalize_username("1admin").is_err());
         assert!(normalize_username("admin space").is_err());
+    }
+
+    #[test]
+    fn announcement_content_is_sanitized() {
+        let content = normalize_announcement_content(
+            r#"<p>hello</p><script>alert(1)</script><a href="javascript:alert(1)">x</a>"#,
+        )
+        .unwrap();
+        assert!(content.contains("hello"));
+        assert!(!content.contains("<script"));
+        assert!(!content.contains("javascript:"));
     }
 
     #[test]

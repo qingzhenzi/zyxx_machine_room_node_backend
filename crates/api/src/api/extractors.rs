@@ -34,8 +34,70 @@ impl FromRequestParts<AppState> for AuthUser {
             .filter(|token| !token.is_empty())
             .ok_or_else(|| AppError::unauthorized("Authorization 需为 `Bearer <token>` 格式"))?;
 
-        let id = state.jwt.verify_access_token(token)?;
-        Ok(Self { id })
+        let verified = state.jwt.verify_access_token(token)?;
+        if let Some(session_id) = verified.session_id {
+            let cached = state
+                .cache
+                .cached_session_active(session_id)
+                .await
+                .ok()
+                .flatten();
+            let active = match cached {
+                Some(value) => value,
+                None => {
+                    let active = state.security.session_active(session_id).await?;
+                    if active {
+                        let _ = state
+                            .cache
+                            .mark_session_active(
+                                session_id,
+                                state.config.refresh_token_ttl_secs as u64,
+                            )
+                            .await;
+                    }
+                    active
+                }
+            };
+            if !active {
+                return Err(AppError::unauthorized("会话已撤销，请重新登录"));
+            }
+        }
+        Ok(Self {
+            id: verified.user_id,
+        })
+    }
+}
+
+/// 反向代理后的客户端 IP。优先使用 nginx 设置的 `X-Real-IP` /
+/// `X-Forwarded-For`；仅用于审计，不参与授权。
+#[derive(Debug, Clone)]
+pub struct ClientIp(pub Option<String>);
+
+impl FromRequestParts<AppState> for ClientIp {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let forwarded = parts
+            .headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        let real_ip = parts
+            .headers
+            .get("x-real-ip")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        Ok(Self(real_ip.or(forwarded)))
     }
 }
 

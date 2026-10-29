@@ -4,7 +4,8 @@
 
 use chrono::{DateTime, Utc};
 use qe_domain::models::{
-    Announcement, AnnouncementStatus, Permission, Role, RoleSummary, User, UserSummary,
+    Announcement, AnnouncementStatus, AuditLog, Permission, Role, RoleSummary, User, UserSession,
+    UserSummary,
 };
 use sqlx::FromRow;
 use uuid::Uuid;
@@ -166,6 +167,62 @@ impl From<AnnouncementRow> for Announcement {
             published_at: row.published_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct AuditLogRow {
+    pub id: Uuid,
+    pub actor_id: Option<Uuid>,
+    pub actor_username: String,
+    pub actor_display_name: String,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<String>,
+    pub detail: serde_json::Value,
+    pub ip: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<AuditLogRow> for AuditLog {
+    fn from(row: AuditLogRow) -> Self {
+        Self {
+            id: row.id,
+            actor_id: row.actor_id,
+            actor_username: row.actor_username,
+            actor_display_name: row.actor_display_name,
+            action: row.action,
+            resource_type: row.resource_type,
+            resource_id: row.resource_id,
+            detail: row.detail,
+            ip: row.ip,
+            created_at: row.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct UserSessionRow {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub user_agent: String,
+    pub ip: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl From<UserSessionRow> for UserSession {
+    fn from(row: UserSessionRow) -> Self {
+        Self {
+            id: row.id,
+            user_id: row.user_id,
+            user_agent: row.user_agent,
+            ip: row.ip,
+            created_at: row.created_at,
+            last_seen_at: row.last_seen_at,
+            revoked_at: row.revoked_at,
         }
     }
 }

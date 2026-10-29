@@ -110,7 +110,7 @@ impl FromStr for AnnouncementStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Announcement {
     pub id: Uuid,
     pub title: String,
@@ -125,6 +125,31 @@ pub struct Announcement {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AuditLog {
+    pub id: Uuid,
+    pub actor_id: Option<Uuid>,
+    pub actor_username: String,
+    pub actor_display_name: String,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<String>,
+    pub detail: serde_json::Value,
+    pub ip: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UserSession {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub user_agent: String,
+    pub ip: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Page<T> {
     pub items: Vec<T>,
     pub total: i64,

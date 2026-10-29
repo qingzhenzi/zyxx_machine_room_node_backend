@@ -2,6 +2,7 @@ pub mod admin;
 pub mod announcements;
 pub mod auth;
 pub mod extractors;
+pub mod openapi;
 pub mod trace;
 pub mod validation;
 
@@ -34,6 +35,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/api-docs/openapi.json", get(openapi::json_spec))
+        .route("/docs", get(openapi::ui))
         .nest("/api/v1", api_v1())
         .layer(
             ServiceBuilder::new()
@@ -58,6 +61,21 @@ fn api_v1() -> Router<AppState> {
         .route("/auth/refresh", post(auth::refresh))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
+        .route("/auth/password/forgot", post(auth::forgot_password))
+        .route("/auth/password/reset", post(auth::reset_password))
+        .route(
+            "/auth/email/verification",
+            post(auth::request_email_verification),
+        )
+        .route("/auth/email/verify", post(auth::verify_email))
+        .route(
+            "/auth/sessions",
+            get(auth::list_sessions).delete(auth::revoke_all_sessions),
+        )
+        .route(
+            "/auth/sessions/{id}",
+            axum::routing::delete(auth::revoke_session),
+        )
         .route("/announcements", get(announcements::list))
         .route("/announcements/{id}", get(announcements::get))
         .nest("/admin", admin::router())

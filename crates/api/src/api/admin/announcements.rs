@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     api::{
-        extractors::{ApiJson, AuthUser},
+        extractors::{ApiJson, AuthUser, ClientIp},
         validation::PageQuery,
     },
     auth::authorization,
@@ -54,17 +54,26 @@ pub async fn list(
     let keyword = validation::normalize_keyword(query.keyword.as_deref())?;
     let status = validation::parse_announcement_status(query.status.as_deref())?;
 
-    Ok(Json(
-        state
-            .announcements
-            .list(status, &keyword, page, page_size)
-            .await?,
-    ))
+    let mut page_result = state
+        .announcements
+        .list(status, &keyword, page, page_size)
+        .await?;
+    for announcement in &mut page_result.items {
+        announcement.content = validation::sanitize_announcement_content(&announcement.content);
+    }
+    Ok(Json(page_result))
+}
+
+async fn bump_announcement_cache(state: &AppState) {
+    if let Err(error) = state.cache.bump_announcement_version().await {
+        tracing::warn!(%error, "递增公告缓存代际失败");
+    }
 }
 
 pub async fn create(
     State(state): State<AppState>,
     AuthUser { id }: AuthUser,
+    ClientIp(ip): ClientIp,
     ApiJson(request): ApiJson<CreateAnnouncementRequest>,
 ) -> AppResult<(StatusCode, Json<Announcement>)> {
     authorization::require_permission(&state, id, permissions::ANNOUNCEMENT_WRITE).await?;
@@ -87,12 +96,26 @@ pub async fn create(
         )
         .await?;
 
+    bump_announcement_cache(&state).await;
+
+    super::audit::record_or_log(
+        &state,
+        id,
+        "announcement.create",
+        "announcement",
+        Some(announcement.id.to_string()),
+        serde_json::json!({ "title": announcement.title, "status": announcement.status }),
+        ip.as_deref(),
+    )
+    .await;
+
     Ok((StatusCode::CREATED, Json(announcement)))
 }
 
 pub async fn update(
     State(state): State<AppState>,
     AuthUser { id }: AuthUser,
+    ClientIp(ip): ClientIp,
     Path(announcement_id): Path<Uuid>,
     ApiJson(request): ApiJson<UpdateAnnouncementRequest>,
 ) -> AppResult<Json<Announcement>> {
@@ -134,12 +157,31 @@ pub async fn update(
         .await?
         .ok_or_else(|| AppError::not_found("公告不存在"))?;
 
+    bump_announcement_cache(&state).await;
+
+    super::audit::record_or_log(
+        &state,
+        id,
+        "announcement.update",
+        "announcement",
+        Some(announcement.id.to_string()),
+        serde_json::json!({
+            "title_changed": title.is_some(),
+            "content_changed": content.is_some(),
+            "status": announcement.status,
+            "is_pinned": announcement.is_pinned,
+        }),
+        ip.as_deref(),
+    )
+    .await;
+
     Ok(Json(announcement))
 }
 
 pub async fn delete(
     State(state): State<AppState>,
     AuthUser { id }: AuthUser,
+    ClientIp(ip): ClientIp,
     Path(announcement_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
     authorization::require_permission(&state, id, permissions::ANNOUNCEMENT_DELETE).await?;
@@ -147,5 +189,19 @@ pub async fn delete(
     if !state.announcements.delete(announcement_id).await? {
         return Err(AppError::not_found("公告不存在"));
     }
+
+    bump_announcement_cache(&state).await;
+
+    super::audit::record_or_log(
+        &state,
+        id,
+        "announcement.delete",
+        "announcement",
+        Some(announcement_id.to_string()),
+        serde_json::json!({}),
+        ip.as_deref(),
+    )
+    .await;
+
     Ok(StatusCode::NO_CONTENT)
 }

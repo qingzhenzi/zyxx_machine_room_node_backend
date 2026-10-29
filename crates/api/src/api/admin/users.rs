@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     api::{
-        extractors::{ApiJson, AuthUser},
+        extractors::{ApiJson, AuthUser, ClientIp},
         validation::PageQuery,
     },
     auth::{authorization, password},
@@ -67,6 +67,7 @@ pub async fn list(
 pub async fn create(
     State(state): State<AppState>,
     AuthUser { id }: AuthUser,
+    ClientIp(ip): ClientIp,
     ApiJson(request): ApiJson<CreateUserRequest>,
 ) -> AppResult<(StatusCode, Json<UserSummary>)> {
     authorization::require_permission(&state, id, permissions::USER_MANAGE).await?;
@@ -102,12 +103,28 @@ pub async fn create(
         .await?
         .ok_or_else(|| AppError::internal("创建用户后无法读取用户信息"))?;
 
+    super::audit::record_or_log(
+        &state,
+        id,
+        "user.create",
+        "user",
+        Some(summary.id.to_string()),
+        serde_json::json!({
+            "username": summary.username,
+            "roles": summary.roles,
+            "is_active": summary.is_active,
+        }),
+        ip.as_deref(),
+    )
+    .await;
+
     Ok((StatusCode::CREATED, Json(summary)))
 }
 
 pub async fn update(
     State(state): State<AppState>,
     AuthUser { id: actor_id }: AuthUser,
+    ClientIp(ip): ClientIp,
     Path(user_id): Path<Uuid>,
     ApiJson(request): ApiJson<UpdateUserRequest>,
 ) -> AppResult<Json<UserSummary>> {
@@ -151,6 +168,7 @@ pub async fn update(
         Some(raw) => Some(validation::normalize_optional_email(raw)?),
         None => None,
     };
+    let password_changed = request.password.is_some();
     let password_hash = match request.password {
         Some(password) => {
             validation::validate_password(&password)?;
@@ -180,12 +198,30 @@ pub async fn update(
         .find_summary(user_id)
         .await?
         .ok_or_else(|| AppError::internal("更新用户后无法读取用户信息"))?;
+
+    super::audit::record_or_log(
+        &state,
+        actor_id,
+        "user.update",
+        "user",
+        Some(user_id.to_string()),
+        serde_json::json!({
+            "display_name_changed": request.display_name.is_some(),
+            "email_changed": request.email.is_some(),
+            "password_changed": password_changed,
+            "is_active": summary.is_active,
+        }),
+        ip.as_deref(),
+    )
+    .await;
+
     Ok(Json(summary))
 }
 
 pub async fn set_roles(
     State(state): State<AppState>,
     AuthUser { id: actor_id }: AuthUser,
+    ClientIp(ip): ClientIp,
     Path(user_id): Path<Uuid>,
     ApiJson(request): ApiJson<SetUserRolesRequest>,
 ) -> AppResult<Json<UserSummary>> {
@@ -216,5 +252,17 @@ pub async fn set_roles(
         .find_summary(user_id)
         .await?
         .ok_or_else(|| AppError::internal("更新角色后无法读取用户信息"))?;
+
+    super::audit::record_or_log(
+        &state,
+        actor_id,
+        "user.set_roles",
+        "user",
+        Some(user_id.to_string()),
+        serde_json::json!({ "roles": summary.roles }),
+        ip.as_deref(),
+    )
+    .await;
+
     Ok(Json(summary))
 }

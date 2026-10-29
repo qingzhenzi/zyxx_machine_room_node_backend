@@ -3,8 +3,14 @@
 基于 **Rust + Axum + PostgreSQL + Redis** 的 Web API 服务，内置：
 
 - 用户名/密码登录，JWT 访问令牌 + Redis 一次性刷新令牌
+- 登录失败限制：Redis 计数 + 临时锁定，默认 5 次/5 分钟
+- 密码重置、邮箱验证、多设备会话列表/撤销
 - RBAC 权限模型（用户 → 角色 → 权限），管理员可在运行时改角色/权限
-- 公告管理（草稿 / 发布 / 归档 / 置顶 / 分页 / 搜索）与公开公告接口
+- 公告管理（草稿 / 发布 / 归档 / 置顶 / 分页 / 搜索），写入时清洗富文本
+- 管理操作审计日志（用户/角色/公告），`audit:read` 权限查看
+- 公告列表 Redis 代际缓存，变更时自动失效
+- OpenAPI 文档：`/docs`，JSON：`/api-docs/openapi.json`
+- 可选 OTLP/HTTP trace 导出（`OTEL_EXPORTER_OTLP_ENDPOINT`）
 - Docker 多阶段构建，nginx 反向代理 + 多副本负载均衡
 - Gitea Actions：格式检查、Clippy、单测、镜像构建并推送到 Gitea Registry
 
@@ -155,8 +161,28 @@ for i in $(seq 1 6); do curl -s http://localhost:8080/healthz; echo; done
 | --- | --- | --- | --- |
 | POST | `/auth/login` | 用户名密码登录，返回 access/refresh token + 用户信息 | 否 |
 | POST | `/auth/refresh` | 用 refresh token 换新令牌（旧 token 立即失效） | 否 |
-| POST | `/auth/logout` | 撤销 refresh token | 否 |
+| POST | `/auth/logout` | 撤销 refresh token 并标记设备会话 | 否 |
 | GET | `/auth/me` | 当前用户、角色、权限 | 是 |
+| POST | `/auth/password/forgot` | 请求密码重置（开发环境把链接写日志） | 否 |
+| POST | `/auth/password/reset` | 一次性令牌重置密码并撤销所有设备会话 | 否 |
+| POST | `/auth/email/verification` | 请求邮箱验证 | 是 |
+| POST | `/auth/email/verify` | 验证邮箱 | 否 |
+| GET | `/auth/sessions` | 当前用户设备会话列表 | 是 |
+| DELETE | `/auth/sessions/{id}` | 撤销指定会话 | 是 |
+| DELETE | `/auth/sessions` | 撤销全部会话 | 是 |
+
+登录会创建 `user_sessions` 记录；access token 带 `sid`，每次鉴权先查 Redis 活跃会话缓存（miss 时回退 `user_sessions` 并回填）。撤销会话会立即拒绝该 access token，而不只是阻止 refresh。迁移期内没有 `sid` 的旧 access token 仍可用，直到过期后重新登录。密码重置会撤销全部会话。
+
+邮件：
+
+- `EMAIL_DRIVER=log`（默认）：只把链接写入服务端日志，适合开发。
+- `EMAIL_DRIVER=smtp`：通过 `SMTP_URL` 发送 HTML 邮件；本地用 Mailpit 验证：
+  ```bash
+  docker compose -f compose.yaml -f compose.mail.yaml up -d mailpit
+  EMAIL_DRIVER=smtp SMTP_URL=smtp://127.0.0.1:1025 cargo run -p qe-api
+  # 打开 http://127.0.0.1:8025 查看邮件
+  ```
+- 生产可把 `SMTP_URL` 换成企业 SMTP/API 网关；`SMTP_FROM` 必须是允许的发件人。
 
 ### 公告（公开）
 
@@ -187,12 +213,14 @@ for i in $(seq 1 6); do curl -s http://localhost:8080/healthz; echo; done
 | PUT | `/admin/roles/{id}/permissions` | `role:manage` |
 | DELETE | `/admin/roles/{id}` | `role:manage` |
 | GET | `/admin/permissions` | `role:manage` 或 `user:manage` |
+| GET | `/admin/audit-logs?action=&resource_type=&page=&page_size=` | `audit:read` |
 
 内置权限点：
 
 ```
 announcement:read    announcement:write   announcement:publish
 announcement:delete  user:manage          role:manage
+audit:read
 ```
 
 内置角色：
@@ -206,6 +234,34 @@ announcement:delete  user:manage          role:manage
 `viewer` 是后台只读角色，`announcement:read` 会看到草稿和归档内容；公开接口 `/announcements` 仍然只返回已发布公告。新建用户未指定角色时默认赋予 `viewer`。
 
 安全约束：不能停用自己；不能停用/降级**最后一个启用中的管理员**。
+
+### 登录失败限制
+
+- 同一用户名连续失败默认 5 次（`LOGIN_MAX_ATTEMPTS`）
+- 窗口默认 5 分钟（`LOGIN_WINDOW_SECONDS`）
+- 达到阈值后锁定默认 15 分钟（`LOGIN_LOCK_SECONDS`），返回 `429 too_many_requests`
+- 登录成功会清除失败计数和锁定
+- 计数在 Redis，多副本共享；生产还建议在 nginx/网关按 IP 做一层限流，防止攻击者轮换用户名
+
+### 公告内容安全与缓存
+
+- `content` 允许有限 HTML；写入和读取都会用 `ammonia` 清洗，移除脚本、事件属性和 `javascript:` 链接
+- 前端仍应使用 DOMPurify 等库做第二道防线；服务端不清洗 Markdown 的渲染逻辑
+- 公开公告列表按 `announcements:version` 代际缓存，默认 TTL 30 秒（`ANNOUNCEMENT_CACHE_SECONDS`）
+- 公告创建/更新/删除时递增代际，旧缓存自然失效
+
+### 审计日志
+
+- 表：`audit_logs`，迁移 `0003_audit.sql`
+- 记录动作：`user.create/update/set_roles`、`role.create/set_permissions/delete`、`announcement.create/update/delete`
+- 记录 actor 快照、资源类型/ID、JSON 明细、时间；IP 暂未采集
+- 查询：`GET /api/v1/admin/audit-logs`，需要 `audit:read`
+
+### OpenAPI
+
+- Swagger UI：`/docs`
+- OpenAPI 3.1 JSON：`/api-docs/openapi.json`
+- 文档是手写维护的规范，避免构建时从 GitHub 下载 Swagger UI；如需自动生成可替换为 utoipa 注解 + 离线资产
 
 ## 请求追踪与日志
 
@@ -255,6 +311,19 @@ docker compose -f compose.yaml -f compose.observability.yaml --profile observabi
 # 只停可观测性组件，不影响 API/PG/Redis/nginx
 docker compose -f compose.yaml -f compose.observability.yaml --profile observability stop loki alloy grafana
 ```
+
+### OTLP trace / logs 导出
+
+API 已接入 `tracing-opentelemetry` + OTLP/HTTP。默认关闭；设置：
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+OTEL_SERVICE_NAME=qestudio-backend
+# 可选：同时导出 OTLP logs；默认仍保留 stdout JSON
+OTEL_LOGS_ENABLED=true
+```
+
+启用后，`http_request` span 和 tracing 日志会导出到 OTLP collector。没有 collector 时不要设置该变量；日志仍按 JSON 输出，由 Alloy/Loki 或外部采集器收集。同时开启 stdout 和 OTLP logs 会造成重复采集，按部署环境二选一。
 
 访问地址（默认只绑定 `127.0.0.1`）：
 
@@ -306,6 +375,19 @@ Grafana Explore 里可以直接查：
 | `BOOTSTRAP_ADMIN_DISPLAY_NAME` | `Administrator` | 显示名 |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | 单请求超时 |
 | `MAX_BODY_BYTES` | `2097152` | 请求体上限（2 MiB） |
+| `LOGIN_MAX_ATTEMPTS` | `5` | 登录失败次数阈值 |
+| `LOGIN_WINDOW_SECONDS` | `300` | 失败计数窗口 |
+| `LOGIN_LOCK_SECONDS` | `900` | 触发阈值后的锁定时长 |
+| `ANNOUNCEMENT_CACHE_SECONDS` | `30` | 公开公告列表缓存 TTL |
+| `PUBLIC_BASE_URL` | `http://localhost:5173` | 邮件链接前缀 |
+| `PASSWORD_RESET_TTL_SECONDS` | `1800` | 密码重置令牌有效期 |
+| `EMAIL_VERIFICATION_TTL_SECONDS` | `86400` | 邮箱验证令牌有效期 |
+| `EMAIL_DRIVER` | `log` | `log`（开发）或 `smtp` |
+| `SMTP_URL` | `smtp://127.0.0.1:1025` | SMTP 连接串（Mailpit 默认） |
+| `SMTP_FROM` | `QEStudio <no-reply@qestudio.local>` | 发件人 |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | 空 | 设置后启用 OTLP/HTTP trace 导出 |
+| `OTEL_SERVICE_NAME` | `qestudio-backend` | OTel service.name |
+| `OTEL_LOGS_ENABLED` | `false` | 同时导出 OTLP logs（默认仅 stdout） |
 | `RUST_LOG` | `info,sqlx=warn` | 日志过滤 |
 | `LOG_FORMAT` | `pretty` | 本地日志格式；compose 容器内固定为 `json` |
 
@@ -313,9 +395,11 @@ Grafana Explore 里可以直接查：
 
 ```bash
 cp .env.example .env
-docker compose up -d postgres redis   # 只起依赖
+make dev-up                           # 只启动 PG/Redis，并提示下一步
 cargo run -p qe-api                    # 启动 API（自动迁移 + 创建管理员）
 cargo test --workspace                # 单元测试（5 个 crate）
+make integration                       # 真实 PostgreSQL + Redis 集成测试
+make mail-up                           # 可选：Mailpit，http://127.0.0.1:8025
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
@@ -352,6 +436,10 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d
 
 `compose.prod.yaml` 会移除本地构建、去掉 PostgreSQL 的宿主端口。
 
+Kubernetes 部署请使用 `deploy/k8s/deployment.yaml`：`readinessProbe` + `preStop` +
+PDB 做主动摘流，说明见 [docs/K8S.md](docs/K8S.md)。开源 nginx 的 `max_fails`
+仍只是被动检查，不能替代 readiness。
+
 ### HTTPS
 
 当前 nginx 只监听 80。生产建议在它前面放云负载均衡/Ingress 做 TLS 终止，或给 nginx 挂证书并加 443 server 块；应用只信任 `X-Forwarded-Proto`，不直接处理证书。
@@ -361,7 +449,8 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d
 工作流：`.gitea/workflows/ci.yml`
 
 1. `test` job：`cargo fmt --all --check` → `cargo clippy --workspace --all-targets -D warnings` → `cargo test --workspace`。
-2. `image` job（push/tag 触发）：构建镜像并推送，标签为 `sha-<短 commit>` 与 `latest`（默认分支）。
+2. `integration` job：启动 PostgreSQL/Redis，执行 `scripts/test-integration.sh`。
+3. `image` job（push/tag 触发）：构建镜像并推送，标签为 `sha-<短 commit>` 与 `latest`（默认分支）。
 
 在 Gitea 仓库 **Settings → Actions** 配置：
 
@@ -391,15 +480,13 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d api
 
 ### 已知限制 / 后续可做
 
-- nginx 开源版只有被动健康检查（`max_fails`），Docker healthcheck 不会自动把副本从 DNS 移除；生产可换 K8s/云 LB 做主动摘流。
-- 公告 `content` 按原样存储，前端渲染 HTML/Markdown 时必须做 XSS 过滤（当前接口不负责清洗）。
-- 登录没有失败次数限制，建议在 nginx 或 Redis 加限流/锁定。
-- 没有审计日志表（谁改了哪个用户/角色/公告）。
-- 没有接入 OpenTelemetry span 导出和日志采集器；当前只有请求级 trace_id 与 JSON 日志。
-- 没有开放 API 文档（可接 utoipa + Swagger UI）。
-- 没有密码找回、邮箱验证、多设备会话管理。
-- 公告列表未缓存；如需高读吞吐可按 RBAC 同样的代际思路加缓存。
-- 集成测试需要真实 PG/Redis，目前只有单元测试。
+- nginx 开源版只有被动健康检查（`max_fails`），Docker healthcheck 不会自动把副本从 DNS 移除；生产建议用 K8s readiness + preStop + PDB，清单在 `deploy/k8s/`，说明见 `docs/K8S.md`。
+- 公告写入/读取已做 HTML 清洗；前端渲染 Markdown 时仍需使用安全的 Markdown 渲染器，不能直接 `innerHTML`。
+- 登录失败限制按用户名计数；生产仍建议在 nginx/网关按 IP 做额外限流，防止轮换用户名。
+- 审计日志已落库并可按 `audit:read` 查询；客户端 IP 来自 `X-Real-IP`/`X-Forwarded-For`，直接暴露 API 时需要网关覆盖这两个头。审计归档/防篡改链未做。
+- OTLP trace 导出已接入；日志默认走 JSON stdout → Alloy/Loki。设置 `OTEL_LOGS_ENABLED=true` 可同时导出 OTLP logs；两者同时开启会重复采集，按部署环境二选一。
+- 密码找回、邮箱验证、多设备会话已实现；`EMAIL_DRIVER=smtp` 时使用 SMTP（本地可用 `compose.mail.yaml` 的 Mailpit）。`log` 仅用于开发。
+- 集成测试已提供 `scripts/test-integration.sh`，CI 的 `integration` job 会启动 PostgreSQL/Redis 并运行。
 
 ## 数据库抖动与故障处理
 
@@ -416,7 +503,7 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d api
 - 建议监控：503 比例、`PoolTimedOut` 日志、PostgreSQL 连接数/锁等待/慢查询、请求 P99；告警优先看 `/readyz` 和 5xx。
 - 大表 DDL 请用独立迁移 job，并把应用设为 `RUN_MIGRATIONS=false`，避免 10s `statement_timeout` 中断迁移。
 
-公共公告列表目前没有 Redis 降级缓存，数据库不可用时会直接 503。如果业务要求“数据库挂了仍可读公告”，可以加短 TTL 缓存 + 写时失效，代价是短暂旧数据。
+公开公告列表有 30 秒 Redis 代际缓存；缓存未命中且数据库不可用时仍会返回 503。若需要数据库故障期间持续可读，可延长 TTL 并做启动预热，代价是短暂旧数据。
 
 ## 排障
 

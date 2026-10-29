@@ -1,7 +1,10 @@
+#![recursion_limit = "256"]
+
 pub mod api;
 pub mod auth;
 pub mod bootstrap;
 pub mod config;
+pub mod email;
 pub mod error;
 pub mod state;
 
@@ -21,7 +24,7 @@ pub async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     let config = Config::from_env()?;
-    init_tracing(config.log_format_json);
+    let _otel_provider = init_tracing(config.log_format_json);
 
     tracing::info!(addr = %config.bind_addr, "正在启动 backend");
 
@@ -57,9 +60,88 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_tracing(json: bool) {
+struct TelemetryGuard {
+    _tracer: opentelemetry_sdk::trace::SdkTracerProvider,
+    _logger: opentelemetry_sdk::logs::SdkLoggerProvider,
+}
+
+fn init_tracing(json: bool) -> Option<TelemetryGuard> {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_otlp::WithExportConfig;
+
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn,hyper=warn"));
+
+    let otel = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|endpoint| {
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_endpoint(endpoint.clone())
+                .build()
+                .map_err(|error| eprintln!("OTLP span exporter init failed: {error}"))
+                .ok()?;
+            let resource = opentelemetry_sdk::Resource::builder()
+                .with_service_name(
+                    std::env::var("OTEL_SERVICE_NAME")
+                        .unwrap_or_else(|_| "qestudio-backend".to_owned()),
+                )
+                .build();
+            let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(resource.clone())
+                .build();
+            let tracer = tracer_provider.tracer("qe-api");
+
+            let logs_enabled = std::env::var("OTEL_LOGS_ENABLED")
+                .ok()
+                .is_some_and(|value| {
+                    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+                });
+            let mut logger_builder =
+                opentelemetry_sdk::logs::SdkLoggerProvider::builder().with_resource(resource);
+            if logs_enabled {
+                match opentelemetry_otlp::LogExporter::builder()
+                    .with_http()
+                    .with_endpoint(endpoint)
+                    .build()
+                {
+                    Ok(exporter) => {
+                        logger_builder = logger_builder.with_simple_exporter(exporter);
+                    }
+                    Err(error) => eprintln!("OTLP log exporter init failed: {error}"),
+                }
+            }
+            let logger_provider = logger_builder.build();
+            Some((tracer_provider, tracer, logger_provider))
+        });
+
+    if let Some((tracer_provider, tracer, logger_provider)) = otel {
+        let log_bridge = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(
+            &logger_provider,
+        );
+        if json {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().json().flatten_event(true))
+                .with(tracing_opentelemetry::layer().with_tracer(tracer.clone()))
+                .with(log_bridge)
+                .init();
+        } else {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer())
+                .with(tracing_opentelemetry::layer().with_tracer(tracer))
+                .with(log_bridge)
+                .init();
+        }
+        tracing::info!("OpenTelemetry OTLP trace/log export 已启用");
+        return Some(TelemetryGuard {
+            _tracer: tracer_provider,
+            _logger: logger_provider,
+        });
+    }
 
     if json {
         tracing_subscriber::registry()
@@ -72,6 +154,7 @@ fn init_tracing(json: bool) {
             .with(tracing_subscriber::fmt::layer())
             .init();
     }
+    None
 }
 
 async fn shutdown_signal() {

@@ -14,6 +14,16 @@ pub struct Config {
     pub refresh_token_ttl_secs: i64,
     pub request_timeout_secs: u64,
     pub max_body_bytes: usize,
+    pub login_max_attempts: u32,
+    pub login_window_secs: u64,
+    pub login_lock_secs: u64,
+    pub announcement_cache_secs: u64,
+    pub public_base_url: String,
+    pub password_reset_ttl_secs: u64,
+    pub email_verification_ttl_secs: u64,
+    pub email_driver: String,
+    pub smtp_url: String,
+    pub smtp_from: String,
     pub cors_allowed_origins: Vec<String>,
     pub run_migrations: bool,
     pub bootstrap_admin_username: Option<String>,
@@ -67,6 +77,25 @@ impl Config {
             bail!("DB_MAX_CONNECTIONS 必须大于 0");
         }
 
+        let login_max_attempts = env_parse("LOGIN_MAX_ATTEMPTS", 5_u32)?;
+        let login_window_secs = env_parse("LOGIN_WINDOW_SECONDS", 300_u64)?;
+        let login_lock_secs = env_parse("LOGIN_LOCK_SECONDS", 900_u64)?;
+        let announcement_cache_secs = env_parse("ANNOUNCEMENT_CACHE_SECONDS", 30_u64)?;
+        let public_base_url = env_optional("PUBLIC_BASE_URL")
+            .unwrap_or_else(|| "http://localhost:5173".to_owned())
+            .trim_end_matches('/')
+            .to_owned();
+        let password_reset_ttl_secs = env_parse("PASSWORD_RESET_TTL_SECONDS", 1800_u64)?;
+        let email_verification_ttl_secs = env_parse("EMAIL_VERIFICATION_TTL_SECONDS", 86_400_u64)?;
+        let email_driver = env_optional("EMAIL_DRIVER").unwrap_or_else(|| "log".to_owned());
+        let smtp_url =
+            env_optional("SMTP_URL").unwrap_or_else(|| "smtp://127.0.0.1:1025".to_owned());
+        let smtp_from = env_optional("SMTP_FROM")
+            .unwrap_or_else(|| "QEStudio <no-reply@qestudio.local>".to_owned());
+        if login_max_attempts == 0 || login_window_secs == 0 || login_lock_secs == 0 {
+            bail!("LOGIN_MAX_ATTEMPTS / LOGIN_WINDOW_SECONDS / LOGIN_LOCK_SECONDS 必须大于 0");
+        }
+
         Ok(Self {
             bind_addr,
             database_url,
@@ -77,6 +106,16 @@ impl Config {
             refresh_token_ttl_secs,
             request_timeout_secs: env_parse("REQUEST_TIMEOUT_SECONDS", 30_u64)?,
             max_body_bytes: env_parse("MAX_BODY_BYTES", 2 * 1024 * 1024_usize)?,
+            login_max_attempts,
+            login_window_secs,
+            login_lock_secs,
+            announcement_cache_secs,
+            public_base_url,
+            password_reset_ttl_secs,
+            email_verification_ttl_secs,
+            email_driver,
+            smtp_url,
+            smtp_from,
             cors_allowed_origins,
             run_migrations: env_parse_bool("RUN_MIGRATIONS", true)?,
             bootstrap_admin_username,

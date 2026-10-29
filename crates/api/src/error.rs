@@ -24,6 +24,8 @@ pub enum AppError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    TooManyRequests(String),
+    #[error("{0}")]
     ServiceUnavailable(String),
     #[error("{0}")]
     Internal(String),
@@ -50,6 +52,10 @@ impl AppError {
         Self::Conflict(message.into())
     }
 
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self::TooManyRequests(message.into())
+    }
+
     pub fn service_unavailable(message: impl Into<String>) -> Self {
         Self::ServiceUnavailable(message.into())
     }
@@ -65,6 +71,7 @@ impl AppError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -77,6 +84,7 @@ impl AppError {
             Self::Forbidden(_) => "forbidden",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
+            Self::TooManyRequests(_) => "too_many_requests",
             Self::ServiceUnavailable(_) => "service_unavailable",
             Self::Internal(_) => "internal_error",
         }

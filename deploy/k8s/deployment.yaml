@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qestudio-api
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: qestudio-api
+  template:
+    metadata:
+      labels:
+        app: qestudio-api
+    spec:
+      terminationGracePeriodSeconds: 35
+      containers:
+        - name: api
+          image: registry.example.com/qestudio/backend:latest
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: qestudio-api
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # 给 Service/Endpoints 摘流和 nginx 连接排空留时间。
+                command: ["/bin/sh", "-c", "sleep 10"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qestudio-api
+spec:
+  selector:
+    app: qestudio-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: qestudio-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: qestudio-api

@@ -11,6 +11,8 @@ authors.workspace = true
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 dotenvy = "0.15"
 qe-auth = { path = "../auth" }
 qe-cache = { path = "../cache" }
@@ -35,5 +37,20 @@ tower-http = { version = "0.6", features = [
     "timeout",
 ] }
 tracing = "0.1"
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-client", "trace", "logs"] }
+opentelemetry-appender-tracing = "0.31"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+] }

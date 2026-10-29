@@ -13,6 +13,7 @@ pub mod permissions {
     pub const ANNOUNCEMENT_DELETE: &str = "announcement:delete";
     pub const USER_MANAGE: &str = "user:manage";
     pub const ROLE_MANAGE: &str = "role:manage";
+    pub const AUDIT_READ: &str = "audit:read";
 
     pub const ALL: &[&str] = &[
         ANNOUNCEMENT_READ,
@@ -21,6 +22,7 @@ pub mod permissions {
         ANNOUNCEMENT_DELETE,
         USER_MANAGE,
         ROLE_MANAGE,
+        AUDIT_READ,
     ];
 }
 

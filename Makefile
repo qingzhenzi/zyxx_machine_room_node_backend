@@ -1,4 +1,4 @@
-.PHONY: help fmt fmt-check clippy test check build run up down logs ps migrate secret obs-up obs-down obs-logs
+.PHONY: help fmt fmt-check clippy test check build run dev-up dev-down mail-up integration up down logs ps migrate secret obs-up obs-down obs-logs
 
 help: ## 显示可用命令
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -25,6 +25,19 @@ run: ## 本地启动（需要 .env 中的 PG/Redis）
 
 up: ## 构建并启动完整环境（nginx + 2 个 API 副本 + PG + Redis）
 	docker compose up -d --build
+
+dev-up: ## 只启动本地开发依赖 PG/Redis
+	docker compose up -d postgres redis
+	@echo "依赖已启动。下一步：cargo run -p qe-api"
+
+dev-down: ## 停止本地开发依赖（保留数据卷）
+	docker compose stop postgres redis
+
+mail-up: ## 启动本地 Mailpit（SMTP 1025 / Web 8025）
+	docker compose -f compose.yaml -f compose.mail.yaml up -d mailpit
+
+integration: ## 真实 PostgreSQL/Redis 集成测试
+	scripts/test-integration.sh
 
 down: ## 停止并移除容器（保留数据卷）
 	docker compose down

@@ -33,6 +33,28 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Start PostgreSQL and Redis
+        run: docker compose up -d postgres redis
+
+      - name: Run integration tests
+        run: scripts/test-integration.sh
+
+      - name: Stop dependencies
+        if: always()
+        run: docker compose stop postgres redis
+
   image:
     needs: test
     if: github.event_name != 'pull_request'

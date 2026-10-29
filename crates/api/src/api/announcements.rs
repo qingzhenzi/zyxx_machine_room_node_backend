@@ -22,7 +22,13 @@ pub async fn list(
     let (page, page_size) = validation::page_params(query.page, query.page_size)?;
     let keyword = validation::normalize_keyword(query.keyword.as_deref())?;
 
-    let result = state
+    let version = state.cache.announcement_version().await.unwrap_or(0);
+    let cache_key = format!("announcements:public:v{version}:p{page}:s{page_size}:k{keyword}");
+    if let Ok(Some(cached)) = state.cache.get_json::<Page<Announcement>>(&cache_key).await {
+        return Ok(Json(cached));
+    }
+
+    let mut result = state
         .announcements
         .list(
             Some(AnnouncementStatus::Published),
@@ -31,6 +37,18 @@ pub async fn list(
             page_size,
         )
         .await?;
+    for announcement in &mut result.items {
+        announcement.content = validation::sanitize_announcement_content(&announcement.content);
+    }
+
+    if let Err(error) = state
+        .cache
+        .set_json(&cache_key, &result, state.config.announcement_cache_secs)
+        .await
+    {
+        tracing::warn!(%error, "写入公告列表缓存失败");
+    }
+
     Ok(Json(result))
 }
 
@@ -45,5 +63,7 @@ pub async fn get(
         .await?
         .filter(|announcement| announcement.status == AnnouncementStatus::Published)
         .ok_or_else(|| AppError::not_found("公告不存在"))?;
+    let mut announcement = announcement;
+    announcement.content = validation::sanitize_announcement_content(&announcement.content);
     Ok(Json(announcement))
 }
