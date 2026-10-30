@@ -22,6 +22,8 @@ pub enum AppError {
     #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
+    MethodNotAllowed(String),
+    #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
     TooManyRequests(String),
@@ -48,6 +50,10 @@ impl AppError {
         Self::NotFound(message.into())
     }
 
+    pub fn method_not_allowed(message: impl Into<String>) -> Self {
+        Self::MethodNotAllowed(message.into())
+    }
+
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::Conflict(message.into())
     }
@@ -70,6 +76,7 @@ impl AppError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -83,6 +90,7 @@ impl AppError {
             Self::Unauthorized(_) => "unauthorized",
             Self::Forbidden(_) => "forbidden",
             Self::NotFound(_) => "not_found",
+            Self::MethodNotAllowed(_) => "method_not_allowed",
             Self::Conflict(_) => "conflict",
             Self::TooManyRequests(_) => "too_many_requests",
             Self::ServiceUnavailable(_) => "service_unavailable",

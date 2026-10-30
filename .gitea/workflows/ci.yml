@@ -35,6 +35,9 @@ jobs:
 
   integration:
     runs-on: ubuntu-latest
+    env:
+      # 仅用于 compose 解析；集成测试不会启动 API。
+      JWT_SECRET: integration-only-secret-0123456789abcdef
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -56,7 +59,7 @@ jobs:
         run: docker compose stop postgres redis
 
   image:
-    needs: test
+    needs: [test, integration]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:

@@ -1,13 +1,21 @@
 # 生产环境覆盖文件：使用 CI 推送的镜像，不再本地构建，也不暴露数据库端口。
 # 用法：docker compose -f compose.yaml -f compose.prod.yaml pull
 #       docker compose -f compose.yaml -f compose.prod.yaml up -d
+#
+# 必须显式提供（compose 会在缺失时直接报错）：
+#   JWT_SECRET、BOOTSTRAP_ADMIN_PASSWORD、POSTGRES_PASSWORD、BACKEND_IMAGE
 services:
   api:
     build: !reset null
     image: ${BACKEND_IMAGE:?请设置 BACKEND_IMAGE，例如 registry.example.com/team/backend:latest}
+    environment:
+      APP_ENV: production
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?生产环境必须显式设置 BOOTSTRAP_ADMIN_PASSWORD}
 
   postgres:
     ports: !reset []
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?生产环境必须显式设置 POSTGRES_PASSWORD}
 
   redis:
     ports: !reset []

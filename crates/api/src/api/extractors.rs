@@ -6,7 +6,7 @@ use axum::{
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use crate::{error::AppError, state::AppState};
+use crate::{auth::SESSION_ACTIVE_CACHE_TTL_SECS, error::AppError, state::AppState};
 
 /// 已通过访问令牌认证的用户。
 #[derive(Debug, Clone, Copy)]
@@ -49,10 +49,7 @@ impl FromRequestParts<AppState> for AuthUser {
                     if active {
                         let _ = state
                             .cache
-                            .mark_session_active(
-                                session_id,
-                                state.config.refresh_token_ttl_secs as u64,
-                            )
+                            .mark_session_active(session_id, SESSION_ACTIVE_CACHE_TTL_SECS)
                             .await;
                     }
                     active

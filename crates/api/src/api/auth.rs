@@ -60,6 +60,21 @@ pub async fn login(
     headers: HeaderMap,
     ApiJson(request): ApiJson<LoginRequest>,
 ) -> AppResult<Json<TokenResponse>> {
+    if let Some(ip) = ip.as_deref()
+        && let Some(retry_after) = state
+            .cache
+            .check_rate_limit(
+                &format!("rate:login:ip:{ip}"),
+                u64::from(state.config.login_ip_max_attempts),
+                state.config.login_ip_window_secs,
+            )
+            .await?
+    {
+        return Err(AppError::too_many_requests(format!(
+            "登录请求过于频繁，请 {retry_after} 秒后重试"
+        )));
+    }
+
     let username = validation::normalize_username(&request.username)
         .map_err(|_| AppError::unauthorized("用户名或密码错误"))?;
 
@@ -162,11 +177,43 @@ pub async fn me(
 
 pub async fn forgot_password(
     State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
     ApiJson(request): ApiJson<ForgotPasswordRequest>,
 ) -> AppResult<StatusCode> {
     // 无论邮箱是否存在都返回 204，避免账号枚举。
-    let email = request.email.trim();
-    if let Some(user) = state.users.find_by_email(email).await?
+    let email = request.email.trim().to_ascii_lowercase();
+    let email_key = format!(
+        "rate:password-forgot:email:{}",
+        session::refresh_token_hash(&email)
+    );
+    if let Some(retry_after) = state
+        .cache
+        .check_rate_limit(
+            &email_key,
+            u64::from(state.config.email_rate_limit_max),
+            state.config.email_rate_limit_window_secs,
+        )
+        .await?
+    {
+        return Err(AppError::too_many_requests(format!(
+            "请求过于频繁，请 {retry_after} 秒后重试"
+        )));
+    }
+    if let Some(ip) = ip.as_deref()
+        && let Some(retry_after) = state
+            .cache
+            .check_rate_limit(
+                &format!("rate:password-forgot:ip:{ip}"),
+                u64::from(state.config.email_rate_limit_max),
+                state.config.email_rate_limit_window_secs,
+            )
+            .await?
+    {
+        return Err(AppError::too_many_requests(format!(
+            "请求过于频繁，请 {retry_after} 秒后重试"
+        )));
+    }
+    if let Some(user) = state.users.find_by_email(&email).await?
         && user.is_active
     {
         let token = new_token();
@@ -176,7 +223,7 @@ pub async fn forgot_password(
             .security
             .create_password_reset(user.id, &session::refresh_token_hash(&token), expires_at)
             .await?;
-        state.email.send_password_reset(email, &token).await;
+        state.email.send_password_reset(&email, &token).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -205,7 +252,36 @@ pub async fn reset_password(
 pub async fn request_email_verification(
     State(state): State<AppState>,
     AuthUser { id }: AuthUser,
+    ClientIp(ip): ClientIp,
 ) -> AppResult<StatusCode> {
+    let user_key = format!("rate:email-verify:user:{id}");
+    if let Some(retry_after) = state
+        .cache
+        .check_rate_limit(
+            &user_key,
+            u64::from(state.config.email_rate_limit_max),
+            state.config.email_rate_limit_window_secs,
+        )
+        .await?
+    {
+        return Err(AppError::too_many_requests(format!(
+            "请求过于频繁，请 {retry_after} 秒后重试"
+        )));
+    }
+    if let Some(ip) = ip.as_deref()
+        && let Some(retry_after) = state
+            .cache
+            .check_rate_limit(
+                &format!("rate:email-verify:ip:{ip}"),
+                u64::from(state.config.email_rate_limit_max),
+                state.config.email_rate_limit_window_secs,
+            )
+            .await?
+    {
+        return Err(AppError::too_many_requests(format!(
+            "请求过于频繁，请 {retry_after} 秒后重试"
+        )));
+    }
     let Some(user) = state.users.find_by_id(id).await? else {
         return Err(AppError::not_found("账号不存在"));
     };
@@ -315,7 +391,7 @@ async fn issue_tokens(
 
     let _ = state
         .cache
-        .mark_session_active(session_id, state.config.refresh_token_ttl_secs as u64)
+        .mark_session_active(session_id, crate::auth::SESSION_ACTIVE_CACHE_TTL_SECS)
         .await;
 
     let user_profile = authorization::profile_of(state, user).await?;

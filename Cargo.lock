@@ -1634,6 +1634,7 @@ dependencies = [
  "axum",
  "chrono",
  "dotenvy",
+ "http-body-util",
  "lettre",
  "opentelemetry",
  "opentelemetry-appender-tracing",

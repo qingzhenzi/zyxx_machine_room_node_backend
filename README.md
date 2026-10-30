@@ -12,7 +12,28 @@
 - OpenAPI 文档：`/docs`，JSON：`/api-docs/openapi.json`
 - 可选 OTLP/HTTP trace 导出（`OTEL_EXPORTER_OTLP_ENDPOINT`）
 - Docker 多阶段构建，nginx 反向代理 + 多副本负载均衡
-- Gitea Actions：格式检查、Clippy、单测、镜像构建并推送到 Gitea Registry
+- GitHub Actions / Gitea Actions：格式检查、Clippy、单测、集成测试、镜像构建
+
+## 从模板开始
+
+1. 在 GitHub 点击 **Use this template**（或 clone 后删除 `.git`）。
+2. 初始化项目标识：
+   ```bash
+   scripts/init-template.sh acme "Acme" https://github.com/acme/backend
+   ```
+   脚本会替换 `qestudio` / `QEStudio` / `qe-*`，并校验 Cargo manifest；`--yes` 跳过确认。
+   `display-name` 用品牌名（如 `Acme`），不要带 `Backend`，否则 README 标题会重复。
+3. 生成开发配置：
+   ```bash
+   cp .env.example .env
+   make secret          # 生成 JWT_SECRET，手动写入 .env
+   ```
+4. 修改 `.env` 中的 `POSTGRES_PASSWORD`、`BOOTSTRAP_ADMIN_PASSWORD`、`CORS_ALLOWED_ORIGINS`。
+5. 跑完整检查：`make check && make integration`。
+
+也可以直接 `make init SLUG=acme NAME="Acme"`；`make init` 会调用同一个脚本。
+
+生产环境把 `APP_ENV` 设为 `production`；此时启动会拒绝示例 JWT、示例管理员/数据库密码和通配 CORS。
 
 ## 技术选型
 
@@ -94,6 +115,7 @@ qe-api ──► qe-db ──► qe-domain ──► qe-auth
 ```bash
 cp .env.example .env
 # 生产/长期使用务必修改：
+#   APP_ENV=production
 #   JWT_SECRET=$(openssl rand -hex 32)
 #   POSTGRES_PASSWORD
 #   BOOTSTRAP_ADMIN_PASSWORD
@@ -175,12 +197,12 @@ for i in $(seq 1 6); do curl -s http://localhost:8080/healthz; echo; done
 
 邮件：
 
-- `EMAIL_DRIVER=log`（默认）：只把链接写入服务端日志，适合开发。
+- `EMAIL_DRIVER=log`（默认）：只把链接写入 debug 日志，适合开发；默认 `RUST_LOG=info` 看不到链接。
 - `EMAIL_DRIVER=smtp`：通过 `SMTP_URL` 发送 HTML 邮件；本地用 Mailpit 验证：
   ```bash
   docker compose -f compose.yaml -f compose.mail.yaml up -d mailpit
   EMAIL_DRIVER=smtp SMTP_URL=smtp://127.0.0.1:1025 cargo run -p qe-api
-  # 打开 http://127.0.0.1:8025 查看邮件
+  # 打开 http://127.0.0.1:8025 查看邮件（或 RUST_LOG=debug 看日志链接）
   ```
 - 生产可把 `SMTP_URL` 换成企业 SMTP/API 网关；`SMTP_FROM` 必须是允许的发件人。
 
@@ -235,13 +257,13 @@ audit:read
 
 安全约束：不能停用自己；不能停用/降级**最后一个启用中的管理员**。
 
-### 登录失败限制
+### 登录与邮件限流
 
-- 同一用户名连续失败默认 5 次（`LOGIN_MAX_ATTEMPTS`）
-- 窗口默认 5 分钟（`LOGIN_WINDOW_SECONDS`）
-- 达到阈值后锁定默认 15 分钟（`LOGIN_LOCK_SECONDS`），返回 `429 too_many_requests`
-- 登录成功会清除失败计数和锁定
-- 计数在 Redis，多副本共享；生产还建议在 nginx/网关按 IP 做一层限流，防止攻击者轮换用户名
+- 同一用户名连续失败默认 5 次（`LOGIN_MAX_ATTEMPTS`），窗口 5 分钟，锁定 15 分钟
+- 同一 IP 的登录尝试默认 60 次/5 分钟（`LOGIN_IP_MAX_ATTEMPTS` / `LOGIN_IP_WINDOW_SECONDS`），成功登录也计数
+- 找回密码/邮箱验证默认 5 次/15 分钟（`EMAIL_RATE_LIMIT_MAX` / `EMAIL_RATE_LIMIT_WINDOW_SECONDS`），按邮箱/用户和 IP 分别计数
+- 达到阈值返回 `429 too_many_requests`，登录成功会清除失败计数和锁定
+- 计数在 Redis，多副本共享；代理池/分布式攻击仍建议在 nginx/网关做全局限流
 
 ### 公告内容安全与缓存
 
@@ -254,7 +276,7 @@ audit:read
 
 - 表：`audit_logs`，迁移 `0003_audit.sql`
 - 记录动作：`user.create/update/set_roles`、`role.create/set_permissions/delete`、`announcement.create/update/delete`
-- 记录 actor 快照、资源类型/ID、JSON 明细、时间；IP 暂未采集
+- 记录 actor 快照、资源类型/ID、JSON 明细、时间与客户端 IP（`0005_audit_ip.sql`）
 - 查询：`GET /api/v1/admin/audit-logs`，需要 `audit:read`
 
 ### OpenAPI
@@ -373,11 +395,16 @@ Grafana Explore 里可以直接查：
 | `BOOTSTRAP_ADMIN_USERNAME` | 空 | 设置后尝试创建引导管理员 |
 | `BOOTSTRAP_ADMIN_PASSWORD` | 空 | 引导管理员密码 |
 | `BOOTSTRAP_ADMIN_DISPLAY_NAME` | `Administrator` | 显示名 |
+| `APP_ENV` | `development` | `production` 时拒绝示例密钥/通配 CORS |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | 单请求超时 |
 | `MAX_BODY_BYTES` | `2097152` | 请求体上限（2 MiB） |
 | `LOGIN_MAX_ATTEMPTS` | `5` | 登录失败次数阈值 |
 | `LOGIN_WINDOW_SECONDS` | `300` | 失败计数窗口 |
 | `LOGIN_LOCK_SECONDS` | `900` | 触发阈值后的锁定时长 |
+| `LOGIN_IP_MAX_ATTEMPTS` | `60` | 同一 IP 登录窗口内最大尝试次数 |
+| `LOGIN_IP_WINDOW_SECONDS` | `300` | 登录 IP 计数窗口 |
+| `EMAIL_RATE_LIMIT_MAX` | `5` | 找回密码/邮箱验证窗口内最大次数 |
+| `EMAIL_RATE_LIMIT_WINDOW_SECONDS` | `900` | 邮件类接口计数窗口 |
 | `ANNOUNCEMENT_CACHE_SECONDS` | `30` | 公开公告列表缓存 TTL |
 | `PUBLIC_BASE_URL` | `http://localhost:5173` | 邮件链接前缀 |
 | `PASSWORD_RESET_TTL_SECONDS` | `1800` | 密码重置令牌有效期 |
@@ -426,10 +453,13 @@ cargo fmt --all -- --check
 
 nginx 使用 `resolver 127.0.0.11` + `server api:8080 resolve`，每 5 秒重新解析 Docker DNS，因此 `docker compose up -d --scale api=3` 后无需重启 nginx。
 
-生产环境用 Gitea CI 产出的镜像：
+生产环境用 CI 产出的镜像：
 
 ```bash
 export BACKEND_IMAGE=registry.example.com/team/backend:latest
+export POSTGRES_PASSWORD="$(openssl rand -hex 16)"
+export BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -base64 24)"
+export JWT_SECRET="$(openssl rand -hex 32)"
 docker compose -f compose.yaml -f compose.prod.yaml pull
 docker compose -f compose.yaml -f compose.prod.yaml up -d
 ```
@@ -444,13 +474,15 @@ PDB 做主动摘流，说明见 [docs/K8S.md](docs/K8S.md)。开源 nginx 的 `m
 
 当前 nginx 只监听 80。生产建议在它前面放云负载均衡/Ingress 做 TLS 终止，或给 nginx 挂证书并加 443 server 块；应用只信任 `X-Forwarded-Proto`，不直接处理证书。
 
-## Gitea Actions
+## GitHub Actions / Gitea Actions
 
-工作流：`.gitea/workflows/ci.yml`
+GitHub 工作流：`.github/workflows/ci.yml`（镜像推送到 GHCR）；Gitea 工作流：`.gitea/workflows/ci.yml`（镜像推送到 Gitea Registry）。两边都包含 test、integration、image 三个 job，image 依赖 test + integration。
+
+Gitea 工作流步骤：
 
 1. `test` job：`cargo fmt --all --check` → `cargo clippy --workspace --all-targets -D warnings` → `cargo test --workspace`。
-2. `integration` job：启动 PostgreSQL/Redis，执行 `scripts/test-integration.sh`。
-3. `image` job（push/tag 触发）：构建镜像并推送，标签为 `sha-<短 commit>` 与 `latest`（默认分支）。
+2. `integration` job：启动 PostgreSQL/Redis，执行 `scripts/test-integration.sh`（含 HTTP 登录/刷新/RBAC/会话撤销测试）。
+3. `image` job（push/tag 触发，依赖前两个 job）：构建镜像并推送，标签为 `sha-<短 commit>` 与 `latest`（默认分支）。
 
 在 Gitea 仓库 **Settings → Actions** 配置：
 
@@ -462,7 +494,7 @@ PDB 做主动摘流，说明见 [docs/K8S.md](docs/K8S.md)。开源 nginx 的 `m
 
 Runner 必须能访问 Docker daemon（挂载 `/var/run/docker.sock` 或使用 DinD）。没有 Docker 权限时，`test` job 仍可运行，把 `image` job 去掉即可。
 
-镜像名使用 `${{ vars.REGISTRY }}/${{ github.repository }}`，请确保仓库路径为小写（Docker tag 不允许大写）。
+Gitea 镜像名使用 `${{ vars.REGISTRY }}/${{ github.repository }}`，请确保仓库路径为小写（Docker tag 不允许大写）。GitHub 侧默认推送到 `ghcr.io/<owner>/<repo>`，使用内置 `GITHUB_TOKEN`，只需在仓库 Settings → Actions 允许写 packages。
 
 服务器更新：
 
@@ -485,8 +517,11 @@ docker compose -f compose.yaml -f compose.prod.yaml up -d api
 - 登录失败限制按用户名计数；生产仍建议在 nginx/网关按 IP 做额外限流，防止轮换用户名。
 - 审计日志已落库并可按 `audit:read` 查询；客户端 IP 来自 `X-Real-IP`/`X-Forwarded-For`，直接暴露 API 时需要网关覆盖这两个头。审计归档/防篡改链未做。
 - OTLP trace 导出已接入；日志默认走 JSON stdout → Alloy/Loki。设置 `OTEL_LOGS_ENABLED=true` 可同时导出 OTLP logs；两者同时开启会重复采集，按部署环境二选一。
-- 密码找回、邮箱验证、多设备会话已实现；`EMAIL_DRIVER=smtp` 时使用 SMTP（本地可用 `compose.mail.yaml` 的 Mailpit）。`log` 仅用于开发。
-- 集成测试已提供 `scripts/test-integration.sh`，CI 的 `integration` job 会启动 PostgreSQL/Redis 并运行。
+- 密码找回、邮箱验证、多设备会话已实现；`EMAIL_DRIVER=smtp` 时使用 SMTP（本地可用 `compose.mail.yaml` 的 Mailpit）。`log` 仅用于开发，且默认不把令牌写进 info 日志。
+- 集成测试已提供 `scripts/test-integration.sh`，覆盖仓储、缓存、登录/刷新/RBAC/会话撤销和安全响应头。
+- `announcements` 是示例业务模块，用于演示 CRUD + RBAC + 缓存；不需要时删除对应 handler、repo、路由和权限即可。
+- `/docs` 的 Swagger UI 从 unpkg CDN 加载资源，离线/内网部署需要自托管静态资源或改用其他文档页。
+- K8s 清单是 starter：Ingress/TLS、NetworkPolicy、HPA、外部 Secret 需要按环境补。
 
 ## 数据库抖动与故障处理
 

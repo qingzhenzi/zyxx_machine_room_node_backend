@@ -6,13 +6,14 @@ pub mod openapi;
 pub mod trace;
 pub mod validation;
 
-use std::time::Duration;
+use std::{any::Any, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Request, State},
     http::{HeaderName, HeaderValue, Method, StatusCode, header},
-    middleware,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
@@ -22,15 +23,17 @@ use tower_http::{
     compression::CompressionLayer,
     cors::{AllowOrigin, CorsLayer},
     limit::RequestBodyLimitLayer,
+    set_header::SetResponseHeaderLayer,
     timeout::TimeoutLayer,
 };
 
-use crate::state::AppState;
+use crate::{error::AppError, state::AppState};
 
 pub fn router(state: AppState) -> Router {
     let cors = build_cors(&state);
     let timeout = state.config.request_timeout();
     let max_body_bytes = state.config.max_body_bytes;
+    let production = state.config.environment.is_production();
 
     Router::new()
         .route("/healthz", get(healthz))
@@ -38,11 +41,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api-docs/openapi.json", get(openapi::json_spec))
         .route("/docs", get(openapi::ui))
         .nest("/api/v1", api_v1())
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(
             ServiceBuilder::new()
                 // 追踪中间件放在最外层，确保错误响应/panic 响应也带 trace 头。
                 .layer(middleware::from_fn(trace::trace_middleware))
-                .layer(CatchPanicLayer::new())
+                .layer(middleware::from_fn(move |request, next| {
+                    security_headers(request, next, production)
+                }))
+                .layer(CatchPanicLayer::custom(handle_panic))
                 .layer(RequestBodyLimitLayer::new(max_body_bytes))
                 .layer(CompressionLayer::new())
                 // Cors 需要其内层响应体实现 Default，因此必须放在 Compression 之内。
@@ -55,30 +63,91 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// 统一给所有响应（含 404/405/panic）加基础安全头；HSTS 只在 production 下发送。
+async fn security_headers(request: Request, next: Next, production: bool) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+    );
+    if production {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    response
+}
+
+fn handle_panic(error: Box<dyn Any + Send + 'static>) -> Response {
+    let message = error
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| error.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic");
+    tracing::error!(panic = %message, "request panicked");
+    AppError::internal("panic").into_response()
+}
+
+async fn not_found() -> Response {
+    AppError::not_found("接口不存在").into_response()
+}
+
+async fn method_not_allowed() -> Response {
+    AppError::method_not_allowed("该接口不支持此 HTTP 方法").into_response()
+}
+
 fn api_v1() -> Router<AppState> {
     Router::new()
-        .route("/auth/login", post(auth::login))
-        .route("/auth/refresh", post(auth::refresh))
-        .route("/auth/logout", post(auth::logout))
-        .route("/auth/me", get(auth::me))
-        .route("/auth/password/forgot", post(auth::forgot_password))
-        .route("/auth/password/reset", post(auth::reset_password))
+        .nest("/auth", auth_routes())
+        .route("/announcements", get(announcements::list))
+        .route("/announcements/{id}", get(announcements::get))
+        // 管理接口可能包含用户/审计数据，禁止中间缓存。
+        .nest(
+            "/admin",
+            admin::router().layer(SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            )),
+        )
+}
+
+fn auth_routes() -> Router<AppState> {
+    Router::new()
+        .route("/login", post(auth::login))
+        .route("/refresh", post(auth::refresh))
+        .route("/logout", post(auth::logout))
+        .route("/me", get(auth::me))
+        .route("/password/forgot", post(auth::forgot_password))
+        .route("/password/reset", post(auth::reset_password))
         .route(
-            "/auth/email/verification",
+            "/email/verification",
             post(auth::request_email_verification),
         )
-        .route("/auth/email/verify", post(auth::verify_email))
+        .route("/email/verify", post(auth::verify_email))
         .route(
-            "/auth/sessions",
+            "/sessions",
             get(auth::list_sessions).delete(auth::revoke_all_sessions),
         )
         .route(
-            "/auth/sessions/{id}",
+            "/sessions/{id}",
             axum::routing::delete(auth::revoke_session),
         )
-        .route("/announcements", get(announcements::list))
-        .route("/announcements/{id}", get(announcements::get))
-        .nest("/admin", admin::router())
+        // 令牌响应不能被浏览器/代理缓存。
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
 }
 
 fn build_cors(state: &AppState) -> CorsLayer {

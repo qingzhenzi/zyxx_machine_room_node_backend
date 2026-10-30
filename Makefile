@@ -1,4 +1,8 @@
-.PHONY: help fmt fmt-check clippy test check build run dev-up dev-down mail-up integration up down logs ps migrate secret obs-up obs-down obs-logs
+.PHONY: help init fmt fmt-check clippy test check build run dev-up dev-down mail-up integration up down logs ps migrate secret obs-up obs-down obs-logs
+
+init: ## 从模板初始化（make init SLUG=acme NAME="Acme"）
+	@test -n "$(SLUG)" || (echo "用法: make init SLUG=acme NAME='Acme' [REPO=https://github.com/acme/backend]"; exit 1)
+	scripts/init-template.sh "$(SLUG)" "$(NAME)" "$(REPO)"
 
 help: ## 显示可用命令
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'

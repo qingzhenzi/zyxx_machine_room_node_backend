@@ -1,6 +1,7 @@
 target
 .git
 .gitignore
+.github
 .gitea
 .cargo
 .env

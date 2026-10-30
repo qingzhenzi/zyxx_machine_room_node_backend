@@ -4,6 +4,7 @@ metadata:
   name: qestudio-api
 spec:
   replicas: 2
+  revisionHistoryLimit: 3
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -18,15 +19,36 @@ spec:
         app: qestudio-api
     spec:
       terminationGracePeriodSeconds: 35
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: api
-          image: registry.example.com/qestudio/backend:latest
+          # 发布时换成 CI 产出的不可变 tag（sha-* 或 release tag），不要用 latest。
+          image: registry.example.com/qestudio/backend:0.1.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: http
               containerPort: 8080
           envFrom:
             - secretRef:
                 name: qestudio-api
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
           readinessProbe:
             httpGet:
               path: /readyz
@@ -51,6 +73,12 @@ spec:
             limits:
               cpu: "1"
               memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

@@ -34,6 +34,7 @@ tower-http = { version = "0.6", features = [
     "compression-gzip",
     "cors",
     "limit",
+    "set-header",
     "timeout",
 ] }
 tracing = "0.1"
@@ -46,6 +47,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring",

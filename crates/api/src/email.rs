@@ -72,11 +72,12 @@ impl EmailService {
 
     async fn send(&self, email: &str, subject: &str, html: &str, fallback_link: &str) {
         let Some(mailer) = &self.mailer else {
+            // 日志里不默认输出令牌；本地调试时用 RUST_LOG=debug 查看。
             tracing::info!(
                 email,
-                link = fallback_link,
-                "开发邮件发送器：{subject} 链接（未配置 SMTP，生产请设置 EMAIL_DRIVER=smtp）"
+                "开发邮件发送器：{subject}（未配置 SMTP，链接已隐藏；RUST_LOG=debug 可查看）"
             );
+            tracing::debug!(email, link = fallback_link, "开发邮件链接");
             return;
         };
 
@@ -102,7 +103,8 @@ impl EmailService {
         };
 
         if let Err(error) = mailer.send(message).await {
-            tracing::error!(%error, email, fallback_link, "SMTP 发送失败");
+            // 不记录 fallback_link，避免令牌进入集中日志。
+            tracing::error!(%error, email, "SMTP 发送失败");
         }
     }
 }

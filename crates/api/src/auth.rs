@@ -6,6 +6,10 @@
 
 pub use qe_auth::{jwt, password, session};
 
+/// 会话活跃缓存 TTL。撤销会话时删除缓存；短 TTL 同时限制
+/// “DB 读到 active 后与撤销并发”可能造成的过期窗口。
+pub const SESSION_ACTIVE_CACHE_TTL_SECS: u64 = 60;
+
 use uuid::Uuid;
 
 use crate::{

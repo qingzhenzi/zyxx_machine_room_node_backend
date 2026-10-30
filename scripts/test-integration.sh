@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# compose.yaml 对 JWT_SECRET 用了必填插值；集成测试不需要启动 API，
+# 这里给一个仅用于 compose 解析的占位值（API 进程不会使用它）。
+export JWT_SECRET="${JWT_SECRET:-integration-only-secret-0123456789abcdef}"
+
 echo "Starting PostgreSQL and Redis..."
 docker compose up -d postgres redis
 

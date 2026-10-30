@@ -114,6 +114,36 @@ impl Cache {
         Ok(version)
     }
 
+    /// 固定窗口限流：窗口内计数超过 `max` 时返回剩余秒数。
+    ///
+    /// 用于登录 IP、找回密码/邮箱验证等入口；计数和过期在 Lua 中原子完成。
+    pub async fn check_rate_limit(
+        &self,
+        key: &str,
+        max: u64,
+        window_secs: u64,
+    ) -> CacheResult<Option<u64>> {
+        let mut connection = self.connection.clone();
+        let script = redis::Script::new(
+            r#"
+            local count = redis.call('INCR', KEYS[1])
+            if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+            local ttl = redis.call('TTL', KEYS[1])
+            return {count, ttl}
+            "#,
+        );
+        let (count, ttl): (i64, i64) = script
+            .key(key)
+            .arg(window_secs.max(1))
+            .invoke_async(&mut connection)
+            .await?;
+        if count > max as i64 {
+            Ok(Some(ttl.max(1) as u64))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// 返回登录锁定剩余秒数；未锁定时为 None。
     pub async fn login_retry_after(&self, username: &str) -> CacheResult<Option<u64>> {
         let mut connection = self.connection.clone();
