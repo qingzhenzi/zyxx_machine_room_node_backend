@@ -1,0 +1,246 @@
+//! 设备 PKI 客户端 CLI。
+//!
+//! ```text
+//! qe-device-pki-client enroll "https://node:4440/enroll?token=T&slot=S" [--wait] [--trust]
+//! qe-device-pki-client confirm [--slot S]
+//! qe-device-pki-client ping    [--slot S]
+//! qe-device-pki-client status  [--slot S]
+//! ```
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use qe_device_pki_client::creds::Credentials;
+use qe_device_pki_client::enroll::{self, EnrollOptions, EnrollOutcome};
+use qe_device_pki_client::transport::{self, BackoffPolicy, ConnectEvent, OutboxQueue, TransportConfig};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Parser, Debug)]
+#[command(name = "qe-device-pki-client", version, about = "设备 PKI 注册与 mTLS 通讯客户端")]
+struct Cli {
+    /// 覆盖数据目录（默认 ~/.local/share/qe-device-pki-client）
+    #[arg(long, global = true)]
+    data_dir: Option<PathBuf>,
+
+    /// 节点槽位名
+    #[arg(long, global = true)]
+    slot: Option<String>,
+
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// 用注册链接完成一次性注册
+    Enroll {
+        /// 注册链接（含 token 与 slot）
+        link: String,
+        /// approval 型：等待管理员批准（默认最多 5 分钟）
+        #[arg(long)]
+        wait: bool,
+        /// 首次连接：人工确认服务端证书（TOFU）
+        #[arg(long)]
+        trust: bool,
+        /// 批准等待超时（秒）
+        #[arg(long, default_value_t = 300)]
+        wait_secs: u64,
+    },
+    /// 用正式证书完成 mTLS 回连确认（通讯真正打通）
+    Confirm,
+    /// 心跳 + 防抖重连演示
+    Ping {
+        /// 心跳次数（0 = 无限）
+        #[arg(long, default_value_t = 3)]
+        count: u32,
+    },
+    /// 查看本地凭证状态
+    Status,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let cli = Cli::parse();
+    let data_dir = match &cli.data_dir {
+        Some(d) => d.clone(),
+        None => qe_device_pki_client::trust::default_data_dir()?,
+    };
+    std::fs::create_dir_all(&data_dir).context("创建数据目录")?;
+
+    match cli.cmd {
+        Cmd::Enroll {
+            link,
+            wait,
+            trust,
+            wait_secs,
+        } => {
+            println!("注册链接: {}", enroll::link_summary(&link)?);
+            let opts = EnrollOptions {
+                approval_wait: if wait {
+                    Some(Duration::from_secs(wait_secs))
+                } else {
+                    None
+                },
+                trust_confirmed: trust,
+                data_dir: Some(data_dir.clone()),
+            };
+
+            match enroll::enroll_link(&link, &opts).await? {
+                EnrollOutcome::Issued(creds) => {
+                    println!("✓ 注册成功");
+                    println!("  slot   : {}", creds.device_slot);
+                    println!("  serial : {}", creds.serial);
+                    let dir = enroll::creds_dir(&creds.device_slot, Some(&data_dir))?;
+                    println!("  凭证   : {}", dir.display());
+                    println!();
+                    println!("下一步：`qe-device-pki-client confirm --slot {}` 完成 mTLS 验证", creds.device_slot);
+                }
+                EnrollOutcome::PendingApproval { enroll_id } => {
+                    println!("◷ 等待管理员批准，enroll_id = {enroll_id}");
+                    println!("  批准后重新执行 enroll 并加 --wait，或直接运行 confirm");
+                }
+            }
+        }
+        Cmd::Confirm => {
+            let cfg = load_transport(&data_dir, cli.slot.as_deref())?;
+            println!("→ mTLS confirm {} ...", cfg.mtls_endpoint);
+            let reply = transport::confirm(&cfg).await?;
+            println!("✓ 通讯已打通");
+            println!("  status : {}", reply.status);
+            println!("  serial : {}", reply.serial);
+            println!("  mtls   : {}", reply.mtls);
+        }
+        Cmd::Ping { count } => {
+            let cfg = load_transport(&data_dir, cli.slot.as_deref())?;
+            let outbox = Arc::new(OutboxQueue::open(&data_dir.join("outbox"))?);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ConnectEvent>(64);
+
+            let log_task = tokio::spawn(async move {
+                while let Some(ev) = rx.recv().await {
+                    match ev {
+                        ConnectEvent::Connected => println!("● 已连接"),
+                        ConnectEvent::Disconnected { reason, attempt } => {
+                            println!("○ 断开（第 {attempt} 次退避）: {reason}")
+                        }
+                        ConnectEvent::Replaying { count } => {
+                            println!("↻ 重放未 ACK 消息 {count} 条")
+                        }
+                        ConnectEvent::Replayed { count } => println!("✓ 重放完成 {count} 条"),
+                    }
+                }
+            });
+
+            // 用 confirm 作为连通性探针，每次成功后 sleep 心跳间隔
+            let cfg_clone = Arc::new(cfg);
+            let heartbeat = cfg_clone.heartbeat;
+            let iterations = if count == 0 { u64::MAX } else { count as u64 };
+            let mut done = 0u64;
+            let probe_cfg = Arc::clone(&cfg_clone);
+            let handle = tokio::spawn(transport::run_with_reconnect(
+                BackoffPolicy::default(),
+                Arc::clone(&outbox),
+                move || {
+                    let c = Arc::clone(&probe_cfg);
+                    async move {
+                        transport::confirm(&c).await.map(|_| {
+                            std::thread::sleep(Duration::from_millis(10));
+                        })
+                    }
+                },
+                Some(tx),
+            ));
+
+            // 心跳：按间隔打印，达到 count 次退出
+            let mut ticker = tokio::time::interval(heartbeat);
+            loop {
+                ticker.tick().await;
+                if done >= iterations {
+                    break;
+                }
+                done += 1;
+                println!("♥ 心跳 #{done}");
+            }
+            handle.abort();
+            log_task.abort();
+            println!("✓ 心跳结束，未 ACK 消息剩余 {} 条", outbox.len());
+        }
+        Cmd::Status => {
+            let creds_dir = match cli.slot.as_deref() {
+                Some(s) => enroll::creds_dir(s, Some(&data_dir))?,
+                None => find_any_creds(&data_dir)?,
+            };
+            if !Credentials::exists(&creds_dir) {
+                println!("○ 未注册（{} 不存在）", creds_dir.display());
+                return Ok(());
+            }
+            let creds = Credentials::load(&creds_dir)?;
+            println!("✓ 已注册");
+            println!("  slot     : {}", creds.device_slot);
+            println!("  serial   : {}", creds.serial);
+            println!("  endpoint : {}", creds.endpoint);
+            println!("  目录     : {}", creds_dir.display());
+
+            // 证书未过期检查
+            use x509_parser::prelude::*;
+            if let Some(der) = creds.cert_chain_der()?.first() {
+                if let Ok((_, cert)) = X509Certificate::from_der(der.as_ref()) {
+                    let now = ASN1Time::now();
+                    let valid = cert.validity().is_valid_at(now);
+                    println!(
+                        "  有效期   : {} → {} ({})",
+                        cert.validity().not_before,
+                        cert.validity().not_after,
+                        if valid { "有效" } else { "已过期" }
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn load_transport(data_dir: &std::path::Path, slot: Option<&str>) -> Result<TransportConfig> {
+    let creds_dir = match slot {
+        Some(s) => enroll::creds_dir(s, Some(data_dir))?,
+        None => find_any_creds(data_dir)?,
+    };
+    let creds = Credentials::load(&creds_dir).with_context(|| {
+        format!("加载凭证失败（{}），请先执行 enroll", creds_dir.display())
+    })?;
+    Ok(TransportConfig::new(creds, data_dir.to_path_buf()))
+}
+
+/// 未指定 slot 时找出唯一的凭证目录。
+fn find_any_creds(data_dir: &std::path::Path) -> Result<PathBuf> {
+    let base = data_dir.join("creds");
+    let mut found = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&base) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() && Credentials::exists(&p) {
+                found.push(p);
+            }
+        }
+    }
+    match found.len() {
+        0 => anyhow::bail!("未找到任何已注册凭证（{} 下为空），请先执行 enroll", base.display()),
+        1 => Ok(found.remove(0)),
+        _ => anyhow::bail!(
+            "发现多个凭证目录，请用 --slot 指定：{}",
+            found
+                .iter()
+                .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}

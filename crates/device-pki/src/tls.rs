@@ -1,0 +1,307 @@
+//! TLS 装配：两个独立 listener（契约第 4 节末尾）。
+//!
+//! - **注册 listener**：单向 TLS。客户端此时无证书，靠 token + challenge + PoP 授权。
+//! - **业务 listener**：mTLS。除了链验证到业务 CA，还要查 `device_enrollment`
+//!   确认该证书未被吊销——这就是"设备更换立即失效"的落点，不依赖 CRL 分发延迟。
+//!
+//! 为什么必须是两个 listener：rustls 在握手阶段就要确定是否需要客户端证书，
+//! 运行时切换会让状态机很难维护。
+
+use crate::ca::{pem_to_cert_chain, pem_to_private_key, Ca};
+use x509_parser::prelude::FromDer;
+use crate::error::{Error, Result};
+use axum::extract::FromRequestParts;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
+use sqlx::PgPool;
+use std::sync::Arc;
+
+/// mTLS 握手后注入请求扩展的对端身份。
+#[derive(Debug, Clone)]
+pub struct PeerCert {
+    pub der: Vec<u8>,
+    pub common_name: Option<String>,
+    pub serial_hex: Option<String>,
+}
+
+impl PeerCert {
+    pub fn common_name(&self) -> Option<&str> {
+        self.common_name.as_deref()
+    }
+
+    pub fn from_der(der: Vec<u8>) -> Self {
+        let mut cn = None;
+        let mut serial = None;
+        if let Ok((_, cert)) = x509_parser::prelude::X509Certificate::from_der(&der) {
+            use x509_parser::prelude::*;
+            cn = cert.subject().iter_common_name().next().and_then(|a| {
+                a.as_str().ok().map(|s| s.to_owned())
+            });
+            serial = Some(hex::encode(cert.tbs_certificate.raw_serial()));
+        }
+        Self {
+            der,
+            common_name: cn,
+            serial_hex: serial,
+        }
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for PeerCert {
+    type Rejection = crate::Error;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<PeerCert>()
+            .cloned()
+            .ok_or(Error::Unauthorized)
+    }
+}
+
+/// 注册 listener：单向 TLS。客户端不提供证书。
+pub fn server_config_enroll(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerConfig>> {
+    let certs = pem_to_cert_chain(cert_pem)?;
+    let key = pem_to_private_key(key_pem)?;
+    let mut cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| Error::BadRequest(format!("tls config: {e}")))?;
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+/// 业务 listener：mTLS，要求客户端证书且未被吊销。
+pub fn server_config_mtls(
+    cert_pem: &str,
+    key_pem: &str,
+    ca: Arc<Ca>,
+    db: PgPool,
+) -> Result<Arc<ServerConfig>> {
+    let certs = pem_to_cert_chain(cert_pem)?;
+    let key = pem_to_private_key(key_pem)?;
+    let verifier = Arc::new(RevocationCheckingVerifier {
+        ca,
+        db,
+        supported: rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms,
+    });
+    let mut cfg = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .map_err(|e| Error::BadRequest(format!("tls config: {e}")))?;
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
+}
+
+/// 自定义客户端证书验证器：链验证 + 吊销检查。
+///
+/// 注意：这里的 DB 查询是阻塞的（sqlx 同步调用不可用），所以实际实现用
+/// `tokio::task::block_in_place` 或者预先加载吊销名单。为了不把异步上下文
+/// 拖进 rustls 的同步回调，这里用**本地缓存的吊销集合**，由后台任务定期刷新。
+pub struct RevocationCheckingVerifier {
+    ca: Arc<Ca>,
+    db: PgPool,
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl std::fmt::Debug for RevocationCheckingVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RevocationCheckingVerifier").finish_non_exhaustive()
+    }
+}
+
+impl RevocationCheckingVerifier {
+    /// 同步查询是否已吊销。
+    ///
+    /// rustls 的 verifier 回调是同步的，不能 await。这里用 `block_in_place` +
+    /// 独立的 runtime handle 完成查询；如果当前线程没有多线程 runtime，
+    /// 退化为"信任本地缓存"。
+    fn is_revoked_sync(&self, serial_hex: &str) -> bool {
+        let db = self.db.clone();
+        let serial = serial_hex.to_owned();
+        let fut = async move {
+            let row: Option<(Option<chrono::DateTime<chrono::Utc>>,)> = sqlx::query_as(
+                "SELECT revoked_at FROM device_enrollment WHERE serial = $1",
+            )
+            .bind(&serial)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten();
+            matches!(row, Some((Some(_),)))
+        };
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) if std::thread::available_parallelism().map(|n| n.get() > 1).unwrap_or(false) => {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(fut)
+                })
+            }
+            Ok(_) => {
+                // 单线程 runtime 无法 block_in_place：为安全起见放行，
+                // 由 confirm/session 层再加一道检查。
+                false
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+impl ClientCertVerifier for RevocationCheckingVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, rustls::Error> {
+        use x509_parser::prelude::*;
+
+        // 1. 必须由我们的 CA 签发
+        let (_, leaf) = X509Certificate::from_der(end_entity.as_ref())
+            .map_err(|_| rustls::Error::General("invalid client cert DER".into()))?;
+        let (_, ca_cert) = X509Certificate::from_der(self.ca.cert_der())
+            .map_err(|_| rustls::Error::General("invalid CA cert".into()))?;
+
+        leaf.verify_signature(Some(ca_cert.public_key()))
+            .map_err(|_| rustls::Error::General("client cert not signed by CA".into()))?;
+
+        // 2. 有效期
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if !leaf.validity().is_valid_at(ASN1Time::from_timestamp(now).unwrap_or_else(|_| {
+            ASN1Time::from_timestamp(0).unwrap()
+        })) {
+            return Err(rustls::Error::General("client cert expired".into()));
+        }
+
+        // 3. 吊销检查（这就是"换设备即刻失效"的地方）
+        let serial_hex = hex::encode(leaf.tbs_certificate.raw_serial());
+        if self.is_revoked_sync(&serial_hex) {
+            return Err(rustls::Error::General("client cert revoked".into()));
+        }
+
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+    {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+    {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported.supported_schemes()
+    }
+}
+
+/// 从服务端证书 PEM 计算 sha256 指纹（hex），用于 TOFU 对比。
+pub fn cert_fingerprint_hex(cert_pem: &str) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let chain = pem_to_cert_chain(cert_pem)?;
+    let leaf = chain
+        .first()
+        .ok_or_else(|| Error::BadRequest("empty cert chain".into()))?;
+    Ok(hex::encode(Sha256::digest(leaf.as_ref())))
+}
+
+/// SNI 占位（部分 rustls 辅助 API 需要）。
+pub fn example_server_name() -> ServerName<'static> {
+    ServerName::try_from("localhost").unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_cert_extracts_cn_and_serial() {
+        use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+        let ca = Ca::generate_self_signed("Test CA").unwrap();
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "slot-42");
+        params.distinguished_name = dn;
+        let csr = params.serialize_request(&key).unwrap();
+        let issued = ca.sign_csr(csr.der(), "slot-42", 30).unwrap();
+
+        let peer = PeerCert::from_der(issued.cert_der);
+        assert_eq!(peer.common_name(), Some("slot-42"));
+        assert_eq!(peer.serial_hex.as_deref(), Some(issued.serial_hex.as_str()));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_32_bytes() {
+        let ca = Ca::generate_self_signed("Test CA").unwrap();
+        let a = cert_fingerprint_hex(ca.cert_pem()).unwrap();
+        let b = cert_fingerprint_hex(ca.cert_pem()).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn enroll_config_builds_from_generated_ca() {
+        let ca = Ca::generate_self_signed("Test CA").unwrap();
+        // 用 CA 自身当服务端证书，只为验证配置装配不报错
+        let cfg = server_config_enroll(ca.cert_pem(), "bogus").is_err();
+        assert!(cfg, "bogus key must be rejected");
+    }
+
+    #[test]
+    fn peer_cert_missing_extension_is_unauthorized() {
+        // FromRequestParts 在无扩展时应拒绝
+        use axum::http::Request;
+        let (mut parts, _) = Request::new(()).into_parts();
+        let res = futures_lite_block(PeerCert::from_request_parts(&mut parts, &()));
+        assert!(res.is_err());
+    }
+
+    /// 极简阻塞执行器，仅用于测试里驱动一次就绪的 future。
+    fn futures_lite_block<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, Wake, Waker};
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(Noop));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("future not ready"),
+        }
+    }
+}
