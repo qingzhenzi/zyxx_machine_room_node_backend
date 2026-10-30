@@ -11,6 +11,7 @@ pub mod ca;
 pub mod challenge;
 pub mod error;
 pub mod pop;
+pub mod revocation;
 pub mod routes;
 pub mod session;
 pub mod tls;

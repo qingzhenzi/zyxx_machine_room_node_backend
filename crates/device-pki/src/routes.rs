@@ -17,8 +17,15 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-/// 客户端证书有效期（天）。一次性颁发 + 持久化场景下不建议过短。
-pub const CLIENT_CERT_DAYS: i64 = 365;
+/// 客户端证书有效期（天）：100 年。
+///
+/// 为什么这么长：这些证书只用于 mTLS 身份认证，生命周期由**主动吊销**管理，
+/// 而不是由有效期管理。短证书 + 自动续期方案需要一整套续期链路、到期告警、
+/// 续期失败兜底；长证书 + 实时吊销用更少的活动部件达到同样效果。
+///
+/// 真正的失效点是服务端 mTLS 握手时的吊销检查（见 `tls.rs`），
+/// 吊销延迟 ≈ 吊销缓存刷新间隔（5s），与证书有效期无关。
+pub const CLIENT_CERT_DAYS: i64 = 36500;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,6 +36,10 @@ pub struct AppState {
     pub admin_token: Arc<str>,
     /// 服务端自己的证书 sha256（hex），用于 TOFU 指纹对比
     pub server_cert_fp_hex: Arc<str>,
+    /// 吊销状态内存缓存（mTLS 握手查它，吊销后立即可见）
+    pub revocations: Arc<crate::revocation::RevocationCache>,
+    /// 对外公布的 mTLS 端点，随注册响应下发给客户端
+    pub mtls_endpoint: Arc<str>,
 }
 
 // ---------------- /enroll/challenge ----------------
@@ -138,6 +149,8 @@ pub enum EnrollReply {
         cert_pem: String,
         ca_chain_pem: String,
         serial: String,
+        /// 客户端后续 mTLS 通讯应连这个地址（与注册端点不同）
+        mtls_endpoint: String,
         /// 客户端调用 confirm 时用
         confirm_hint: String,
     },
@@ -170,10 +183,27 @@ pub async fn enroll(
     )
     .await?;
 
-    // TOFU / pin 指纹对比：客户端看到的服务端证书必须与服务端自述一致
-    if !st.server_cert_fp_hex.is_empty()
-        && !req.tls_cert_seen_fp.eq_ignore_ascii_case(&st.server_cert_fp_hex)
+    // TOFU / pin 指纹对比：客户端看到的服务端证书必须与服务端自述一致。
+    //
+    // 这里**不允许空值绕过**：早期实现写成 `!server_fp.is_empty() && ...`，
+    // 只要服务端没配置指纹，客户端传什么都放过，等于 TOFU 防中间人完全失效。
+    if st.server_cert_fp_hex.is_empty() {
+        return Err(Error::Internal(anyhow::anyhow!(
+            "server_cert_fp_hex 未配置，拒绝在无法校验 TOFU 指纹的情况下签发证书"
+        )));
+    }
+    if req.tls_cert_seen_fp.len() != 64
+        || !req.tls_cert_seen_fp.chars().all(|c| c.is_ascii_hexdigit())
     {
+        return Err(Error::FpMismatch);
+    }
+    if !req.tls_cert_seen_fp.eq_ignore_ascii_case(&st.server_cert_fp_hex) {
+        tracing::warn!(
+            seen = %req.tls_cert_seen_fp,
+            expected = %st.server_cert_fp_hex,
+            slot = %req.slot,
+            "TOFU fingerprint mismatch — possible MITM"
+        );
         return Err(Error::FpMismatch);
     }
 
@@ -201,15 +231,22 @@ pub async fn enroll(
     }
     tx.commit().await?;
 
-    // 先吊销同 slot 旧证书（换设备场景），再签发新的
-    sqlx::query(
+    // 先吊销同 slot 旧证书（换设备场景），再签发新的。
+    // 返回旧 serial 以便立即写入吊销缓存 —— 不等 5s 刷新，
+    // 否则旧设备在这个窗口内仍能完成握手。
+    let superseded: Vec<(String,)> = sqlx::query_as(
         "UPDATE device_enrollment SET status = 'revoked', revoked_at = now(),
                 revoke_reason = 'superseded'
-         WHERE device_slot = $1 AND status IN ('issued','active')",
+         WHERE device_slot = $1 AND status IN ('issued','active')
+         RETURNING serial",
     )
     .bind(&req.slot)
-    .execute(&st.db)
+    .fetch_all(&st.db)
     .await?;
+    for (old_serial,) in &superseded {
+        st.revocations.mark_revoked(old_serial);
+        tracing::info!(serial = %old_serial, slot = %req.slot, "superseded old cert, revoked immediately");
+    }
 
     let issued = st.ca.sign_csr(&csr_der, &req.slot, CLIENT_CERT_DAYS)?;
 
@@ -233,6 +270,7 @@ pub async fn enroll(
                 cert_pem: issued.cert_pem,
                 ca_chain_pem: st.ca.chain_pem(),
                 serial: issued.serial_hex,
+                mtls_endpoint: st.mtls_endpoint.to_string(),
                 confirm_hint: "POST /enroll/confirm over mTLS to activate".into(),
             }))
         }
@@ -482,6 +520,9 @@ pub async fn revoke(
     if res.rows_affected() == 0 {
         return Err(Error::EnrollmentNotFound);
     }
+    // 立即生效，不等后台刷新
+    st.revocations.mark_revoked(&req.serial);
+    tracing::info!(serial = %req.serial, reason = %reason, "cert revoked");
     Ok(Json(serde_json::json!({ "status": "revoked", "serial": req.serial })))
 }
 
@@ -590,6 +631,8 @@ mod tests {
             sessions: Arc::new(SessionManager::new(Default::default()).0),
             admin_token: Arc::from("secret"),
             server_cert_fp_hex: Arc::from(""),
+            revocations: Arc::new(crate::revocation::RevocationCache::new()),
+            mtls_endpoint: Arc::from("https://mtls.test:4441"),
         };
         let mut h = HeaderMap::new();
         h.insert(

@@ -142,7 +142,7 @@ pub struct TransportConfig {
 impl TransportConfig {
     pub fn new(creds: Credentials, state_dir: PathBuf) -> Self {
         Self {
-            mtls_endpoint: creds.endpoint.clone(),
+            mtls_endpoint: creds.mtls_endpoint.clone(),
             creds,
             backoff: BackoffPolicy::default(),
             heartbeat: HEARTBEAT_INTERVAL,

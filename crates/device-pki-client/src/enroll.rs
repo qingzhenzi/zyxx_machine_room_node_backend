@@ -129,6 +129,8 @@ enum EnrollReply {
         cert_pem: String,
         ca_chain_pem: String,
         serial: String,
+        #[serde(default)]
+        mtls_endpoint: Option<String>,
     },
     Pending {
         enroll_id: String,
@@ -244,8 +246,17 @@ pub async fn enroll(target: &EnrollTarget, opts: &EnrollOptions) -> Result<Enrol
             cert_pem,
             ca_chain_pem,
             serial,
+            mtls_endpoint,
         } => {
-            let creds = persist(target, &key, cert_pem, ca_chain_pem, serial, opts)?;
+            let creds = persist(
+                target,
+                &key,
+                cert_pem,
+                ca_chain_pem,
+                serial,
+                mtls_endpoint,
+                opts,
+            )?;
             Ok(EnrollOutcome::Issued(creds))
         }
         EnrollReply::Pending {
@@ -257,7 +268,17 @@ pub async fn enroll(target: &EnrollTarget, opts: &EnrollOptions) -> Result<Enrol
                 let (cert_pem, ca_chain_pem, serial) =
                     poll_until_approved(&http, target, &enroll_id, poll_after_secs, max_wait)
                         .await?;
-                let creds = persist(target, &key, cert_pem, ca_chain_pem, serial, opts)?;
+                // approval 型下载路径没有单独的 mtls_endpoint 字段，
+                // 用注册端点主机名 + 服务端约定端口无法推断，交给 persist 回退
+                let creds = persist(
+                    target,
+                    &key,
+                    cert_pem,
+                    ca_chain_pem,
+                    serial,
+                    None,
+                    opts,
+                )?;
                 Ok(EnrollOutcome::Issued(creds))
             }
         },
@@ -270,6 +291,7 @@ fn persist(
     cert_pem: String,
     ca_chain_pem: String,
     serial: String,
+    mtls_endpoint: Option<String>,
     opts: &EnrollOptions,
 ) -> Result<Credentials> {
     let key_pem = key_to_pem(key)?;
@@ -280,6 +302,17 @@ fn persist(
         key_pem,
         ca_chain_pem,
         endpoint: target.endpoint.clone(),
+        // 服务端返回的 mTLS 端点优先；缺失时退化为注册端点（并打警告）
+        mtls_endpoint: match mtls_endpoint {
+            Some(e) if !e.is_empty() => e,
+            _ => {
+                tracing::warn!(
+                    "服务端未返回 mtls_endpoint，回退到注册端点 —— \
+                     confirm 很可能失败，请检查服务端 PUBLIC_MTLS_ENDPOINT 配置"
+                );
+                target.endpoint.clone()
+            }
+        },
     };
     let dir = match &opts.data_dir {
         Some(d) => d.join("creds").join(&target.slot),

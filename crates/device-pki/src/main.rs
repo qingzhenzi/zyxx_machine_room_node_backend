@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use qe_device_pki::ca::Ca;
+use qe_device_pki::revocation::{self, RevocationCache};
 use qe_device_pki::routes::{self, AppState};
 use qe_device_pki::session::{DebounceConfig, SessionManager};
 use qe_device_pki::tls;
@@ -10,6 +11,11 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 同时被 sqlx(aws-lc-rs) 与 ring 引入时无法自动选 provider，必须显式安装
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls CryptoProvider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -20,11 +26,24 @@ async fn main() -> Result<()> {
     let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL required")?;
     let enroll_addr = std::env::var("ENROLL_ADDR").unwrap_or_else(|_| "0.0.0.0:4440".into());
     let mtls_addr = std::env::var("MTLS_ADDR").unwrap_or_else(|_| "0.0.0.0:4441".into());
-    let enroll_cert = std::env::var("ENROLL_TLS_CERT").context("ENROLL_TLS_CERT required")?;
-    let enroll_key = std::env::var("ENROLL_TLS_KEY").context("ENROLL_TLS_KEY required")?;
-    let mtls_cert = std::env::var("MTLS_TLS_CERT").context("MTLS_TLS_CERT required")?;
-    let mtls_key = std::env::var("MTLS_TLS_KEY").context("MTLS_TLS_KEY required")?;
+    let enroll_cert_path = std::env::var("ENROLL_TLS_CERT").context("ENROLL_TLS_CERT required")?;
+    let enroll_key_path = std::env::var("ENROLL_TLS_KEY").context("ENROLL_TLS_KEY required")?;
+    let mtls_cert_path = std::env::var("MTLS_TLS_CERT").context("MTLS_TLS_CERT required")?;
+    let mtls_key_path = std::env::var("MTLS_TLS_KEY").context("MTLS_TLS_KEY required")?;
     let admin_token = std::env::var("ADMIN_TOKEN").context("ADMIN_TOKEN required")?;
+    // 对外公布的 mTLS 地址（客户端拿到证书后连这个，不是注册地址）
+    let public_mtls = std::env::var("PUBLIC_MTLS_ENDPOINT")
+        .unwrap_or_else(|_| format!("https://{mtls_addr}"));
+
+    // 环境变量给的是文件路径，这里读成 PEM 内容
+    let enroll_cert = std::fs::read_to_string(&enroll_cert_path)
+        .with_context(|| format!("读取 {enroll_cert_path} 失败"))?;
+    let enroll_key = std::fs::read_to_string(&enroll_key_path)
+        .with_context(|| format!("读取 {enroll_key_path} 失败"))?;
+    let mtls_cert = std::fs::read_to_string(&mtls_cert_path)
+        .with_context(|| format!("读取 {mtls_cert_path} 失败"))?;
+    let mtls_key = std::fs::read_to_string(&mtls_key_path)
+        .with_context(|| format!("读取 {mtls_key_path} 失败"))?;
 
     let ca_key_pem = std::fs::read_to_string(
         std::env::var("CA_KEY").unwrap_or_else(|_| "certs/ca-key.pem".into()),
@@ -46,6 +65,18 @@ async fn main() -> Result<()> {
         .run(&db)
         .await
         .context("run migrations")?;
+
+    // 吊销状态：启动时先加载一次全量，之后每 5s 刷新
+    let revocations = Arc::new(RevocationCache::new());
+    match revocations.reload(&db).await {
+        Ok(n) => tracing::info!(revoked = n, "revocation cache loaded"),
+        Err(e) => tracing::warn!(error = %e, "initial revocation load failed"),
+    }
+    let _revocation_refresher = revocation::spawn_refresher(
+        Arc::clone(&revocations),
+        db.clone(),
+        revocation::DEFAULT_REFRESH_INTERVAL,
+    );
 
     let (sessions, mut events) = SessionManager::new(DebounceConfig::default());
     let sessions = Arc::new(sessions);
@@ -86,10 +117,13 @@ async fn main() -> Result<()> {
         sessions,
         admin_token: Arc::from(admin_token.as_str()),
         server_cert_fp_hex: Arc::from(enroll_fp.as_str()),
+        revocations: Arc::clone(&revocations),
+        mtls_endpoint: Arc::from(public_mtls.as_str()),
     };
 
     let enroll_cfg = tls::server_config_enroll(&enroll_cert, &enroll_key)?;
-    let mtls_cfg = tls::server_config_mtls(&mtls_cert, &mtls_key, Arc::clone(&ca), db)?;
+    let mtls_cfg =
+        tls::server_config_mtls(&mtls_cert, &mtls_key, Arc::clone(&ca), revocations)?;
 
     let enroll_app = routes::enroll_router(state.clone());
     let mtls_app = routes::mtls_router(state);

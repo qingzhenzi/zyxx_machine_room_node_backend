@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use qe_device_pki_client::creds::Credentials;
+use qe_device_pki_client::creds::{CredIssue, Credentials};
 use qe_device_pki_client::enroll::{self, EnrollOptions, EnrollOutcome};
 use qe_device_pki_client::transport::{self, BackoffPolicy, ConnectEvent, OutboxQueue, TransportConfig};
 use std::path::PathBuf;
@@ -61,6 +61,9 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 依赖树里同时存在 aws-lc-rs 与 ring 时无法自动选 provider，必须显式安装
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -178,8 +181,11 @@ async fn main() -> Result<()> {
                 None => find_any_creds(&data_dir)?,
             };
             if !Credentials::exists(&creds_dir) {
-                println!("○ 未注册（{} 不存在）", creds_dir.display());
-                return Ok(());
+                let issue = CredIssue::NotEnrolled;
+                println!("○ {}", issue);
+                println!();
+                println!("{}", issue.advice());
+                std::process::exit(2);
             }
             let creds = Credentials::load(&creds_dir)?;
             println!("✓ 已注册");
@@ -188,18 +194,25 @@ async fn main() -> Result<()> {
             println!("  endpoint : {}", creds.endpoint);
             println!("  目录     : {}", creds_dir.display());
 
-            // 证书未过期检查
             use x509_parser::prelude::*;
             if let Some(der) = creds.cert_chain_der()?.first() {
                 if let Ok((_, cert)) = X509Certificate::from_der(der.as_ref()) {
-                    let now = ASN1Time::now();
-                    let valid = cert.validity().is_valid_at(now);
                     println!(
-                        "  有效期   : {} → {} ({})",
+                        "  有效期   : {} → {}",
                         cert.validity().not_before,
-                        cert.validity().not_after,
-                        if valid { "有效" } else { "已过期" }
+                        cert.validity().not_after
                     );
+                }
+            }
+
+            // 启动自检：PEM 可解析 / 私钥与证书匹配 / 未过期
+            match creds.verify() {
+                Ok(()) => println!("  状态     : 可用"),
+                Err(issue) => {
+                    println!("  状态     : ✗ {issue}");
+                    println!();
+                    println!("{}", issue.advice());
+                    std::process::exit(2);
                 }
             }
         }
@@ -210,12 +223,16 @@ async fn main() -> Result<()> {
 
 fn load_transport(data_dir: &std::path::Path, slot: Option<&str>) -> Result<TransportConfig> {
     let creds_dir = match slot {
-        Some(s) => enroll::creds_dir(s, Some(data_dir))?,
+        Some(s) => qe_device_pki_client::creds::locate(s, Some(data_dir))?,
         None => find_any_creds(data_dir)?,
     };
     let creds = Credentials::load(&creds_dir).with_context(|| {
-        format!("加载凭证失败（{}），请先执行 enroll", creds_dir.display())
+        format!("加载凭证失败（{}）", creds_dir.display())
     })?;
+    // 用前自检：损坏的凭证必须在这里就报清楚，而不是等 mTLS 握手含糊失败
+    if let Err(issue) = creds.verify() {
+        anyhow::bail!("凭证不可用：{issue}\n\n{}", issue.advice());
+    }
     Ok(TransportConfig::new(creds, data_dir.to_path_buf()))
 }
 

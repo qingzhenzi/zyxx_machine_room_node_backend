@@ -8,13 +8,13 @@
 //! 运行时切换会让状态机很难维护。
 
 use crate::ca::{pem_to_cert_chain, pem_to_private_key, Ca};
+use crate::revocation::RevocationCache;
 use x509_parser::prelude::FromDer;
 use crate::error::{Error, Result};
 use axum::extract::FromRequestParts;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
-use sqlx::PgPool;
 use std::sync::Arc;
 
 /// mTLS 握手后注入请求扩展的对端身份。
@@ -80,13 +80,13 @@ pub fn server_config_mtls(
     cert_pem: &str,
     key_pem: &str,
     ca: Arc<Ca>,
-    db: PgPool,
+    revocations: Arc<RevocationCache>,
 ) -> Result<Arc<ServerConfig>> {
     let certs = pem_to_cert_chain(cert_pem)?;
     let key = pem_to_private_key(key_pem)?;
     let verifier = Arc::new(RevocationCheckingVerifier {
         ca,
-        db,
+        revocations,
         supported: rustls::crypto::ring::default_provider()
             .signature_verification_algorithms,
     });
@@ -100,55 +100,18 @@ pub fn server_config_mtls(
 
 /// 自定义客户端证书验证器：链验证 + 吊销检查。
 ///
-/// 注意：这里的 DB 查询是阻塞的（sqlx 同步调用不可用），所以实际实现用
-/// `tokio::task::block_in_place` 或者预先加载吊销名单。为了不把异步上下文
-/// 拖进 rustls 的同步回调，这里用**本地缓存的吊销集合**，由后台任务定期刷新。
+/// 吊销状态来自内存缓存（`RevocationCache`），由后台任务每 5s 刷新。
+/// 这样 rustls 的同步回调里不需要任何 async/DB 访问，也就不会出现
+/// 「单线程 runtime 降级放行」的漏洞。
 pub struct RevocationCheckingVerifier {
     ca: Arc<Ca>,
-    db: PgPool,
+    revocations: Arc<RevocationCache>,
     supported: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
 impl std::fmt::Debug for RevocationCheckingVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RevocationCheckingVerifier").finish_non_exhaustive()
-    }
-}
-
-impl RevocationCheckingVerifier {
-    /// 同步查询是否已吊销。
-    ///
-    /// rustls 的 verifier 回调是同步的，不能 await。这里用 `block_in_place` +
-    /// 独立的 runtime handle 完成查询；如果当前线程没有多线程 runtime，
-    /// 退化为"信任本地缓存"。
-    fn is_revoked_sync(&self, serial_hex: &str) -> bool {
-        let db = self.db.clone();
-        let serial = serial_hex.to_owned();
-        let fut = async move {
-            let row: Option<(Option<chrono::DateTime<chrono::Utc>>,)> = sqlx::query_as(
-                "SELECT revoked_at FROM device_enrollment WHERE serial = $1",
-            )
-            .bind(&serial)
-            .fetch_optional(&db)
-            .await
-            .ok()
-            .flatten();
-            matches!(row, Some((Some(_),)))
-        };
-
-        match tokio::runtime::Handle::try_current() {
-            Ok(_) if std::thread::available_parallelism().map(|n| n.get() > 1).unwrap_or(false) => {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(fut)
-                })
-            }
-            Ok(_) => {
-                // 单线程 runtime 无法 block_in_place：为安全起见放行，
-                // 由 confirm/session 层再加一道检查。
-                false
-            }
-            Err(_) => false,
-        }
     }
 }
 
@@ -195,7 +158,8 @@ impl ClientCertVerifier for RevocationCheckingVerifier {
 
         // 3. 吊销检查（这就是"换设备即刻失效"的地方）
         let serial_hex = hex::encode(leaf.tbs_certificate.raw_serial());
-        if self.is_revoked_sync(&serial_hex) {
+        if self.revocations.is_revoked(&serial_hex) {
+            tracing::info!(serial = %serial_hex, "mTLS handshake rejected: cert revoked");
             return Err(rustls::Error::General("client cert revoked".into()));
         }
 
