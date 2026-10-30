@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use qe_device_pki::ca::Ca;
 use qe_device_pki::cert_status::{self, CertStatusCache};
+use qe_device_pki::messaging;
 use qe_device_pki::ratelimit;
 use qe_device_pki::routes::{self, AppState};
 use qe_device_pki::session::{DebounceConfig, SessionManager, SessionState};
@@ -151,6 +152,32 @@ async fn main() -> Result<()> {
 
     let enroll_fp = tls::cert_fingerprint_hex(&enroll_cert)?;
 
+    // 上行消息分发器。这里是**独立二进制**的默认装配：
+    // 通配订阅一条"落日志"处理器，让 ping 联调时看得见消息；
+    // 真实业务方（例如将来的 crates/api）依赖本 crate 后，
+    // 自己 `dispatcher.subscribe("telemetry", ...)` 换成真正的处理逻辑。
+    let dispatcher = Arc::new(messaging::Dispatcher::new(
+        std::time::Duration::from_secs(10),
+    ));
+    dispatcher.subscribe_all(|m: messaging::Message| async move {
+        tracing::info!(
+            serial = %m.serial,
+            slot = %m.slot,
+            seq = m.seq,
+            kind = %m.kind,
+            payload = %m.payload,
+            "message accepted"
+        );
+        Ok(())
+    });
+
+    // 离线判定：没有这个定时器，heartbeat_miss 永远没人调用 ——
+    // 设备只会被"消息到达时翻回 online"，永远不会被判 offline（契约 §6）
+    let _offline_detector = messaging::spawn_offline_detector(
+        Arc::clone(&sessions),
+        messaging::OFFLINE_TICK_INTERVAL,
+    );
+
     let state = AppState {
         db: db.clone(),
         ca: Arc::clone(&ca),
@@ -159,6 +186,7 @@ async fn main() -> Result<()> {
         server_cert_fp_hex: Arc::from(enroll_fp.as_str()),
         cert_status: Arc::clone(&cert_status),
         admin_limiter: Arc::new(ratelimit::RateLimiter::new(admin_rate_limit_per_min)),
+        dispatcher,
         mtls_endpoint: Arc::from(public_mtls.as_str()),
         enroll_endpoint: Arc::from(public_enroll.as_str()),
     };

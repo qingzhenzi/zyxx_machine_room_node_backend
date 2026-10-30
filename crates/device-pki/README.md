@@ -55,6 +55,37 @@
 所有 `/admin/...` 都按对端 IP 限速（429 + `Retry-After`）：静态 bearer 没有
 账号锁定，限速是唯一防线。
 
+## 上行消息：接入业务处理
+
+`qe-device-pki` 是 **lib crate**，消息处理这层（`messaging`）不依赖任何 HTTP
+细节，别的服务直接依赖本 crate 就能订阅自己关心的类型：
+
+```rust
+use qe_device_pki::messaging::{Dispatcher, Message};
+use std::sync::Arc;
+use std::time::Duration;
+
+let dispatcher = Arc::new(Dispatcher::new(Duration::from_secs(10)));
+dispatcher.subscribe("telemetry", |m: Message| async move {
+    // m.serial / m.slot / m.seq / m.kind / m.payload
+    // 返回 Err → 客户端会重发同一条，下次自愈
+    Ok(())
+});
+dispatcher.subscribe_all(|m: Message| async move { /* 通配：审计/指标 */ Ok(()) });
+```
+
+语义（契约 §6 有完整表格）：
+
+- **收件箱去重**：`device_message_inbox` 主键 `(serial, seq)`，跨重启有效；
+  记 `attempts`/`last_error`/`processed_at`，失败的重发会自愈
+- **成功才推水位**：handler 失败或超时 → 5xx 且不动 `last_seen_seq` → 客户端重发
+- **没有订阅方的 kind**：回 `no_handler` 并记为终态（重试也不会变，别让客户端死循环）
+- **handler 要快速返回**（默认 10s 超时）；慢活请自己 spawn
+
+离线判定由 `messaging::spawn_offline_detector` 驱动（每 5s 一轮）——
+没有它，`SessionManager::heartbeat_miss` 永远没人调用，设备只会"回到在线"
+而永远不会被判 offline。
+
 ## 关键实现说明
 
 **握手可用性检查**：`tls::DeviceCertVerifier` 在每次 mTLS 握手时查内存里的
@@ -80,6 +111,6 @@
 ## 测试
 
 ```bash
-cargo test -p qe-device-pki                    # 47 个单元测试
-./scripts/test-integration.sh                  # 另加 6 个端到端用例（真实 PostgreSQL）
+cargo test -p qe-device-pki                    # 55 个单元测试
+./scripts/test-integration.sh                  # 另加 7 个端到端用例（真实 PostgreSQL）
 ```

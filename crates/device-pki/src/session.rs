@@ -145,6 +145,15 @@ impl SessionManager {
         self.sessions.get(serial).map(|e| e.last_seen_seq)
     }
 
+    /// 当前**已确认在线**的会话 serial（离线判定定时器遍历用）。
+    pub fn online_serials(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|e| e.confirmed == SessionState::Online)
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
     /// 标记一次心跳 miss。达到阈值时把状态翻转排进防抖窗口。
     pub async fn heartbeat_miss(&self, serial: &str) {
         let (slot, should_offline) = {

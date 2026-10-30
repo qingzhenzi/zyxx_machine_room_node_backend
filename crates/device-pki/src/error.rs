@@ -34,7 +34,7 @@ pub enum Error {
     RateLimited(u64),
     #[error("bad request: {0}")]
     BadRequest(String),
-    #[error("内部错误")]
+    #[error("内部错误: {0}")]
     Internal(#[source] anyhow::Error),
 }
 

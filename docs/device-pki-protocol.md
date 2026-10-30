@@ -199,9 +199,26 @@ CREATE TABLE device_enrollment (
 -- 同一 slot 只允许一个非终态证书（部分唯一索引）
 CREATE UNIQUE INDEX device_slot_one_live ON device_enrollment (device_slot)
   WHERE status IN ('pending','issued','active');
+
+-- 设备上行消息收件箱：跨重启去重 + 至少一次处理 + 审计
+CREATE TABLE device_message_inbox (
+  serial       TEXT NOT NULL REFERENCES device_enrollment(serial),
+  seq          BIGINT NOT NULL CHECK (seq > 0),
+  device_slot  TEXT NOT NULL,
+  kind         TEXT NOT NULL,
+  payload      TEXT NOT NULL,
+  attempts     INT NOT NULL DEFAULT 0,
+  received_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  processed_at TIMESTAMPTZ,
+  last_error   TEXT,
+  PRIMARY KEY (serial, seq)
+);
+CREATE INDEX device_message_inbox_unprocessed
+  ON device_message_inbox (received_at) WHERE processed_at IS NULL;
 ```
 
-> 迁移文件在 workspace 根 `migrations/0006_device_pki.sql`，与 api/db 共用同一份。
+> 迁移文件在 workspace 根 `migrations/0006_device_pki.sql`（消息收件箱在
+> `0007_device_messaging.sql`），与 api/db 共用同一份。
 > 曾经 device-pki 自带一套以 `0001_` 开头的迁移，与根目录 `0001_init.sql` 版本号冲突，
 > 两个二进制共用一个库时 sqlx 会直接报 `VersionMismatch`/`VersionMissing` 让进程起不来。
 
@@ -213,9 +230,24 @@ CREATE UNIQUE INDEX device_slot_one_live ON device_enrollment (device_slot)
   **启动时把水位读回内存**，重启后去重立刻生效
 - **客户端**：指数退避重连（100ms → 30s 上限，jitter），出站消息带单调 `seq`，
   先落 sled 再发送，**收到服务端 ACK 才删除**；重连后按 seq 逐条真正重发
-- **服务端**：`POST /messages` 按 `(serial, seq)` 去重（重复也是 2xx，幂等）；
-  入站事件经防抖窗口（默认 250ms）合并后再分发；`last_seen_seq` 持久化
-- **下线判定**：心跳间隔 5s，3 次未达 → 标记 offline（防抖，不立即广播），恢复后合并为一次状态变更
+- **服务端**：`POST /messages` 的处理顺序是 **收件箱去重 → 业务分发 → 成功才推水位**：
+
+  | 情况 | HTTP | `status` | 收件箱 | 水位 |
+  |---|---|---|---|---|
+  | 首次到达、handler 成功 | 2xx | `ok` | `processed_at = now()` | 推进 |
+  | handler 失败 / 超时 | 5xx | — | `attempts+1`、`last_error` | **不推**（客户端重发自愈） |
+  | 重复 seq 且已处理 | 2xx | `duplicate` | 不变 | 不变 |
+  | 同条正在处理 | 2xx | `in_flight` | 不变 | 不变 |
+  | 没有订阅方的 kind | 2xx | `no_handler` | 记为终态 + 原因 | 推进 |
+
+  收件箱是 `device_message_inbox`，主键 `(serial, seq)`，因此去重**跨进程重启有效**，
+  并留下审计轨迹（谁、何时、什么载荷、第几次尝试、失败原因）
+- **业务分发**：`qe-device_pki::messaging::Dispatcher` 按 `kind` 路由到 handler，
+  同 kind 可挂多个（全部成功才算成功），`"*"` 是通配订阅；handler 有超时保护。
+  `qe-device-pki` 是 lib crate，别的服务（如 `crates/api`）依赖它后
+  直接 `dispatcher.subscribe("telemetry", ...)` 即可接入
+- **下线判定**：后台每 5s 跑一轮 `offline_tick`，把「连续 3 次未达心跳」的会话
+  推进防抖窗口标记 offline（不立即广播），恢复后合并为一次状态变更
 - **节奏**：客户端成功一轮后按心跳间隔（5s）再探，而不是退避下限 —— 否则
   confirm 会被打成 ~10 次/秒，违反心跳约定并冲击服务端防抖
 

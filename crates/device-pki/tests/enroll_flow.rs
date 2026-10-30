@@ -73,6 +73,9 @@ async fn setup_with_limit(admin_limit: u32) -> Option<(AppState, Router, Router)
         server_cert_fp_hex: Arc::from(fp.as_str()),
         cert_status: Arc::new(CertStatusCache::new()),
         admin_limiter: Arc::new(RateLimiter::new(admin_limit)),
+        dispatcher: Arc::new(qe_device_pki::messaging::Dispatcher::new(
+            std::time::Duration::from_secs(5),
+        )),
         mtls_endpoint: Arc::from("https://mtls.integration.test:4441"),
         enroll_endpoint: Arc::from("https://enroll.integration.test:4440"),
     };
@@ -784,6 +787,131 @@ async fn messages_are_deduped_by_serial_and_seq() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "身份必须来自 mTLS 证书");
+
+    cleanup(&db, &slot).await;
+}
+
+/// 处理语义：**成功才推水位**，失败能被重发自愈，没有订阅方要明确记档。
+#[tokio::test]
+#[ignore = "requires PostgreSQL; run via scripts/test-integration.sh"]
+async fn message_processing_is_at_least_once_with_self_healing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let Some((state, enroll_app, mtls_app)) = setup().await else {
+        return;
+    };
+    let db = state.db.clone();
+    let slot = unique_slot("proc");
+    let (cert_pem, serial) = auto_enroll(&state, &enroll_app, &slot).await;
+    let cert_der = pem_first_der(&cert_pem);
+
+    // 第一次故意失败，之后成功 —— 验证重发能自愈
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let a = Arc::clone(&attempts);
+    state.dispatcher.subscribe("telemetry", move |_m| {
+        let a = Arc::clone(&a);
+        async move {
+            if a.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(qe_device_pki::Error::Internal(anyhow::anyhow!(
+                    "第一次故意失败"
+                )));
+            }
+            Ok(())
+        }
+    });
+
+    let build = {
+        let cert_der = cert_der.clone();
+        move |seq: i64, kind: &str| {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"seq": seq, "kind": kind, "payload": "{}"}).to_string(),
+                ))
+                .unwrap();
+            req.extensions_mut()
+                .insert(qe_device_pki::tls::PeerCert::from_der(cert_der.clone()));
+            req
+        }
+    };
+
+    // 1) 第一次投递：handler 失败 → 5xx，且不推水位
+    let (status, body) = call(&mtls_app, build(1, "telemetry")).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "失败应是 5xx: {body}"
+    );
+    let (attempts_db, processed_at, last_error): (i32, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT attempts, processed_at::text, last_error
+             FROM device_message_inbox WHERE serial = $1 AND seq = 1",
+        )
+        .bind(&serial)
+        .fetch_one(&db)
+        .await
+        .expect("inbox row");
+    assert_eq!(attempts_db, 1);
+    assert!(processed_at.is_none(), "失败不能算处理成功");
+    assert!(last_error.unwrap().contains("故意失败"), "要留下失败原因");
+    let watermark: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(last_seen_seq), 0) FROM device_session WHERE serial = $1",
+    )
+    .bind(&serial)
+    .fetch_one(&db)
+    .await
+    .expect("watermark");
+    assert!(watermark < 1, "失败时不能推水位，实际 {watermark}");
+
+    // 2) 客户端重发同一条 → 自愈成功
+    let (status, body) = call(&mtls_app, build(1, "telemetry")).await;
+    assert_eq!(status, StatusCode::OK, "重发应成功: {body}");
+    assert_eq!(body["duplicate"], false);
+    let (attempts_db, processed_at, _): (i32, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT attempts, processed_at::text, last_error
+         FROM device_message_inbox WHERE serial = $1 AND seq = 1",
+    )
+    .bind(&serial)
+    .fetch_one(&db)
+    .await
+    .expect("inbox row");
+    assert_eq!(attempts_db, 2);
+    assert!(processed_at.is_some(), "成功后必须落 processed_at");
+    let (watermark,): (i64,) =
+        sqlx::query_as("SELECT last_seen_seq FROM device_session WHERE serial = $1")
+            .bind(&serial)
+            .fetch_one(&db)
+            .await
+            .expect("session row");
+    assert_eq!(watermark, 1, "成功后才推水位");
+
+    // 3) 再次重发 → 幂等 ACK，handler 不再跑
+    let hits_before = attempts.load(Ordering::SeqCst);
+    let (status, body) = call(&mtls_app, build(1, "telemetry")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["duplicate"], true);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        hits_before,
+        "已处理过的消息不该再触发 handler"
+    );
+
+    // 4) 没有订阅方的 kind：明确记档，不假装成功也不无限重试
+    let (status, body) = call(&mtls_app, build(2, "no-such-kind")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "no_handler");
+    let (processed_at, last_error): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT processed_at::text, last_error
+         FROM device_message_inbox WHERE serial = $1 AND seq = 2",
+    )
+    .bind(&serial)
+    .fetch_one(&db)
+    .await
+    .expect("inbox row");
+    assert!(processed_at.is_some(), "no_handler 也要记档为终态");
+    assert!(last_error.unwrap().contains("handler"), "要写明原因");
 
     cleanup(&db, &slot).await;
 }

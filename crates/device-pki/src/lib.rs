@@ -12,6 +12,7 @@ pub mod ca;
 pub mod cert_status;
 pub mod challenge;
 pub mod error;
+pub mod messaging;
 pub mod pop;
 pub mod ratelimit;
 pub mod routes;

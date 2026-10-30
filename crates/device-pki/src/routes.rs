@@ -4,7 +4,7 @@ use crate::ca::{parse_reason, Ca};
 use crate::challenge;
 use crate::error::{Error, Result};
 use crate::pop::{self, SignatureAlgorithm};
-use crate::session::{Dedup, SessionManager, SessionState};
+use crate::session::{SessionManager, SessionState};
 use crate::token::{self, TokenKind};
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
@@ -40,6 +40,8 @@ pub struct AppState {
     pub cert_status: Arc<crate::cert_status::CertStatusCache>,
     /// 管理端限速器（静态 bearer 没有账号锁定，只能靠"不能无限试"）
     pub admin_limiter: Arc<crate::ratelimit::RateLimiter>,
+    /// 上行消息分发器：别的 crate 依赖本 crate 后可直接 `subscribe`
+    pub dispatcher: Arc<crate::messaging::Dispatcher>,
     /// 对外公布的 mTLS 端点，随注册响应下发给客户端
     pub mtls_endpoint: Arc<str>,
     /// 对外公布的注册端点，用于拼接注册链接（管理端发 token 时用）
@@ -779,6 +781,8 @@ pub struct MessageRequest {
 
 #[derive(Debug, Serialize)]
 pub struct MessageReply {
+    /// `ok` | `duplicate`（已处理过，幂等 ACK）| `in_flight`（同条正在处理）|
+    /// `no_handler`（没有订阅方，已记档不重试）
     pub status: String,
     pub seq: i64,
     pub duplicate: bool,
@@ -786,13 +790,20 @@ pub struct MessageReply {
 
 /// `POST /messages` —— 设备上行消息（mTLS listener）。
 ///
-/// **幂等**：重复的 `seq` 返回 `duplicate: true` 但仍是 2xx，这样客户端重放
-/// 不会因为"怕重复触发副作用"而不敢重试。
+/// 处理顺序：**收件箱去重 → 业务分发 → 成功才推水位**。
+///
+/// - 重复 seq 返回 2xx + `duplicate:true`（幂等 ACK），客户端才敢放心重发
+/// - handler 失败 → 不推水位、回 5xx → 客户端重发，下次自愈
+/// - 没有订阅方的 kind → 记档后回 `no_handler`（协议不匹配，重试也不会变）
+///
+/// 详细语义见 `crate::messaging`。
 pub async fn receive_message(
     State(st): State<AppState>,
     peer: crate::tls::PeerCert,
     Json(req): Json<MessageRequest>,
 ) -> Result<Json<MessageReply>> {
+    use crate::messaging::{Dispatch, Message};
+
     // 身份来自 mTLS 证书，不信任请求体
     let serial = peer.serial_hex.clone().ok_or(Error::Unauthorized)?;
     let slot = peer.common_name().ok_or(Error::Unauthorized)?.to_owned();
@@ -809,38 +820,68 @@ pub async fn receive_message(
         )));
     }
 
-    let duplicate = match st.sessions.last_seen_seq(&serial) {
-        Some(_) => st.sessions.observe(&serial, req.seq) == Dedup::Duplicate,
-        None => {
-            // 未知会话（重启后、或该设备还没 confirm 过）：先登记再按新消息处理
-            st.sessions.upsert(&serial, &slot, SessionState::Online, req.seq);
-            false
+    let msg = Message {
+        serial: serial.clone(),
+        slot: slot.clone(),
+        seq: req.seq,
+        kind: req.kind.clone(),
+        payload: req.payload.clone(),
+        received_at: chrono::Utc::now(),
+    };
+
+    // 1) 收件箱去重：这一步在 DB 上做，重启后依然有效（只靠内存水位不够）
+    let inserted = crate::messaging::inbox_store(&st.db, &msg).await?;
+    if !inserted {
+        match crate::messaging::inbox_state(&st.db, &serial, req.seq).await? {
+            Some(row) if row.processed_at.is_some() => {
+                return Ok(Json(MessageReply {
+                    status: "duplicate".into(),
+                    seq: req.seq,
+                    duplicate: true,
+                }));
+            }
+            Some(_) if st.dispatcher.is_in_flight(&msg.key()) => {
+                return Ok(Json(MessageReply {
+                    status: "in_flight".into(),
+                    seq: req.seq,
+                    duplicate: true,
+                }));
+            }
+            // 其余情况 = 上次处理失败（或进程重启中断）：落到下面自愈重投
+            _ => tracing::warn!(
+                serial = %serial,
+                seq = req.seq,
+                kind = %req.kind,
+                "未处理成功的消息重新投递"
+            ),
+        }
+    }
+
+    // 2) 会话层：登记未知会话（还没 confirm 过 / 重启后），并记一次活动
+    if st.sessions.last_seen_seq(&serial).is_none() {
+        st.sessions.upsert(&serial, &slot, SessionState::Online, req.seq - 1);
+    }
+    st.sessions.mark_seen(&serial).await;
+
+    // 3) 业务分发。失败 → 记原因、不推水位、回 5xx 让客户端重发
+    let (status, note) = match st.dispatcher.dispatch(msg).await {
+        Ok(Dispatch::Processed) => ("ok", None),
+        Ok(Dispatch::NoHandler) => ("no_handler", Some("no handler subscribed for this kind")),
+        Err(e) => {
+            crate::messaging::inbox_mark_failed(&st.db, &serial, req.seq, &e.to_string()).await?;
+            return Err(e);
         }
     };
 
-    if !duplicate {
-        // 水位落库：重启后仍能按 (serial, seq) 去重（契约 §6）
-        sqlx::query(
-            "INSERT INTO device_session (serial, device_slot, last_seen_seq, state, updated_at)
-             VALUES ($1, $2, $3, 'online', now())
-             ON CONFLICT (serial) DO UPDATE SET
-               last_seen_seq = GREATEST(device_session.last_seen_seq, EXCLUDED.last_seen_seq),
-               state = 'online',
-               updated_at = now()",
-        )
-        .bind(&serial)
-        .bind(&slot)
-        .bind(req.seq)
-        .execute(&st.db)
-        .await?;
-        // 上行活动也算在线：若此前被判 offline，这里会排一次防抖后的 online 翻转
-        st.sessions.mark_seen(&serial).await;
-    }
+    crate::messaging::inbox_mark_processed(&st.db, &serial, req.seq, note).await?;
+    // 处理成功才推水位：失败的消息必须能被客户端重发覆盖到
+    crate::messaging::bump_watermark(&st.db, &serial, &slot, req.seq).await?;
+    let _ = st.sessions.observe(&serial, req.seq);
 
     Ok(Json(MessageReply {
-        status: if duplicate { "duplicate" } else { "ok" }.into(),
+        status: status.into(),
         seq: req.seq,
-        duplicate,
+        duplicate: false,
     }))
 }
 
@@ -985,6 +1026,7 @@ mod tests {
             server_cert_fp_hex: Arc::from(""),
             cert_status: Arc::new(crate::cert_status::CertStatusCache::new()),
             admin_limiter: Arc::new(crate::ratelimit::RateLimiter::new(0)),
+            dispatcher: Arc::new(crate::messaging::Dispatcher::new(std::time::Duration::from_secs(1))),
             mtls_endpoint: Arc::from("https://mtls.test:4441"),
             enroll_endpoint: Arc::from("https://enroll.test:4440"),
         };
