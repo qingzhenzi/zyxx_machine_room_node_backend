@@ -768,8 +768,8 @@ pub async fn delete_enrollment(
 
 // ---------------- /messages（mTLS listener） ----------------
 
-/// 单条消息最大载荷。防抖会话层不是消息队列，超大载荷应走对象存储。
-pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// 单条消息最大载荷（上行与下行共用，定义在 `messaging`）。
+pub use crate::messaging::MAX_MESSAGE_BYTES;
 
 #[derive(Debug, Deserialize)]
 pub struct MessageRequest {
@@ -885,6 +885,75 @@ pub async fn receive_message(
     }))
 }
 
+// ---------------- /messages/downlink（服务端 → 设备） ----------------
+
+#[derive(Debug, Deserialize)]
+pub struct DownlinkQuery {
+    /// 上次已 ACK 的游标（首次为 0）
+    pub after: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DownlinkReply {
+    pub messages: Vec<serde_json::Value>,
+    /// 处理成功后用它回 ack（可以大于返回的最大 id，表示"都处理完了"）
+    pub next_after: i64,
+}
+
+/// `GET /messages/downlink` —— 设备拉取下行消息（mTLS listener）。
+///
+/// **拉取不等于投递**：拿到消息后要处理，处理成功再 `POST .../ack`；
+/// 没 ACK 的下次还会拿到（至少一次，与上行收件箱对称）。
+pub async fn downlink_pull(
+    State(st): State<AppState>,
+    peer: crate::tls::PeerCert,
+    axum::extract::Query(q): axum::extract::Query<DownlinkQuery>,
+) -> Result<Json<DownlinkReply>> {
+    let serial = peer.serial_hex.clone().ok_or(Error::Unauthorized)?;
+    let after = q.after.unwrap_or(0).max(0);
+    let limit = q.limit.unwrap_or(100);
+
+    let rows = crate::messaging::downlink_fetch(&st.db, &serial, after, limit).await?;
+    let next_after = rows.iter().map(|m| m.id).max().unwrap_or(after);
+    let messages = rows
+        .into_iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "kind": m.kind,
+                "payload": m.payload,
+                "created_at": m.created_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(DownlinkReply {
+        messages,
+        next_after,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DownlinkAck {
+    /// 已成功处理到的游标（含）
+    pub up_to: i64,
+}
+
+/// `POST /messages/downlink/ack` —— 设备确认已处理（mTLS listener）。
+pub async fn downlink_ack(
+    State(st): State<AppState>,
+    peer: crate::tls::PeerCert,
+    Json(req): Json<DownlinkAck>,
+) -> Result<Json<serde_json::Value>> {
+    let serial = peer.serial_hex.clone().ok_or(Error::Unauthorized)?;
+    if req.up_to <= 0 {
+        return Err(Error::BadRequest("up_to 必须为正整数".into()));
+    }
+    let acked = crate::messaging::downlink_ack(&st.db, &serial, req.up_to).await?;
+    Ok(Json(serde_json::json!({ "acked": acked })))
+}
+
 // ---------------- CRL ----------------
 
 pub async fn crl(State(st): State<AppState>) -> Result<axum::response::Response> {
@@ -988,6 +1057,8 @@ pub fn mtls_router(st: AppState) -> Router {
     Router::new()
         .route("/enroll/confirm", post(confirm))
         .route("/messages", post(receive_message))
+        .route("/messages/downlink", get(downlink_pull))
+        .route("/messages/downlink/ack", post(downlink_ack))
         .route("/revoke", post(revoke))
         .with_state(st)
 }

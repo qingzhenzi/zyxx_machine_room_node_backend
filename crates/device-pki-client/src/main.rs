@@ -10,6 +10,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use qe_device_pki_client::creds::{CredIssue, Credentials};
+use qe_device_pki_client::downlink;
 use qe_device_pki_client::enroll::{self, EnrollOptions, EnrollOutcome};
 use qe_device_pki_client::transport::{
     self, BackoffPolicy, ConnectEvent, OutboxQueue, PendingMessage, TransportConfig,
@@ -218,6 +219,28 @@ async fn main() -> Result<()> {
                 }
             });
 
+            // 下行消费者：按心跳节奏拉一批、本地分发、处理成功才 ack。
+            // 游标落 `<data-dir>/downlink-<slot>.json`，重启后从上次位置继续。
+            let dl_cfg = Arc::clone(&cfg_all);
+            let dl_state = data_dir
+                .join(format!("downlink-{}.json", cfg_all.creds.device_slot));
+            let dispatcher = Arc::new(downlink::Dispatcher::new());
+            dispatcher.subscribe_all(|m: transport::DownlinkMessage| async move {
+                println!("▼ 收到下行消息 id={} kind={} payload={}", m.id, m.kind, m.payload);
+                Ok(())
+            });
+            let downlink_task = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(heartbeat);
+                loop {
+                    ticker.tick().await;
+                    match downlink::poll_once(&dl_cfg, &dispatcher, &dl_state, 50).await {
+                        Ok(0) => {}
+                        Ok(n) => println!("▼ 处理并 ACK 了 {n} 条下行消息"),
+                        Err(e) => tracing::warn!(error = %e, "本轮下行处理失败，下轮重投"),
+                    }
+                }
+            });
+
             let probe_cfg = Arc::clone(&cfg_all);
             let send_cfg = Arc::clone(&cfg_all);
             let handle = tokio::spawn(transport::run_with_reconnect(
@@ -254,6 +277,7 @@ async fn main() -> Result<()> {
             }
             handle.abort();
             producer.abort();
+            downlink_task.abort();
             log_task.abort();
             println!("✓ 心跳结束，未 ACK 消息剩余 {} 条", outbox.len());
         }

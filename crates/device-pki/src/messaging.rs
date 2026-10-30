@@ -42,6 +42,12 @@ pub const OFFLINE_TICK_INTERVAL: Duration = Duration::from_secs(5);
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// 单条消息最大载荷（上行与下行共用）。
+///
+/// 消息通道不是消息队列：超大载荷应走对象存储，这里给个硬上限防止
+/// 一条消息打爆连接与内存。
+pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
 /// 一条已通过身份与格式校验的上行消息。
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -324,6 +330,155 @@ pub async fn bump_watermark(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+// ---------------- 下行队列（服务端 → 设备） ----------------
+
+/// 单台设备**未 ACK** 的下行消息上限：达到后拒绝继续投递（背压）。
+pub const MAX_UNACKED_DOWNLINK: i64 = 1000;
+
+/// 一次下行投递。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DownlinkMessage {
+    /// 全局自增游标：设备用它做"从哪继续拉"
+    pub id: i64,
+    pub kind: String,
+    pub payload: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// 校验 `kind`（与上行同一套规则，两端口径一致）。
+pub fn validate_kind(kind: &str) -> Result<()> {
+    if kind.is_empty() || kind.len() > 64 {
+        return Err(Error::BadRequest("kind 长度必须在 1..=64".into()));
+    }
+    Ok(())
+}
+
+/// 校验载荷大小。
+pub fn validate_payload(payload: &str, max: usize) -> Result<()> {
+    if payload.len() > max {
+        return Err(Error::BadRequest(format!("payload 超过 {max} 字节")));
+    }
+    Ok(())
+}
+
+/// 给指定设备排一条下行消息，返回游标 `id`。
+///
+/// 背压：单台设备未 ACK 的消息超过 [`MAX_UNACKED_DOWNLINK`] 时报错，
+/// 而不是无限堆积 —— 设备失联时业务方必须感知，而不是把库写爆。
+pub async fn downlink_publish(
+    pool: &PgPool,
+    serial: &str,
+    slot: &str,
+    kind: &str,
+    payload: &str,
+) -> Result<i64> {
+    validate_kind(kind)?;
+    validate_payload(payload, MAX_MESSAGE_BYTES)?;
+
+    let unacked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM device_downlink
+         WHERE serial = $1 AND delivered_at IS NULL",
+    )
+    .bind(serial)
+    .fetch_one(pool)
+    .await?;
+    if unacked >= MAX_UNACKED_DOWNLINK {
+        return Err(Error::DownlinkFull(unacked as usize));
+    }
+
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO device_downlink (serial, device_slot, kind, payload)
+         VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(serial)
+    .bind(slot)
+    .bind(kind)
+    .bind(payload)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+/// 按 slot 给**当前存活证书**投递；没有存活证书时返回 `Ok(None)`。
+///
+/// 解析范围是 `issued`/`active`（与 mTLS 握手允许的范围一致）：设备拿到证书
+/// 但还没跑 `confirm` 时也可以先把消息排上，等它回连自然会拉到。
+pub async fn downlink_publish_to_slot(
+    pool: &PgPool,
+    slot: &str,
+    kind: &str,
+    payload: &str,
+) -> Result<Option<i64>> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT serial, device_slot FROM device_enrollment
+         WHERE device_slot = $1 AND status IN ('issued','active')
+         ORDER BY (status = 'active') DESC, activated_at DESC NULLS LAST
+         LIMIT 1",
+    )
+    .bind(slot)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some((serial, device_slot)) => {
+            downlink_publish(pool, &serial, &device_slot, kind, payload)
+                .await
+                .map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
+/// 设备拉取：返回 `id > after` 的未投递消息（按 id 升序）。
+///
+/// **拉取不等于已投递**：设备必须处理成功后再 `downlink_ack`，
+/// 否则下次还会拿到同一批（至少一次，与上行对称）。
+pub async fn downlink_fetch(
+    pool: &PgPool,
+    serial: &str,
+    after: i64,
+    limit: i64,
+) -> Result<Vec<DownlinkMessage>> {
+    sqlx::query_as(
+        "SELECT id, kind, payload, created_at FROM device_downlink
+         WHERE serial = $1 AND id > $2 AND delivered_at IS NULL
+         ORDER BY id
+         LIMIT $3",
+    )
+    .bind(serial)
+    .bind(after)
+    .bind(limit.clamp(1, 500))
+    .fetch_all(pool)
+    .await
+    .map_err(Into::into)
+}
+
+/// 设备 ACK：把 `id <= up_to` 标记为已投递（保留一段时间供审计，之后由
+/// [`downlink_cleanup`] 回收）。重复 ACK 是幂等的。
+pub async fn downlink_ack(pool: &PgPool, serial: &str, up_to: i64) -> Result<u64> {
+    let res = sqlx::query(
+        "UPDATE device_downlink SET delivered_at = now()
+         WHERE serial = $1 AND id <= $2 AND delivered_at IS NULL",
+    )
+    .bind(serial)
+    .bind(up_to)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// 回收已投递且超过保留期的下行消息（运维定期调用）。
+pub async fn downlink_cleanup(pool: &PgPool, keep: chrono::Duration) -> Result<u64> {
+    let cutoff = chrono::Utc::now() - keep;
+    let res = sqlx::query(
+        "DELETE FROM device_downlink
+         WHERE delivered_at IS NOT NULL AND delivered_at < $1",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 // ---------------- 在线 / 离线判定 ----------------

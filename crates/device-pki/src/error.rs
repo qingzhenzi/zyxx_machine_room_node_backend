@@ -32,6 +32,8 @@ pub enum Error {
     Unauthorized,
     #[error("请求过于频繁，请 {0}s 后再试")]
     RateLimited(u64),
+    #[error("该设备未 ACK 的下行消息已达 {0} 条，暂停投递（背压）")]
+    DownlinkFull(usize),
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("内部错误: {0}")]
@@ -60,6 +62,7 @@ impl Error {
             Error::AlreadyDownloaded => "already_downloaded",
             Error::Unauthorized => "unauthorized",
             Error::RateLimited(_) => "rate_limited",
+            Error::DownlinkFull(_) => "downlink_full",
             Error::BadRequest(_) => "bad_request",
             Error::Internal(_) => "internal",
         }
@@ -81,6 +84,8 @@ impl Error {
             Error::AlreadyDownloaded => StatusCode::GONE,
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
             Error::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
+            // 背压：让客户端稍后重试（拉取侧收到它就知道该等了）
+            Error::DownlinkFull(_) => StatusCode::SERVICE_UNAVAILABLE,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

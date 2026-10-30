@@ -119,6 +119,32 @@ approval 型响应：
   `payload` ≤ 64 KiB
 - 这是防抖会话层的入口：新消息还会触发"此前被判 offline 的会话恢复 online"
 
+### GET /messages/downlink  （mTLS listener，设备拉取下行消息）
+
+`?after=<上次 ACK 的游标>&limit=<条数，上限 500>`
+
+```json
+{ "messages": [ { "id": 7, "kind": "config", "payload": "{}", "created_at": "..." } ],
+  "next_after": 7 }
+```
+
+### POST /messages/downlink/ack  （mTLS listener）
+
+```json
+{ "up_to": 7 }
+```
+
+下行语义与上行**对称（至少一次）**：
+
+- 业务方用 `messaging::downlink_publish(...)` / `downlink_publish_to_slot(...)`
+  排消息（后者自动解析该 slot 当前存活证书：`issued`/`active`，所以可以在设备
+  还没 `confirm` 时先排上）
+- **拉取不等于投递**：设备处理成功后才 `ack`；没 ack 的下次还会拿到同一批
+- 游标是全局自增 `id`，设备侧落盘（0600），重启后从上次位置继续
+- 背压：单台设备未 ACK 超过 1000 条时 `downlink_publish` 报
+  `downlink_full`（503），而不是把库写爆；已投递的由 `downlink_cleanup`
+  按保留期回收
+
 ### POST /admin/tokens  （管理端，Bearer）
 
 ```json
@@ -248,6 +274,10 @@ CREATE INDEX device_message_inbox_unprocessed
   直接 `dispatcher.subscribe("telemetry", ...)` 即可接入
 - **下线判定**：后台每 5s 跑一轮 `offline_tick`，把「连续 3 次未达心跳」的会话
   推进防抖窗口标记 offline（不立即广播），恢复后合并为一次状态变更
+- **下行（服务端 → 设备）**：`device_downlink` 队列 + `GET .../downlink` 拉取 +
+  `POST .../ack`。同样是至少一次：**处理成功才 ack**，否则下次重投；
+  设备侧游标落盘，重启后继续。与上行的共同原则是
+  **"确认成功才推进水位/游标"**，任何一边都不允许"收到即忘"
 - **节奏**：客户端成功一轮后按心跳间隔（5s）再探，而不是退避下限 —— 否则
   confirm 会被打成 ~10 次/秒，违反心跳约定并冲击服务端防抖
 

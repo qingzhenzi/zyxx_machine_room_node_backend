@@ -69,14 +69,31 @@ mTLS 阶段同理：用服务端下发的 `ca_chain_pem` 作为信任根做链�
 
 ## 防抖通讯
 
+双向，且两侧都是**至少一次 + 确认成功才推进水位/游标**：
+
+**上行（设备 → 服务端）**
+
 - **指数退避**：100ms → 30s 上限，jitter 20%；**成功一轮后按 5s 心跳间隔**再探
 - **消息可靠性**：出站消息单调 `seq`，写 sled 后才经 `POST /messages`（mTLS）
   发送，**收到服务端 ACK 才删除**；重连后按 seq 逐条真正重发，失败即停止本轮保序。
   服务端按 `(serial, seq)` 幂等去重（重复也是 2xx），所以重试是安全的
 - **心跳**：5s（`ping` 每次心跳入队一条 heartbeat 消息，剩余待 ACK 条数会实时打印）
 
+**下行（服务端 → 设备）**
+
+```rust
+let d = downlink::Dispatcher::new();
+d.subscribe("config", |m| async move { /* m.id / m.kind / m.payload */ Ok(()) });
+d.subscribe_all(|m| async move { println!("{}: {}", m.kind, m.payload); Ok(()) });
+downlink::poll_once(&cfg, &d, &state_path, 50).await?;
+```
+
+`ping` 每个心跳拉一批下行消息、本地分发、**处理成功才 `ack`**；游标落
+`<data-dir>/downlink-<slot>.json`（0600），重启后从上次位置继续。
+handler 必须**幂等**（服务端是至少一次，处理失败会重投）。
+
 ## 测试
 
 ```bash
-cargo test -p qe-device-pki-client   # 47 passed（43 单元 + 4 跨 crate 契约）
+cargo test -p qe-device-pki-client   # 51 passed（47 单元 + 4 跨 crate 契约）
 ```

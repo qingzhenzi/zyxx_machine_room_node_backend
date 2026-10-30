@@ -258,6 +258,84 @@ pub async fn send_message(cfg: &TransportConfig, msg: &PendingMessage) -> Result
         .map_err(|e| Error::Transport(e.to_string()))
 }
 
+/// 一条下行消息（服务端 → 设备）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DownlinkMessage {
+    /// 全局游标：处理成功后用它 ack
+    pub id: i64,
+    pub kind: String,
+    pub payload: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DownlinkReply {
+    messages: Vec<DownlinkMessage>,
+    next_after: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DownlinkAckReply {
+    acked: u64,
+}
+
+/// `GET /messages/downlink` —— 拉取下行消息。
+///
+/// **拉取不等于已投递**：处理成功后必须再调用 [`ack_downlink`]，
+/// 否则服务端下次还会给同一批（至少一次，与上行对称）。
+pub async fn fetch_downlink(
+    cfg: &TransportConfig,
+    after: i64,
+    limit: i64,
+) -> Result<Vec<DownlinkMessage>> {
+    let client = build_mtls_client(cfg)?;
+    let url = format!("{}/messages/downlink", cfg.mtls_endpoint);
+    let resp = client
+        .get(&url)
+        .query(&[("after", after.to_string()), ("limit", limit.to_string())])
+        .send()
+        .await
+        .map_err(|e| Error::Transport(format!("拉取下行消息失败: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(Error::Unexpected(format!(
+            "GET /messages/downlink 返回 {}",
+            resp.status()
+        )));
+    }
+    let reply: DownlinkReply = resp
+        .json()
+        .await
+        .map_err(|e| Error::Transport(e.to_string()))?;
+    let _ = reply.next_after;
+    Ok(reply.messages)
+}
+
+/// `POST /messages/downlink/ack` —— 确认已处理到 `up_to`（含）。
+pub async fn ack_downlink(cfg: &TransportConfig, up_to: i64) -> Result<u64> {
+    let client = build_mtls_client(cfg)?;
+    let url = format!("{}/messages/downlink/ack", cfg.mtls_endpoint);
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "up_to": up_to }))
+        .send()
+        .await
+        .map_err(|e| Error::Transport(format!("ack 下行消息失败: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(Error::Unexpected(format!(
+            "POST /messages/downlink/ack 返回 {}",
+            resp.status()
+        )));
+    }
+    let reply: DownlinkAckReply = resp
+        .json()
+        .await
+        .map_err(|e| Error::Transport(e.to_string()))?;
+    Ok(reply.acked)
+}
+
 /// 重连状态机事件（供上层观察/日志）。
 #[derive(Debug, Clone)]
 pub enum ConnectEvent {

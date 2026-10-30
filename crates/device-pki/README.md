@@ -49,7 +49,9 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/enroll/confirm` | 回连验证，`issued → active` 并清空 `cert_pem`，通讯打通 |
-| POST | `/messages` | 设备上行消息；按 `(serial, seq)` 幂等去重，水位落 `device_session` |
+| POST | `/messages` | 设备上行消息；收件箱去重 + 业务分发 + 成功才推水位 |
+| GET | `/messages/downlink` | 设备拉取下行消息（`?after=&limit=`） |
+| POST | `/messages/downlink/ack` | 设备确认已处理（`{"up_to": id}`） |
 | POST | `/revoke` | 吊销（Bearer） |
 
 所有 `/admin/...` 都按对端 IP 限速（429 + `Retry-After`）：静态 bearer 没有
@@ -86,6 +88,23 @@ dispatcher.subscribe_all(|m: Message| async move { /* 通配：审计/指标 */ 
 没有它，`SessionManager::heartbeat_miss` 永远没人调用，设备只会"回到在线"
 而永远不会被判 offline。
 
+### 下行（服务端 → 设备）
+
+```rust
+use qe_device_pki::messaging;
+
+// 按 slot 投递给当前存活证书（issued/active），设备没 confirm 时也能先排上
+let id = messaging::downlink_publish_to_slot(&pool, "slot-1", "config", r#"{"mode":"a"}"#).await?;
+// 或者直接指定 serial
+let id = messaging::downlink_publish(&pool, &serial, "slot-1", "config", "{}").await?;
+```
+
+设备侧拉取 `/messages/downlink?after=<游标>` → 处理 → 成功后 `/ack`。
+**拉取不等于投递**：没 ack 的下次还会拿到（至少一次）。
+
+背压：单台设备未 ACK 超过 1000 条时报 `downlink_full`（503）而不是无限堆积；
+已投递的由 `messaging::downlink_cleanup(pool, keep)` 按保留期回收。
+
 ## 关键实现说明
 
 **握手可用性检查**：`tls::DeviceCertVerifier` 在每次 mTLS 握手时查内存里的
@@ -112,5 +131,5 @@ dispatcher.subscribe_all(|m: Message| async move { /* 通配：审计/指标 */ 
 
 ```bash
 cargo test -p qe-device-pki                    # 55 个单元测试
-./scripts/test-integration.sh                  # 另加 7 个端到端用例（真实 PostgreSQL）
+./scripts/test-integration.sh                  # 另加 8 个端到端用例（真实 PostgreSQL）
 ```

@@ -915,3 +915,103 @@ async fn message_processing_is_at_least_once_with_self_healing() {
 
     cleanup(&db, &slot).await;
 }
+
+/// 下行通道：业务方投递 → 设备拉取 → 处理成功才 ACK（拉取不等于投递）。
+#[tokio::test]
+#[ignore = "requires PostgreSQL; run via scripts/test-integration.sh"]
+async fn downlink_queue_is_pull_then_ack() {
+    use qe_device_pki::messaging;
+
+    let Some((state, enroll_app, mtls_app)) = setup().await else {
+        return;
+    };
+    let db = state.db.clone();
+    let slot = unique_slot("dl");
+    let (cert_pem, serial) = auto_enroll(&state, &enroll_app, &slot).await;
+    let cert_der = pem_first_der(&cert_pem);
+
+    // 业务方按 slot 投递（自动解析当前 active 的 serial）
+    let id = messaging::downlink_publish_to_slot(&db, &slot, "config", r#"{"mode":"a"}"#)
+        .await
+        .expect("publish")
+        .expect("active 设备应能收到");
+    let id2 = messaging::downlink_publish(&db, &serial, &slot, "config", r#"{"mode":"b"}"#)
+        .await
+        .expect("publish");
+
+    let pull = |after: i64| {
+        let mut req = Request::builder()
+            .uri(format!("/messages/downlink?after={after}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(qe_device_pki::tls::PeerCert::from_der(cert_der.clone()));
+        req
+    };
+    let ack = |up_to: i64| {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/messages/downlink/ack")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"up_to": up_to}).to_string()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(qe_device_pki::tls::PeerCert::from_der(cert_der.clone()));
+        req
+    };
+
+    // 拉取：按 id 升序，且"拉取不等于投递"
+    let (status, body) = call(&mtls_app, pull(0)).await;
+    assert_eq!(status, StatusCode::OK, "pull: {body}");
+    let msgs = body["messages"].as_array().expect("messages");
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["id"], id);
+    assert_eq!(msgs[0]["kind"], "config");
+    assert_eq!(msgs[0]["payload"], r#"{"mode":"a"}"#);
+    assert_eq!(body["next_after"], id2);
+
+    // 没 ACK 之前，再拉一次还会拿到同一批（至少一次）
+    let (status, body) = call(&mtls_app, pull(0)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["messages"].as_array().unwrap().len(),
+        2,
+        "未 ACK 时重复拉取必须仍然拿到"
+    );
+
+    // 处理成功后 ACK
+    let (status, body) = call(&mtls_app, ack(id2)).await;
+    assert_eq!(status, StatusCode::OK, "ack: {body}");
+    assert_eq!(body["acked"], 2);
+
+    // ACK 之后拉不到旧消息；从旧游标再拉也是空（幂等）
+    let (status, body) = call(&mtls_app, pull(id2)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["messages"].as_array().unwrap().is_empty(), "{body}");
+    let (status, body) = call(&mtls_app, ack(id2)).await;
+    assert_eq!(status, StatusCode::OK, "重复 ACK 幂等: {body}");
+    assert_eq!(body["acked"], 0);
+
+    // 向不存在的 slot 投递 → None（而不是报错）
+    let nobody = unique_slot("nobody");
+    assert!(
+        messaging::downlink_publish_to_slot(&db, &nobody, "x", "{}")
+            .await
+            .unwrap()
+            .is_none(),
+        "没有 active 设备时应返回 None"
+    );
+
+    // 无 mTLS 证书拉取 → 401
+    let (status, _) = call(
+        &mtls_app,
+        Request::builder()
+            .uri("/messages/downlink?after=0")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    cleanup(&db, &slot).await;
+}
