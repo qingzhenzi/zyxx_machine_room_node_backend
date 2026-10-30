@@ -13,6 +13,10 @@ use crate::error::{Error, Result};
 use ring::signature;
 use sha2::{Digest, Sha256};
 
+/// 注册协议默认使用的 PoP 算法标签。客户端 `POP_ALGORITHM` 必须与之一致，
+/// 否则两端 transcript 验签直接失败。
+pub const POP_ALGORITHM: &str = "ecdsa-p256-sha256";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureAlgorithm {
     EcdsaP256Sha256,

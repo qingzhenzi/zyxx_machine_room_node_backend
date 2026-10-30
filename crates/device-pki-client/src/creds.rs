@@ -244,8 +244,10 @@ fn read_required(p: &Path) -> Result<String> {
     })
 }
 
-/// 把 slot 名转成安全目录名。
-fn sanitize(slot: &str) -> String {
+/// 把 slot 名转成安全目录名。**保存与加载必须用同一套规则**（enroll 落盘、
+/// `locate`/`dir_for` 加载），否则含 `/`、空格的 slot 会出现保存/加载路径分叉，
+/// 甚至把 key.pem 写到数据目录之外。
+pub fn sanitize(slot: &str) -> String {
     slot.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {

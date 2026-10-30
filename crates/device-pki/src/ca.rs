@@ -27,6 +27,22 @@ pub struct IssuedCert {
     pub cert_der: Vec<u8>,
 }
 
+/// serial 的**规范 hex**：去掉前导零。
+///
+/// 为什么必须规范化：DER 编码 INTEGER 时会剥掉前导零（首字节高位为 1 时再补
+/// 一个 0x00），所以证书里读出来的 `raw_serial()` 与生成时用的 20 字节在
+/// 约 1/256 的情况下不等长。签名时记库的是前者、握手时查缓存的是后者的话，
+/// 吊销状态就会在那些证书上永远对不上。两侧统一走这个函数。
+pub fn canonical_serial_hex(raw: &[u8]) -> String {
+    let trimmed = raw
+        .iter()
+        .skip_while(|b| **b == 0)
+        .copied()
+        .collect::<Vec<u8>>();
+    // 全零的退化输入也要给出确定结果（空串），避免两侧口径不同
+    hex::encode(trimmed)
+}
+
 /// 吊销条目，用于 CRL 生成。
 #[derive(Debug, Clone)]
 pub struct RevokedEntry {
@@ -115,7 +131,8 @@ impl Ca {
         let mut serial_raw = [0u8; 20];
         rand::Rng::fill(&mut rand::rng(), &mut serial_raw);
         serial_raw[0] &= 0x7f; // 正整数
-        let serial_hex = hex::encode(serial_raw);
+        // 记库用规范口径，与握手时从证书里读出来的 serial 对得上
+        let serial_hex = canonical_serial_hex(&serial_raw);
 
         let mut params = csr.params;
         let mut dn = DistinguishedName::new();
@@ -176,7 +193,7 @@ impl Ca {
         let crl = params
             .signed_by(&self.cert, &self.key)
             .map_err(|e| Error::Internal(e.into()))?;
-        Ok(crl.pem().map_err(|e| Error::Internal(e.into()))?)
+        crl.pem().map_err(|e| Error::Internal(e.into()))
     }
 
     /// 证书链 PEM（CA）。
@@ -292,6 +309,29 @@ mod tests {
         assert_ne!(a.serial_hex, b.serial_hex);
         let first = u8::from_str_radix(&a.serial_hex[..2], 16).unwrap();
         assert!(first & 0x80 == 0);
+    }
+
+    #[test]
+    fn canonical_serial_strips_leading_zeros() {
+        assert_eq!(canonical_serial_hex(&[0x00, 0x00, 0xab]), "ab");
+        assert_eq!(canonical_serial_hex(&[0x7f, 0x00]), "7f00");
+        assert_eq!(canonical_serial_hex(&[0x00]), "");
+        assert_eq!(canonical_serial_hex(&[]), "");
+    }
+
+    /// 签发时记下的 serial 必须和证书里读出来的完全一致 —— 否则吊销/可用性
+    /// 检查在某些证书上（DER 剥掉前导零的那约 1/256）会永远对不上。
+    #[test]
+    fn recorded_serial_matches_certificate_bytes() {
+        let ca = Ca::generate_self_signed("Test Device CA").unwrap();
+        for _ in 0..64 {
+            let issued = ca.sign_csr(&make_csr("a"), "a", 30).unwrap();
+            let (_, cert) = X509Certificate::from_der(&issued.cert_der).unwrap();
+            assert_eq!(
+                canonical_serial_hex(cert.tbs_certificate.raw_serial()),
+                issued.serial_hex
+            );
+        }
     }
 
     #[test]

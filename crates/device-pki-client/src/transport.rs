@@ -61,6 +61,11 @@ pub struct OutboxQueue {
     db: sled::Db,
 }
 
+/// seq 计数器占用的键。它和消息键（`seq.to_be_bytes()`，8 字节）混在同一棵
+/// sled 里，`pending()` 若把它当消息 JSON 解码必然失败，整批重放会被静默吞掉
+/// （调用处写的是 `if let Ok(pending)`）——所以迭代类接口必须跳过它。
+const SEQ_COUNTER_KEY: &[u8] = b"seq";
+
 impl OutboxQueue {
     pub fn open(path: &Path) -> Result<Self> {
         let db = sled::open(path).map_err(|e| Error::Storage(format!("sled open: {e}")))?;
@@ -91,7 +96,10 @@ impl OutboxQueue {
     pub fn pending(&self) -> Result<Vec<PendingMessage>> {
         let mut out = Vec::new();
         for item in self.db.iter() {
-            let (_, v) = item.map_err(|e| Error::Storage(format!("sled iter: {e}")))?;
+            let (k, v) = item.map_err(|e| Error::Storage(format!("sled iter: {e}")))?;
+            if k.as_ref() == SEQ_COUNTER_KEY {
+                continue;
+            }
             let msg: PendingMessage = serde_json::from_slice(&v)
                 .map_err(|e| Error::Storage(format!("sled decode: {e}")))?;
             out.push(msg);
@@ -101,16 +109,20 @@ impl OutboxQueue {
     }
 
     pub fn len(&self) -> usize {
-        self.db.len()
+        self.db
+            .iter()
+            .flatten()
+            .filter(|(k, _)| k.as_ref() != SEQ_COUNTER_KEY)
+            .count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.db.is_empty()
+        self.len() == 0
     }
 
     /// 下一个 seq（单调递增，持久化）。
     pub fn next_seq(&self) -> Result<u64> {
-        let key = b"seq";
+        let key = SEQ_COUNTER_KEY;
         let cur = self
             .db
             .get(key)
@@ -159,24 +171,28 @@ pub struct ConfirmReply {
 }
 
 /// 构建 mTLS 的 reqwest 客户端（客户端证书 + CA 链）。
+///
+/// **必须真正验证服务端证书**：这里把设备 CA（`ca_chain_pem`）加进信任根，
+/// 握手会做链验证 + 主机名校验。之前是 `danger_accept_invalid_certs(true)`，
+/// 而凭证里的 `ca_roots()` 全项目无人调用 —— 契约 §1 要求的"阶段 2 双向验证"
+/// 里，服务端身份其实是零校验，任何 MITM 都能完成握手。
 pub fn build_mtls_client(cfg: &TransportConfig) -> Result<reqwest::Client> {
-    let certs = cfg.creds.cert_chain_der()?;
-    let key = cfg.creds.private_key_der()?;
-
-    // rustls 配置需要把证书/私钥转成 PEM 再交给 reqwest（reqwest 只接受 PEM/Identity）
     let mut identity_pem = cfg.creds.cert_pem.clone();
     identity_pem.push_str(&cfg.creds.key_pem);
 
     let ident = reqwest::Identity::from_pem(identity_pem.as_bytes())
         .map_err(|e| Error::Crypto(format!("build identity: {e}")))?;
-    let _ = certs;
-    let _ = key;
 
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
         .identity(ident)
-        .danger_accept_invalid_certs(true) // 服务端身份已由 pin/TOFU 记录绑定
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(15));
+    for der in cfg.creds.ca_roots()? {
+        let cert = reqwest::Certificate::from_der(der.as_ref())
+            .map_err(|e| Error::Crypto(format!("build ca root: {e}")))?;
+        builder = builder.add_root_certificate(cert);
+    }
+    builder
         .build()
         .map_err(|e| Error::Transport(e.to_string()))
 }
@@ -205,6 +221,43 @@ pub async fn confirm(cfg: &TransportConfig) -> Result<ConfirmReply> {
         .map_err(|e| Error::Transport(e.to_string()))
 }
 
+/// 上行消息 ACK（服务端 `POST /messages` 的响应）。
+#[derive(Debug, Deserialize)]
+pub struct MessageAck {
+    pub status: String,
+    pub seq: u64,
+    pub duplicate: bool,
+}
+
+/// `POST /messages` —— 用正式证书发一条上行消息（mTLS）。
+///
+/// 服务端按 `(serial, seq)` 幂等去重，所以发送失败时可以放心重试，
+/// 重放同一条不会重复触发副作用。
+pub async fn send_message(cfg: &TransportConfig, msg: &PendingMessage) -> Result<MessageAck> {
+    let client = build_mtls_client(cfg)?;
+    let url = format!("{}/messages", cfg.mtls_endpoint);
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "seq": msg.seq,
+            "kind": msg.kind,
+            "payload": msg.payload,
+        }))
+        .send()
+        .await
+        .map_err(|e| Error::Transport(format!("消息发送失败: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(Error::Unexpected(format!(
+            "POST /messages 返回 {}",
+            resp.status()
+        )));
+    }
+    resp.json()
+        .await
+        .map_err(|e| Error::Transport(e.to_string()))
+}
+
 /// 重连状态机事件（供上层观察/日志）。
 #[derive(Debug, Clone)]
 pub enum ConnectEvent {
@@ -216,16 +269,23 @@ pub enum ConnectEvent {
 
 /// 带防抖的重连循环。
 ///
-/// `probe` 返回 Err 视为断线，按指数退避重试；成功后重置退避并重放未 ACK 消息。
-pub async fn run_with_reconnect<F, Fut>(
+/// - `probe` 返回 Err 视为断线，按指数退避重试
+/// - `probe` 成功后：**真正按 seq 逐条重发**未 ACK 消息，服务端确认后才从
+///   outbox 删除（此前只是打日志，消息留在队列里永不发出）
+/// - 重放失败即停止本轮，保证顺序；下一轮连接会从同一条继续
+/// - 成功一轮后按心跳间隔再探，而不是退避下限
+pub async fn run_with_reconnect<F, Fut, S, SFut>(
     policy: BackoffPolicy,
     outbox: Arc<OutboxQueue>,
     mut probe: F,
+    mut send: S,
     events: Option<mpsc::Sender<ConnectEvent>>,
 ) -> !
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
+    S: FnMut(PendingMessage) -> SFut,
+    SFut: std::future::Future<Output = Result<()>>,
 {
     let mut attempt = 0u32;
     loop {
@@ -237,9 +297,9 @@ where
                 if let Some(tx) = &events {
                     let _ = tx.send(ConnectEvent::Connected).await;
                 }
-                // 重放未 ACK 消息
-                if let Ok(pending) = outbox.pending() {
-                    if !pending.is_empty() {
+                // 重放未 ACK 消息（读失败必须喊出来：静默吞掉等于重放永远不发生）
+                match outbox.pending() {
+                    Ok(pending) if !pending.is_empty() => {
                         if let Some(tx) = &events {
                             let _ = tx
                                 .send(ConnectEvent::Replaying {
@@ -247,19 +307,44 @@ where
                                 })
                                 .await;
                         }
-                        for msg in &pending {
-                            tracing::info!(seq = msg.seq, kind = %msg.kind, "replay pending message");
+                        let mut sent = 0usize;
+                        for msg in pending {
+                            match send(msg.clone()).await {
+                                Ok(()) => {
+                                    sent += 1;
+                                    match outbox.ack(msg.seq) {
+                                        Ok(()) => tracing::info!(
+                                            seq = msg.seq,
+                                            kind = %msg.kind,
+                                            "重放成功并已 ACK"
+                                        ),
+                                        Err(e) => tracing::error!(
+                                            seq = msg.seq,
+                                            error = %e,
+                                            "ACK 落盘失败，服务端已收到但本地可能重发"
+                                        ),
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        seq = msg.seq,
+                                        error = %e,
+                                        "重放失败，停止本轮（保序），下轮从这条继续"
+                                    );
+                                    break;
+                                }
+                            }
                         }
                         if let Some(tx) = &events {
-                            let _ = tx
-                                .send(ConnectEvent::Replayed {
-                                    count: pending.len(),
-                                })
-                                .await;
+                            let _ = tx.send(ConnectEvent::Replayed { count: sent }).await;
                         }
                     }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "读取未 ACK 消息失败，本轮跳过重放"),
                 }
-                // 连接保持阶段：交给 probe 内部处理，返回即视为断线
+                // 连接保持阶段：probe 返回即视为断线。成功一轮后按**心跳间隔**再探，
+                // 而不是退避下限 —— 否则 confirm 会被打成 ~10 次/秒，
+                // 违反契约 §6 的 5s 心跳并冲击服务端防抖。
                 if let Some(tx) = &events {
                     let _ = tx
                         .send(ConnectEvent::Disconnected {
@@ -268,8 +353,8 @@ where
                         })
                         .await;
                 }
-                tokio::time::sleep(policy.delay(attempt)).await;
-                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                attempt = 0;
             }
             Err(e) => {
                 if let Some(tx) = &events {
@@ -372,6 +457,26 @@ mod tests {
         assert_eq!(pending[0].seq, 7);
     }
 
+    /// 之前 `next_seq` 的计数器键和消息键混在一起，`pending()` 把它的 u64 原始
+    /// 字节当 JSON 解码必然失败，整批重放被调用处的 `if let Ok` 静默吞掉。
+    #[test]
+    fn seq_counter_does_not_pollute_pending_or_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = OutboxQueue::open(dir.path()).unwrap();
+        let seq = q.next_seq().unwrap();
+        q.enqueue(&PendingMessage {
+            seq,
+            kind: "k".into(),
+            payload: "v".into(),
+        })
+        .unwrap();
+
+        let pending = q.pending().expect("计数器不应让 pending() 整体失败");
+        assert_eq!(pending.len(), 1, "计数器不应被当成一条消息");
+        assert_eq!(q.len(), 1, "len() 不应把计数器算进去");
+        assert_eq!(q.next_seq().unwrap(), seq + 1);
+    }
+
     #[test]
     fn seq_is_monotonic_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -397,11 +502,14 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(64);
         let q2 = Arc::clone(&q);
+        let q_check = Arc::clone(&q);
         let policy = BackoffPolicy {
             initial: Duration::from_millis(1),
             max: Duration::from_millis(5),
             jitter: 0.0,
         };
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let sent_in_task = Arc::clone(&sent);
         let mut calls = 0;
         let handle = tokio::spawn(async move {
             run_with_reconnect(
@@ -417,6 +525,10 @@ mod tests {
                             Ok(())
                         }
                     }
+                },
+                move |msg: PendingMessage| {
+                    sent_in_task.lock().unwrap().push(msg.seq);
+                    async move { Ok::<(), Error>(()) }
                 },
                 Some(tx),
             )
@@ -436,5 +548,14 @@ mod tests {
         assert!(joined.contains("Connected"), "{joined}");
         assert!(joined.contains("Replaying"), "{joined}");
         assert!(joined.contains("count: 1"), "{joined}");
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![1],
+            "重放必须真正调用发送，而不是只打日志"
+        );
+        assert!(
+            q_check.pending().unwrap().is_empty(),
+            "发送成功后消息必须 ACK 并移出 outbox"
+        );
     }
 }

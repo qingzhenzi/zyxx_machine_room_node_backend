@@ -13,6 +13,9 @@ qe-device-pki-client enroll "https://node:4440/enroll?token=T&slot=S" --trust
 # approval 型：等待管理员批准（默认 5 分钟）
 qe-device-pki-client enroll "https://...&token=T&slot=S" --trust --wait
 
+# 1b. 等待审批期间中断/超时后续跑（私钥与 enroll_id 已落盘，不需要原链接）
+qe-device-pki-client poll --slot S --wait-secs 300
+
 # 2. mTLS 回连确认 —— 这一步成功才算通讯打通
 qe-device-pki-client confirm
 
@@ -25,11 +28,27 @@ qe-device-pki-client status
 
 `--data-dir` 可覆盖数据目录（默认 `~/.local/share/qe-device-pki-client`）。
 
+链接里含一次性 token，走 argv 会留在 shell history / `ps` 里 —— 传 `-` 表示
+从 stdin 读：
+
+```bash
+echo "$LINK" | qe-device-pki-client enroll - --trust
+```
+
 ## 服务端身份校验（三优先级）
 
 1. **pin**：`...&pin=sha256/<hex>` 或 `pin=sha256spki/<hex>`，只接受该指纹
 2. **已信任记录**：本地 trust store 里确认过的指纹
-3. **TOFU**：首次连接展示指纹，`--trust` 表示人工确认，写入 trust store
+3. **TOFU**：首次连接**打印指纹**并要求人工核对（交互确认，或显式 `--trust`）后写入 trust store
+
+判出来的指纹会被**钉进真正发送 token/CSR 的那条 TLS 连接**（自定义
+`ServerCertVerifier` + `use_preconfigured_tls`）——否则校验的是探测连接、传凭证
+的是另一条连接，中间人可以两条连接出示不同证书把 token 骗走。
+
+拿不到服务端证书时**硬失败**，不会带着空指纹继续。
+
+mTLS 阶段同理：用服务端下发的 `ca_chain_pem` 作为信任根做链验证 + 主机名校验，
+**不再** `danger_accept_invalid_certs`。
 
 无论哪条路径，客户端都会把「实际看到的证书指纹」作为 `tls_cert_seen_fp` 上报，
 服务端据此做中间人检测（不一致返回 `fp_mismatch`）。
@@ -43,18 +62,21 @@ qe-device-pki-client status
 │   ├── key.pem         # 0600
 │   ├── ca-chain.pem    # 0600
 │   └── meta.json       # 0600
+├── pending/<slot>.json # 进行中的 approval 注册：私钥 + enroll_id（0600）
 ├── trust-store.json
 └── outbox/             # sled：未 ACK 消息队列
 ```
 
 ## 防抖通讯
 
-- **指数退避**：100ms → 30s 上限，jitter 20%
-- **消息可靠性**：出站消息单调 `seq`，写 sled 后才发送，收到 ACK 才删除；重连后按 seq 顺序重放
-- **心跳**：5s
+- **指数退避**：100ms → 30s 上限，jitter 20%；**成功一轮后按 5s 心跳间隔**再探
+- **消息可靠性**：出站消息单调 `seq`，写 sled 后才经 `POST /messages`（mTLS）
+  发送，**收到服务端 ACK 才删除**；重连后按 seq 逐条真正重发，失败即停止本轮保序。
+  服务端按 `(serial, seq)` 幂等去重（重复也是 2xx），所以重试是安全的
+- **心跳**：5s（`ping` 每次心跳入队一条 heartbeat 消息，剩余待 ACK 条数会实时打印）
 
 ## 测试
 
 ```bash
-cargo test -p qe-device-pki-client   # 33 passed
+cargo test -p qe-device-pki-client   # 47 passed（43 单元 + 4 跨 crate 契约）
 ```

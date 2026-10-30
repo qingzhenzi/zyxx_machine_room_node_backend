@@ -30,6 +30,8 @@ pub enum Error {
     AlreadyDownloaded,
     #[error("unauthorized")]
     Unauthorized,
+    #[error("请求过于频繁，请 {0}s 后再试")]
+    RateLimited(u64),
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("内部错误")]
@@ -57,6 +59,7 @@ impl Error {
             Error::EnrollmentNotFound => "enrollment_not_found",
             Error::AlreadyDownloaded => "already_downloaded",
             Error::Unauthorized => "unauthorized",
+            Error::RateLimited(_) => "rate_limited",
             Error::BadRequest(_) => "bad_request",
             Error::Internal(_) => "internal",
         }
@@ -77,7 +80,15 @@ impl Error {
             Error::EnrollmentNotFound => StatusCode::NOT_FOUND,
             Error::AlreadyDownloaded => StatusCode::GONE,
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
+            Error::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+    /// 限速错误的建议等待秒数；其它错误为 None。
+    fn retry_after(&self) -> Option<u64> {
+        match self {
+            Error::RateLimited(secs) => Some(*secs),
+            _ => None,
         }
     }
 }
@@ -88,7 +99,14 @@ impl IntoResponse for Error {
             code: self.code(),
             message: self.to_string(),
         };
-        (self.status(), Json(body)).into_response()
+        let mut resp = (self.status(), Json(body)).into_response();
+        // 限速时告诉客户端什么时候再来，省得盲试
+        if let Some(retry_after) = self.retry_after()
+            && let Ok(v) = axum::http::HeaderValue::from_str(&retry_after.to_string())
+        {
+            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+        }
+        resp
     }
 }
 

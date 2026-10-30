@@ -38,5 +38,8 @@ export TEST_REDIS_URL="${TEST_REDIS_URL:-redis://127.0.0.1:6379}"
 echo "Running integration tests against $TEST_DATABASE_URL"
 cargo test -p qe-api --test integration -- --ignored --nocapture
 
+echo "Running device-PKI enrollment flow tests against $TEST_DATABASE_URL"
+cargo test -p qe-device-pki --test enroll_flow -- --ignored --nocapture
+
 echo "Integration tests passed."
 echo "Services remain running; stop with: docker compose stop postgres redis"

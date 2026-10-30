@@ -203,13 +203,16 @@ fn set_dir_private(_p: &Path) -> Result<()> {
 #[cfg(unix)]
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o600)
+        .mode(0o600) // 新建时就是 0600，避免"先 0644 再 chmod"的窗口
         .open(path)?;
+    // `OpenOptions::mode()` 只在**创建**时生效：文件已存在且是 0644 时，
+    // 覆盖写完仍是 0644。所以每次写都显式改一次权限。
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     f.write_all(bytes)?;
     Ok(())
 }

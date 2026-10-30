@@ -37,13 +37,17 @@
 { "token": "T", "slot": "S", "client_info": { "hostname": "...", "machine_id": "..." } }
 ```
 - `client_info` 仅 approval 型必填
-- 校验：token 有效未用未过期、slot 匹配；approval 型创建 pending 注册单
-- 挑战绑定三元组 `(token_hash, slot, tls_cert_seen_fp_hint)`
+- 校验：token 有效未用未过期、slot 匹配；approval 型创建 pending 注册单。
+  **同 slot 已有 `pending` 单时直接复用**（不返回 409）：否则客户端在 challenge 之后、
+  enroll 之前掉线一次就会被自己刚建的 pending 单永久挡死
+- slot 已有 `issued`/`active` 证书 → `slot_conflict`（409）
+- 挑战绑定三元组 `(token_hash, slot)`
 
 响应：
 ```json
-{ "challenge_id": "uuid", "challenge": "<hex 32B>", "ttl_secs": 60 }
+{ "challenge_id": "uuid", "challenge": "<hex 32B>", "ttl_secs": 60, "kind": "auto", "enroll_id": "uuid" }
 ```
+`enroll_id` 仅 approval 型返回，客户端应**立刻落盘**（配合私钥，见 §7）。
 
 ### POST /enroll
 
@@ -51,14 +55,21 @@
 ```json
 {
   "challenge_id": "uuid",
+  "token": "T",
+  "slot": "S",
   "csr_der": "<base64>",
   "pop_signature": "<base64 ECDSA/Ed25519>",
+  "pop_algorithm": "ecdsa-p256-sha256",
   "tls_cert_seen_fp": "<hex sha256 of server cert seen by client>"
 }
 ```
 - `canonical_transcript = challenge || token_hash || slot || sha256(csr_der) || tls_cert_seen_fp`
-- 服务端验证：challenge 未过期未消费且三元组匹配、PoP 签名、（TOFU 场景）指纹对比
-- 事务：`UPDATE challenge SET consumed_at`、`UPDATE token SET used_at`、插 enrollment
+- 服务端验证：challenge 未过期未消费且三元组匹配、PoP 签名、TOFU 指纹对比
+  （**指纹为空或不匹配一律拒绝**，不允许空值绕过）
+- 客户端**必须**把 `tls_cert_seen_fp` 钉在真正发送本请求的那条 TLS 连接上：
+  若只在另一条探测连接上校验，攻击者可以两条连接出示不同证书，把 token 骗走
+- 事务：`consume challenge` + `consume token` + 顶掉同 slot 旧证书 + 插/更新 enrollment
+  **同一事务**，任一步失败整体回滚 → token 不会被烧掉，客户端可用同一链接重试
 
 auto 型响应：
 ```json
@@ -72,14 +83,71 @@ approval 型响应：
 
 ### GET /enroll/{id}  （approval 型轮询）
 
-- `pending` / `rejected` / `approved`
-- approved 时**一次性**返回证书（下载后 `downloaded_at` 置位，不可再取）
+- `pending` / `rejected` / `approved` / `active`
+- 响应含 `mtls_endpoint`（**每个状态都带**），否则 approval 型客户端拿到证书后
+  只能拿注册端点去 confirm，必然 404
+- 可取性以 `confirm`（激活）为界：
+  - `issued` 期间**可重复下载**——服务端在响应体真正送达前就已置位 `downloaded_at`，
+    响应在网络上丢失时"一次性"会让设备永久拿不到证书（token 已消费、无路可走）
+  - `active` 后返回 410：激活时服务端已把 `cert_pem` 清空，DB 不再长期持有证书
 
 ### POST /enroll/confirm  （mTLS listener，业务 CA 信任）
 
 - 客户端拿到证书后立即调用，验证整链配置
-- 服务端：enrollment `issued → active`；换设备场景此刻才吊销旧证书
-- 请求体：`{ "slot": "S" }`（身份取自 mTLS 证书 CN/serial）
+- **握手前置条件**：证书必须由本 CA 签发、在有效期内，且在 `device_enrollment`
+  里处于 `issued`/`active` 且未被吊销。`pending`（还没批）/`rejected` 阶段就已
+  签好的证书**永远连不上**；状态查内存缓存（每 5s 刷新），从未成功刷新过时
+  拒绝一切握手（fail-closed）
+- **serial 口径**：两侧统一用去掉前导零的规范 hex。DER 编码 INTEGER 会剥掉
+  前导零，直接 hex 对比时约 1/256 的证书会永远对不上，吊销就形同虚设
+- 服务端：enrollment `issued → active`，同时**清空 `cert_pem`**（证书已交付并被使用）
+- 换设备（同 slot 顶掉旧证书）发生在 `POST /enroll` 时刻并立即写入吊销缓存；
+  注意 challenge 阶段会把已有 `issued/active` 的 slot 挡成 409，
+  所以实际换设备流程是：管理员 `/revoke` 旧 serial → 发新链接
+- 请求体：`{ "slot": "S" }`（身份取自 mTLS 证书 CN，与 body 不一致即 401）
+
+### POST /messages  （mTLS listener，设备上行消息）
+
+```json
+{ "seq": 1, "kind": "heartbeat", "payload": "{}" }
+```
+
+- `seq` 从 1 起单调递增；服务端按 `(serial, seq)` 去重，**重复返回 2xx +
+  `{"duplicate": true}`**（幂等，客户端重放不需要担心副作用）
+- 水位写入 `device_session.last_seen_seq`，重启后去重仍然有效
+- 身份取自 mTLS 证书（CN + serial），不信任请求体；`kind` 1..64 字符、
+  `payload` ≤ 64 KiB
+- 这是防抖会话层的入口：新消息还会触发"此前被判 offline 的会话恢复 online"
+
+### POST /admin/tokens  （管理端，Bearer）
+
+```json
+{ "kind": "auto|approval", "slot": "S", "ttl_secs": 900, "created_by": "ops@x" }
+```
+返回一次性明文注册链接（`link`），库中只存 SHA-256。`slot` 只允许 `[A-Za-z0-9._-]`。
+
+> **限速**：所有 `/admin/...` 按对端 IP 计预算（`ADMIN_RATE_LIMIT`，
+> 默认 30 次/分钟，`0` = 关闭），超限返回 `429` + `Retry-After`。
+> 静态 bearer 没有账号锁定可言，限速是唯一防线。
+
+### GET /admin/enrollments?status=pending  （管理端，Bearer）
+
+注册单列表（含 `client_info`、时间戳、是否已下载）。审批的入口：
+没有它，管理员必须先从客户端拿到 `enroll_id` 才能 decide。
+
+### DELETE /admin/enrollments/{id}  （管理端，Bearer）
+
+清理 `pending`（卡死的半截注册）与 `rejected`；`issued/active` 走 `/revoke`，
+`revoked` 保留作审计。
+
+### POST /admin/enroll/{id}/decide  （管理端，Bearer）
+
+```json
+{ "approve": true, "note": "..." }
+```
+`approve: false` 时**同时吊销**该注册单在 enroll 阶段就已签好的证书
+（`revoked_at = now()`，并立即写入吊销缓存）——否则一张长有效期证书会以
+`rejected` 身份留在库里，而 mTLS 握手只查吊销缓存。
 
 ### POST /revoke  （管理端，管理员鉴权）
 
@@ -121,6 +189,8 @@ CREATE TABLE device_enrollment (
   cert_pem      TEXT NOT NULL,
   status        TEXT NOT NULL CHECK (status IN ('pending','issued','active','rejected','revoked')),
   client_info   JSONB,
+  enroll_id     UUID,
+  downloaded_at TIMESTAMPTZ,
   issued_at     TIMESTAMPTZ,
   activated_at  TIMESTAMPTZ,
   revoked_at    TIMESTAMPTZ,
@@ -131,19 +201,38 @@ CREATE UNIQUE INDEX device_slot_one_live ON device_enrollment (device_slot)
   WHERE status IN ('pending','issued','active');
 ```
 
+> 迁移文件在 workspace 根 `migrations/0006_device_pki.sql`，与 api/db 共用同一份。
+> 曾经 device-pki 自带一套以 `0001_` 开头的迁移，与根目录 `0001_init.sql` 版本号冲突，
+> 两个二进制共用一个库时 sqlx 会直接报 `VersionMismatch`/`VersionMissing` 让进程起不来。
+
 ## 6. 防抖持久化会话（debounce）
 
 目标：网络抖动/重连时抑制重复状态翻转与重复消息，且重启可恢复。
 
-- **会话标识**：`(serial, device_slot)`，服务端内存 `DashMap` + DB 落盘 `device_session` 表
-- **客户端**：指数退避重连（100ms → 30s 上限，jitter），出站消息带单调 `seq`，未 ACK 消息持久化（sled/文件队列），重连后重放
-- **服务端**：按 `(serial, seq)` 去重；入站事件经防抖窗口（默认 250ms）合并后再分发；`last_seen_seq` 持久化
+- **会话标识**：`(serial, device_slot)`，服务端内存 + DB 落盘 `device_session` 表；
+  **启动时把水位读回内存**，重启后去重立刻生效
+- **客户端**：指数退避重连（100ms → 30s 上限，jitter），出站消息带单调 `seq`，
+  先落 sled 再发送，**收到服务端 ACK 才删除**；重连后按 seq 逐条真正重发
+- **服务端**：`POST /messages` 按 `(serial, seq)` 去重（重复也是 2xx，幂等）；
+  入站事件经防抖窗口（默认 250ms）合并后再分发；`last_seen_seq` 持久化
 - **下线判定**：心跳间隔 5s，3 次未达 → 标记 offline（防抖，不立即广播），恢复后合并为一次状态变更
+- **节奏**：客户端成功一轮后按心跳间隔（5s）再探，而不是退避下限 —— 否则
+  confirm 会被打成 ~10 次/秒，违反心跳约定并冲击服务端防抖
 
-## 7. 客户端凭证持久化
+## 7. 客户端凭证与信任持久化
 
-- `cert.pem` / `key.pem` 落盘，权限 0600
-- `server pin`（SPKI sha256）写入本地 trust store（TOFU 首次人工确认后）
+- `cert.pem` / `key.pem` 落盘，权限 0600（每次写都重新 `chmod`，覆盖已有文件也生效）
+- **进行中的 approval 注册**落 `pending/<slot>.json`：设备私钥 + `enroll_id`。
+  CSR 一旦提交私钥就换不回来，若等到拿到证书才存盘，等待审批期间进程一退出
+  这台设备就永久注册不上（token 已消费）。中断后用 `poll --slot <slot>` 续跑，
+  不需要原注册链接
+- TOFU 首次连接必须**展示指纹并人工核对**（交互确认或显式 `--trust`），
+  不能是"看都不看就信"
+- 注册链接里含一次性 token，客户端支持从 **stdin** 读链接（`enroll -`），
+  避免它留在 shell history / 进程参数里
+- 注册通道：客户端把已校验的证书指纹钉进真正传 token 的 TLS 连接
+- mTLS 通道：用 `ca_chain_pem` 作为信任根做链验证 + 主机名校验，
+  不允许 `danger_accept_invalid_certs`
 - 换设备：管理员吊销旧 serial → 生成新链接 → 新设备走同一流程
 
 ## 8. 错误码（注册端点）
@@ -155,4 +244,12 @@ CREATE UNIQUE INDEX device_slot_one_live ON device_enrollment (device_slot)
 | `challenge_expired` / `challenge_consumed` / `challenge_mismatch` | 挑战问题 |
 | `pop_invalid` | 持有证明验签失败 |
 | `fp_mismatch` | TOFU 指纹与服务端实际不符（疑似 MITM） |
-| `pending_approval` / `approval_rejected` | approval 型状态 |
+| `pending_approval` / `approval_rejected` | approval 型状态（`rejected`/`revoked` 后轮询） |
+| `already_downloaded` | 证书已激活交付，不可再取（410） |
+| `enrollment_not_found` | 注册单不存在或已被管理端清理（404） |
+| `unauthorized` | 管理端 Bearer 缺失或错误（401） |
+| `rate_limited` | 管理端超出每 IP 每分钟预算（429 + `Retry-After`） |
+| `bad_request` | 请求体不合法，例如 `slot` 不在白名单内（400） |
+| `internal` | 服务端内部错误（500） |
+
+> `pending` **不是错误码**：challenge/enroll 轮询阶段它以 `{"status":"pending"}` 正常返回 200。

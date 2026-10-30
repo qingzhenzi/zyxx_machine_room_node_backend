@@ -11,7 +11,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use qe_device_pki_client::creds::{CredIssue, Credentials};
 use qe_device_pki_client::enroll::{self, EnrollOptions, EnrollOutcome};
-use qe_device_pki_client::transport::{self, BackoffPolicy, ConnectEvent, OutboxQueue, TransportConfig};
+use qe_device_pki_client::transport::{
+    self, BackoffPolicy, ConnectEvent, OutboxQueue, PendingMessage, TransportConfig,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +51,12 @@ enum Cmd {
     },
     /// 用正式证书完成 mTLS 回连确认（通讯真正打通）
     Confirm,
+    /// 续跑一次被中断的 approval 注册（用落盘的 pending 状态，不需要原链接）
+    Poll {
+        /// 最长等待管理员批准的时间（秒）
+        #[arg(long, default_value_t = 300)]
+        wait_secs: u64,
+    },
     /// 心跳 + 防抖重连演示
     Ping {
         /// 心跳次数（0 = 无限）
@@ -85,6 +93,18 @@ async fn main() -> Result<()> {
             trust,
             wait_secs,
         } => {
+            // 链接里含一次性 token，走 argv 会留在 shell history / ps 里。
+            // 传 `-` 表示从 stdin 读（配合脚本或剪贴板管道）。
+            let link = if link == "-" {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .context("从 stdin 读取注册链接")?;
+                buf.trim().to_owned()
+            } else {
+                link
+            };
             println!("注册链接: {}", enroll::link_summary(&link)?);
             let opts = EnrollOptions {
                 approval_wait: if wait {
@@ -107,8 +127,12 @@ async fn main() -> Result<()> {
                     println!("下一步：`qe-device-pki-client confirm --slot {}` 完成 mTLS 验证", creds.device_slot);
                 }
                 EnrollOutcome::PendingApproval { enroll_id } => {
+                    let slot = enroll::EnrollTarget::parse(&link)
+                        .map(|t| t.slot)
+                        .unwrap_or_else(|_| "<slot>".into());
                     println!("◷ 等待管理员批准，enroll_id = {enroll_id}");
-                    println!("  批准后重新执行 enroll 并加 --wait，或直接运行 confirm");
+                    println!("  私钥与注册单已落盘（pending/），批准或中断后续跑即可：");
+                    println!("    qe-device-pki-client poll --slot {slot} --wait-secs 300");
                 }
             }
         }
@@ -120,6 +144,24 @@ async fn main() -> Result<()> {
             println!("  status : {}", reply.status);
             println!("  serial : {}", reply.serial);
             println!("  mtls   : {}", reply.mtls);
+        }
+        Cmd::Poll { wait_secs } => {
+            let slot = match cli.slot.clone() {
+                Some(s) => s,
+                None => find_any_pending(&data_dir)?,
+            };
+            let opts = EnrollOptions {
+                approval_wait: Some(Duration::from_secs(wait_secs)),
+                trust_confirmed: false,
+                data_dir: Some(data_dir.clone()),
+            };
+            println!("→ 续跑 {slot} 的审批轮询（最长 {wait_secs}s）");
+            let creds = enroll::resume_poll(&slot, Some(&data_dir), &opts).await?;
+            println!("✓ 注册成功（续跑）");
+            println!("  slot   : {}", creds.device_slot);
+            println!("  serial : {}", creds.serial);
+            println!("  凭证   : {}", enroll::creds_dir(&creds.device_slot, Some(&data_dir))?.display());
+            println!("下一步：`qe-device-pki-client confirm --slot {}` 完成 mTLS 验证", creds.device_slot);
         }
         Cmd::Ping { count } => {
             let cfg = load_transport(&data_dir, cli.slot.as_deref())?;
@@ -141,21 +183,60 @@ async fn main() -> Result<()> {
                 }
             });
 
-            // 用 confirm 作为连通性探针，每次成功后 sleep 心跳间隔
-            let cfg_clone = Arc::new(cfg);
-            let heartbeat = cfg_clone.heartbeat;
+            // 用 confirm 作为连通性探针；每次成功后 run_with_reconnect 会按心跳间隔再探
+            let cfg_all = Arc::new(cfg);
+            let heartbeat = cfg_all.heartbeat;
             let iterations = if count == 0 { u64::MAX } else { count as u64 };
             let mut done = 0u64;
-            let probe_cfg = Arc::clone(&cfg_clone);
+
+            // 生产者：每次心跳入队一条消息（先落盘，发送由重连循环负责 —— 契约 §6 的
+            // "写 sled 后才发送，收到 ACK 才删除"）
+            let producer_outbox = Arc::clone(&outbox);
+            let producer = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(heartbeat);
+                loop {
+                    ticker.tick().await;
+                    let seq = match producer_outbox.next_seq() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("✗ 取 seq 失败: {e}");
+                            continue;
+                        }
+                    };
+                    let epoch = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let msg = PendingMessage {
+                        seq,
+                        kind: "heartbeat".into(),
+                        payload: serde_json::json!({ "at": epoch }).to_string(),
+                    };
+                    if let Err(e) = producer_outbox.enqueue(&msg) {
+                        eprintln!("✗ 消息入队失败: {e}");
+                    }
+                }
+            });
+
+            let probe_cfg = Arc::clone(&cfg_all);
+            let send_cfg = Arc::clone(&cfg_all);
             let handle = tokio::spawn(transport::run_with_reconnect(
                 BackoffPolicy::default(),
                 Arc::clone(&outbox),
                 move || {
                     let c = Arc::clone(&probe_cfg);
+                    // 不在这里 sleep：run_with_reconnect 已按心跳间隔 pacing，
+                    // 再塞一个 std::thread::sleep 只会阻塞 tokio worker 线程
+                    async move { transport::confirm(&c).await.map(|_| ()) }
+                },
+                move |msg: PendingMessage| {
+                    let c = Arc::clone(&send_cfg);
                     async move {
-                        transport::confirm(&c).await.map(|_| {
-                            std::thread::sleep(Duration::from_millis(10));
-                        })
+                        let ack = transport::send_message(&c, &msg).await?;
+                        if ack.duplicate {
+                            tracing::debug!(seq = ack.seq, "服务端判为重复（重放幂等，正常）");
+                        }
+                        Ok(())
                     }
                 },
                 Some(tx),
@@ -169,9 +250,10 @@ async fn main() -> Result<()> {
                     break;
                 }
                 done += 1;
-                println!("♥ 心跳 #{done}");
+                println!("♥ 心跳 #{done}（待 ACK {} 条）", outbox.len());
             }
             handle.abort();
+            producer.abort();
             log_task.abort();
             println!("✓ 心跳结束，未 ACK 消息剩余 {} 条", outbox.len());
         }
@@ -195,14 +277,14 @@ async fn main() -> Result<()> {
             println!("  目录     : {}", creds_dir.display());
 
             use x509_parser::prelude::*;
-            if let Some(der) = creds.cert_chain_der()?.first() {
-                if let Ok((_, cert)) = X509Certificate::from_der(der.as_ref()) {
-                    println!(
-                        "  有效期   : {} → {}",
-                        cert.validity().not_before,
-                        cert.validity().not_after
-                    );
-                }
+            if let Some(der) = creds.cert_chain_der()?.first()
+                && let Ok((_, cert)) = X509Certificate::from_der(der.as_ref())
+            {
+                println!(
+                    "  有效期   : {} → {}",
+                    cert.validity().not_before,
+                    cert.validity().not_after
+                );
             }
 
             // 启动自检：PEM 可解析 / 私钥与证书匹配 / 未过期
@@ -234,6 +316,28 @@ fn load_transport(data_dir: &std::path::Path, slot: Option<&str>) -> Result<Tran
         anyhow::bail!("凭证不可用：{issue}\n\n{}", issue.advice());
     }
     Ok(TransportConfig::new(creds, data_dir.to_path_buf()))
+}
+
+/// 未指定 slot 时找出唯一的待续跑注册（`pending/` 下的落盘状态）。
+fn find_any_pending(data_dir: &std::path::Path) -> Result<String> {
+    let base = data_dir.join("pending");
+    let mut found = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&base) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                found.push(p.file_stem().unwrap_or_default().to_string_lossy().into_owned());
+            }
+        }
+    }
+    match found.len() {
+        0 => anyhow::bail!(
+            "没有待续跑的注册（{} 下为空）。请用注册链接重新 enroll",
+            base.display()
+        ),
+        1 => Ok(found.remove(0)),
+        _ => anyhow::bail!("发现多个待续跑注册，请用 --slot 指定：{}", found.join(", ")),
+    }
 }
 
 /// 未指定 slot 时找出唯一的凭证目录。

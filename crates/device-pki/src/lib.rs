@@ -4,14 +4,16 @@
 //!
 //! 两个 listener：
 //! - 注册 listener（单向 TLS）：`POST /enroll/challenge`、`POST /enroll`、
-//!   `GET /enroll/{id}`、`POST /admin/enroll/{id}/decide`、`GET /crl`
-//! - 业务 listener（mTLS）：`POST /enroll/confirm`、`POST /revoke`
+//!   `GET /enroll/{id}`、`POST /admin/tokens`、`GET /admin/enrollments`、
+//!   `DELETE /admin/enrollments/{id}`、`POST /admin/enroll/{id}/decide`、`GET /crl`
+//! - 业务 listener（mTLS）：`POST /enroll/confirm`、`POST /messages`、`POST /revoke`
 
 pub mod ca;
+pub mod cert_status;
 pub mod challenge;
 pub mod error;
 pub mod pop;
-pub mod revocation;
+pub mod ratelimit;
 pub mod routes;
 pub mod session;
 pub mod tls;

@@ -2,13 +2,14 @@
 //!
 //! - **注册 listener**：单向 TLS。客户端此时无证书，靠 token + challenge + PoP 授权。
 //! - **业务 listener**：mTLS。除了链验证到业务 CA，还要查 `device_enrollment`
-//!   确认该证书未被吊销——这就是"设备更换立即失效"的落点，不依赖 CRL 分发延迟。
+//!   确认该证书**可用**（`issued`/`active` 且未被吊销）——"设备更换立即失效"
+//!   与"未批准/被拒的证书永远用不了"都在这里落地，不依赖 CRL 分发延迟。
 //!
 //! 为什么必须是两个 listener：rustls 在握手阶段就要确定是否需要客户端证书，
 //! 运行时切换会让状态机很难维护。
 
 use crate::ca::{pem_to_cert_chain, pem_to_private_key, Ca};
-use crate::revocation::RevocationCache;
+use crate::cert_status::CertStatusCache;
 use x509_parser::prelude::FromDer;
 use crate::error::{Error, Result};
 use axum::extract::FromRequestParts;
@@ -34,11 +35,10 @@ impl PeerCert {
         let mut cn = None;
         let mut serial = None;
         if let Ok((_, cert)) = x509_parser::prelude::X509Certificate::from_der(&der) {
-            use x509_parser::prelude::*;
             cn = cert.subject().iter_common_name().next().and_then(|a| {
                 a.as_str().ok().map(|s| s.to_owned())
             });
-            serial = Some(hex::encode(cert.tbs_certificate.raw_serial()));
+            serial = Some(crate::ca::canonical_serial_hex(cert.tbs_certificate.raw_serial()));
         }
         Self {
             der,
@@ -75,18 +75,18 @@ pub fn server_config_enroll(cert_pem: &str, key_pem: &str) -> Result<Arc<ServerC
     Ok(Arc::new(cfg))
 }
 
-/// 业务 listener：mTLS，要求客户端证书且未被吊销。
+/// 业务 listener：mTLS，要求客户端证书且**在 device_enrollment 中可用**。
 pub fn server_config_mtls(
     cert_pem: &str,
     key_pem: &str,
     ca: Arc<Ca>,
-    revocations: Arc<RevocationCache>,
+    cert_status: Arc<CertStatusCache>,
 ) -> Result<Arc<ServerConfig>> {
     let certs = pem_to_cert_chain(cert_pem)?;
     let key = pem_to_private_key(key_pem)?;
-    let verifier = Arc::new(RevocationCheckingVerifier {
+    let verifier = Arc::new(DeviceCertVerifier {
         ca,
-        revocations,
+        cert_status,
         supported: rustls::crypto::ring::default_provider()
             .signature_verification_algorithms,
     });
@@ -98,24 +98,24 @@ pub fn server_config_mtls(
     Ok(Arc::new(cfg))
 }
 
-/// 自定义客户端证书验证器：链验证 + 吊销检查。
+/// 自定义客户端证书验证器：链验证 + 可用性检查（吊销 / 未启用）。
 ///
-/// 吊销状态来自内存缓存（`RevocationCache`），由后台任务每 5s 刷新。
+/// 状态来自内存缓存（`CertStatusCache`），由后台任务每 5s 刷新。
 /// 这样 rustls 的同步回调里不需要任何 async/DB 访问，也就不会出现
 /// 「单线程 runtime 降级放行」的漏洞。
-pub struct RevocationCheckingVerifier {
+pub struct DeviceCertVerifier {
     ca: Arc<Ca>,
-    revocations: Arc<RevocationCache>,
+    cert_status: Arc<CertStatusCache>,
     supported: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
-impl std::fmt::Debug for RevocationCheckingVerifier {
+impl std::fmt::Debug for DeviceCertVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RevocationCheckingVerifier").finish_non_exhaustive()
+        f.debug_struct("DeviceCertVerifier").finish_non_exhaustive()
     }
 }
 
-impl ClientCertVerifier for RevocationCheckingVerifier {
+impl ClientCertVerifier for DeviceCertVerifier {
     fn offer_client_auth(&self) -> bool {
         true
     }
@@ -156,11 +156,22 @@ impl ClientCertVerifier for RevocationCheckingVerifier {
             return Err(rustls::Error::General("client cert expired".into()));
         }
 
-        // 3. 吊销检查（这就是"换设备即刻失效"的地方）
-        let serial_hex = hex::encode(leaf.tbs_certificate.raw_serial());
-        if self.revocations.is_revoked(&serial_hex) {
+        // 3. 可用性检查：吊销 + 必须在 device_enrollment 里且处于 issued/active
+        //    （这就是"换设备即刻失效"、"未批准/被拒证书永远用不了"的落点）
+        //
+        //    serial 两侧必须用同一个规范化口径：rcgen 写进证书的 INTEGER 会被 DER
+        //    去掉前导零，而库里存的是生成时的原始 20 字节 —— 直接 hex 对比时
+        //    约 1/256 的证书（首字节为 0x00）会永远对不上。
+        let serial_hex = crate::ca::canonical_serial_hex(leaf.tbs_certificate.raw_serial());
+        if self.cert_status.is_revoked(&serial_hex) {
             tracing::info!(serial = %serial_hex, "mTLS handshake rejected: cert revoked");
             return Err(rustls::Error::General("client cert revoked".into()));
+        }
+        if !self.cert_status.is_live(&serial_hex) {
+            tracing::info!(serial = %serial_hex, "mTLS handshake rejected: cert not active in device_enrollment");
+            return Err(rustls::Error::General(
+                "client cert not active in device_enrollment".into(),
+            ));
         }
 
         Ok(ClientCertVerified::assertion())
