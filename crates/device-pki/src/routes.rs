@@ -1088,6 +1088,8 @@ pub fn mtls_router(st: AppState) -> Router {
         .route("/messages", post(receive_message))
         .route("/messages/downlink", get(downlink_pull))
         .route("/messages/downlink/ack", post(downlink_ack))
+        // 节点配置：启动时按证书身份拉取 global → area → room 合并后的策略（§17.3）
+        .route("/agent/config", get(crate::agent_config::get_config))
         // 设备换对象存储预签名 URL（大文件不走消息通道，契约 §16.2）
         .route("/resources/presign", post(crate::resource::presign))
         .route("/revoke", post(revoke))

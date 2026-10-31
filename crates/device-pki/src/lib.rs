@@ -7,8 +7,10 @@
 //!   `GET /enroll/{id}`、`POST /admin/tokens`、`GET /admin/enrollments`、
 //!   `DELETE /admin/enrollments/{id}`、`POST /admin/enroll/{id}/decide`、`GET /crl`
 //! - 业务 listener（mTLS）：`POST /enroll/confirm`、`POST /messages`、
+//!   `GET /agent/config`（节点配置，契约 §17.3）、
 //!   `POST /resources/presign`（对象存储预签名，契约 §16.2）、`POST /revoke`
 
+pub mod agent_config;
 pub mod ca;
 pub mod cert_status;
 pub mod challenge;

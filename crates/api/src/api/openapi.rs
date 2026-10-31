@@ -54,6 +54,7 @@ pub async fn json_spec() -> Json<Value> {
             { "name": "Devices", "description": "设备：注册状态、在线状态与区域/房间绑定（v3）" },
             { "name": "Storage", "description": "对象存储：预签名上传、对象登记、分发/收集任务（P0，S3 兼容）" },
             { "name": "Images", "description": "镜像：manifest、验证、发布与房间分配（P0，不做 Registry 协议）" },
+            { "name": "AgentConfigs", "description": "节点配置：按 global → area → room 合并的生效策略与二次下发（P2）" },
             { "name": "Health" }
         ],
         "components": {
@@ -980,6 +981,80 @@ pub async fn json_spec() -> Json<Value> {
                 "AssignImageRequest": {
                     "type": "object",
                     "properties": { "channel": { "$ref": "#/components/schemas/ImageChannel", "default": "prod" } }
+                },
+                "AgentConfigScopeType": {
+                    "type": "string",
+                    "enum": ["global", "area", "room"],
+                    "description": "作用域：global（scope_id 必须为空）/ area / room（必须提供 scope_id）。"
+                },
+                "AgentPolicy": {
+                    "type": "object",
+                    "description": "合并后的完整策略（默认值：lxc_auto_start=false、poll_interval_secs=2、download_concurrency=4、cache_max_bytes=10737418240）。",
+                    "required": ["lxc_auto_start", "poll_interval_secs", "download_concurrency", "cache_max_bytes"],
+                    "properties": {
+                        "lxc_auto_start": { "type": "boolean" },
+                        "poll_interval_secs": { "type": "integer", "minimum": 1, "maximum": 60 },
+                        "download_concurrency": { "type": "integer", "minimum": 1, "maximum": 32 },
+                        "cache_max_bytes": { "type": "integer", "minimum": 0, "maximum": 1099511627776i64 }
+                    }
+                },
+                "AgentPolicyPatch": {
+                    "type": "object",
+                    "description": "局部策略；只覆盖出现的字段，范围与 AgentPolicy 一致。",
+                    "properties": {
+                        "lxc_auto_start": { "type": "boolean" },
+                        "poll_interval_secs": { "type": "integer", "minimum": 1, "maximum": 60 },
+                        "download_concurrency": { "type": "integer", "minimum": 1, "maximum": 32 },
+                        "cache_max_bytes": { "type": "integer", "minimum": 0, "maximum": 1099511627776i64 }
+                    }
+                },
+                "AgentConfig": {
+                    "type": "object",
+                    "required": ["id", "scope_type", "scope_id", "policy", "revision", "updated_by", "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "scope_type": { "$ref": "#/components/schemas/AgentConfigScopeType" },
+                        "scope_id": { "type": ["string", "null"], "format": "uuid" },
+                        "policy": { "$ref": "#/components/schemas/AgentPolicyPatch" },
+                        "revision": { "type": "integer", "description": "每次 upsert 递增；新行从 1 开始。" },
+                        "updated_by": { "type": ["string", "null"], "format": "uuid" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "AgentConfigList": {
+                    "type": "object",
+                    "required": ["items", "total"],
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/AgentConfig" } },
+                        "total": { "type": "integer" }
+                    }
+                },
+                "UpdateAgentConfigRequest": {
+                    "type": "object",
+                    "required": ["scope_type", "policy"],
+                    "properties": {
+                        "scope_type": { "$ref": "#/components/schemas/AgentConfigScopeType" },
+                        "scope_id": { "type": ["string", "null"], "format": "uuid", "description": "global 必须缺省/为 null；area/room 必填。" },
+                        "policy": { "$ref": "#/components/schemas/AgentPolicyPatch" }
+                    }
+                },
+                "UpdateAgentConfigReply": {
+                    "type": "object",
+                    "required": ["config", "pushed_rooms"],
+                    "properties": {
+                        "config": { "$ref": "#/components/schemas/AgentConfig" },
+                        "pushed_rooms": { "type": "integer", "description": "成功写入 config.update 下行的房间数。" }
+                    }
+                },
+                "EffectiveAgentPolicyReply": {
+                    "type": "object",
+                    "required": ["room_id", "policy", "revision"],
+                    "properties": {
+                        "room_id": { "type": "string", "format": "uuid" },
+                        "policy": { "$ref": "#/components/schemas/AgentPolicy" },
+                        "revision": { "type": "integer", "description": "已应用行中的最大 revision；无配置为 0。" }
+                    }
                 }
             }
         },
@@ -1936,6 +2011,45 @@ pub async fn json_spec() -> Json<Value> {
                         "403": error_response("缺少 storage:read")
                     }
                 }
+            },
+            "/admin/agent-configs": {
+                "get": {
+                    "tags": ["AgentConfigs"],
+                    "summary": "所有作用域的节点配置（global / area / room）",
+                    "security": secured(),
+                    "responses": {
+                        "200": { "description": "配置列表", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AgentConfigList" } } } },
+                        "403": error_response("缺少 device:read")
+                    }
+                },
+                "put": {
+                    "tags": ["AgentConfigs"],
+                    "summary": "写入作用域配置（upsert 后审计并二次下发 config.update）",
+                    "description": "global 的 scope_id 必须为空；area/room 必须提供且目标存在。policy 为局部 patch，先做范围校验。",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateAgentConfigRequest" } } } },
+                    "responses": {
+                        "200": { "description": "写入结果与成功下发的房间数", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateAgentConfigReply" } } } },
+                        "400": error_response("scope 与 scope_id 不匹配，或 policy 超出范围"),
+                        "403": error_response("缺少 device:manage"),
+                        "404": error_response("区域或房间不存在")
+                    }
+                }
+            },
+            "/admin/agent-configs/effective": {
+                "get": {
+                    "tags": ["AgentConfigs"],
+                    "summary": "某房间合并后的生效策略（global → area → room）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "room_id", "in": "query", "required": true, "schema": { "type": "string", "format": "uuid" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "生效策略与最大 revision（无配置为 0）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EffectiveAgentPolicyReply" } } } },
+                        "403": error_response("缺少 device:read"),
+                        "404": error_response("房间不存在")
+                    }
+                }
             }
         }
     }))
@@ -1977,6 +2091,8 @@ mod tests {
         assert!(paths.contains_key("/admin/transfers"));
         assert!(paths.contains_key("/admin/transfers/{id}/retry"));
         assert!(paths.contains_key("/admin/collections"));
+        assert!(paths.contains_key("/admin/agent-configs"));
+        assert!(paths.contains_key("/admin/agent-configs/effective"));
         assert!(
             spec["tags"]
                 .as_array()
@@ -2004,6 +2120,13 @@ mod tests {
                 .expect("tags")
                 .iter()
                 .any(|tag| tag["name"] == "Images")
+        );
+        assert!(
+            spec["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .any(|tag| tag["name"] == "AgentConfigs")
         );
         assert_eq!(
             spec["components"]["securitySchemes"]["bearerAuth"]["scheme"],

@@ -8,6 +8,7 @@ use crate::{
     config::{Config, StorageConfig},
     db::{
         Db,
+        agent_config::AgentConfigRepo,
         announcements::AnnouncementRepo,
         audit::AuditLogRepo,
         device::DeviceRepo,
@@ -37,6 +38,8 @@ pub struct AppState {
     pub schedule_events: ScheduleEventRepo,
     // ---- 设备 ----
     pub devices: DeviceRepo,
+    // ---- 节点配置（P2：global → area → room）----
+    pub agent_configs: AgentConfigRepo,
     // ---- 资源与镜像（S3 兼容对象存储）----
     /// 未配置 `S3_ENDPOINT` + `S3_BUCKET`（或初始化失败）时为 `None`，
     /// 存储/镜像接口统一返回 503。
@@ -68,6 +71,7 @@ impl AppState {
             event_rules: EventRuleRepo::new(db.pool().clone()),
             schedule_events: ScheduleEventRepo::new(db.pool().clone()),
             devices: DeviceRepo::new(db.pool().clone()),
+            agent_configs: AgentConfigRepo::new(db.pool().clone()),
             storage,
             storage_repo: StorageRepo::new(db.pool().clone()),
             email,

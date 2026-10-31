@@ -698,6 +698,49 @@ image:read      image:manage
 P2 待做：zstd/gzip 压缩与解压校验、chunk 复用/增量、S3 Event 兜底、收集上传、配额/保留期/GC、
 `transfers`/`collections` 状态过滤、只读 Registry（Zot facade）、Trivy 扫描、真实 RustFS/Incus/libvirt 环境联调。
 
+## 节点配置管理（P2）
+
+房间节点 agent 的策略默认在节点本地（配置文件 + env），启动连上 device-pki 后通过
+`GET /agent/config` 拉取生效策略；管理端可随时修改策略，经 device-pki 下行 `config.update`
+二次下发。设计契约见 [`docs/storage-design.md`](docs/storage-design.md) §17，
+迁移为 `migrations/0012_agent_config.sql`。
+
+### API（`/api/v1/admin`）
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/agent-configs` | `device:read` | 所有作用域配置 `{items,total}` |
+| PUT | `/agent-configs` | `device:manage` | body `{scope_type:"global"\|"area"\|"room", scope_id?, policy:{...patch}}`；upsert + 审计 + 二次下发，返回 `{config,pushed_rooms}` |
+| GET | `/agent-configs/effective?room_id=` | `device:read` | 房间合并后的生效策略 `{room_id,policy,revision}` |
+
+`scope_type=global` 时 `scope_id` 必须为空；`area` / `room` 必须提供 `scope_id`，目标不存在返回 404。
+`policy` 是局部 patch，写入前校验范围（`poll_interval_secs` 1..=60、`download_concurrency` 1..=32、
+`cache_max_bytes` 0..=1 TiB）。
+
+### scope 继承
+
+策略按 **global → area（房间所属区域）→ room** 依次合并，后者覆盖前者；未出现的字段保持默认值：
+
+| 字段 | 默认 | 范围 |
+| --- | --- | --- |
+| `lxc_auto_start` | `false` | — |
+| `poll_interval_secs` | `2` | 1..=60 |
+| `download_concurrency` | `4` | 1..=32 |
+| `cache_max_bytes` | 10 GiB | 0..=1 TiB |
+
+`revision` 取已应用配置行中的最大值（无配置为 0），每次 upsert 递增。
+同一作用域重复 PUT 会**整体替换**该作用域的 patch：未提交的字段回到继承值/默认值，
+需要保留时请在本次 patch 中一并提交。
+
+### 二次下发
+
+`PUT /agent-configs` 成功并写审计 `agent_config.update` 后，服务端用 `rooms_for_scope`
+找到受影响房间；对每个已绑定 `device_slot` 的房间取 `effective_for_room`，向该槽位入队
+`config.update`（payload `{"policy":{...},"revision":n}`），有存活设备时再发 Redis 通知唤醒长连接。
+下发是尽力而为：无设备 / 入队或通知失败只记 `warn`，不回滚配置写入；`pushed_rooms` 是成功入队的房间数。
+agent 收到后应用策略：`lxc_auto_start` / `poll_interval_secs` 立即生效，
+`download_concurrency` / `cache_max_bytes` 需重启（只 warn）。
+
 ## 请求追踪与日志
 
 ### trace_id / request_id

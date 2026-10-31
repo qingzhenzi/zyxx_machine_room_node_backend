@@ -162,6 +162,8 @@ mod tests {
             libvirt_pool: "default".into(),
             lxc_rootfs_dir: PathBuf::from("/var/lib/lxc"),
             lxc_auto_start: false,
+            config_file: PathBuf::from("./data/agent-config.json"),
+            local_policy: qe_domain::agent_config::AgentPolicy::default(),
         }
     }
 

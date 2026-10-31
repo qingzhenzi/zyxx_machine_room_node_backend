@@ -152,3 +152,16 @@ psql "$DATABASE_URL" -c "SELECT image_id,room_id,rollout_state FROM image_assign
 
 Incus 主机要求（本机踩坑）：`newuidmap`/`newgidmap` 需 setuid；`/etc/subuid`、`/etc/subgid`
 需为 `root` 提供 ≥65536 范围；运行 agent 的用户需在 `incus-admin` 组。
+
+## 7. P2 节点配置管理验证（本地，2026-10-31）
+
+| 检查 | 结果 |
+| --- | --- |
+| 本地默认配置 | ✅ agent 启动读 `agent-config.json`（`lxc_auto_start=false, poll_interval=2`） |
+| 启动拉取远端策略 | ✅ mTLS `GET /agent/config` 返回房间合并策略（`lxc_auto_start=true, poll_interval=3`, revision=1），覆盖本地 |
+| 按策略拉取/启动 | ✅ `image.pull` 后 Incus 容器 `debian12-cfg` RUNNING，`incus exec` 可读 Debian 12 `/etc/os-release` |
+| 管理端二次下发 | ✅ 运行中 PUT room 策略（`lxc_auto_start=false, poll_interval=1`）→ `pushed_rooms=1`，agent 下行 `config.update` 应用 revision=2，轮询间隔立即变 1s |
+| 管理端查看生效策略 | ✅ `GET /admin/agent-configs/effective?room_id=` 返回合并后的策略与 revision |
+| 集成测试 | ✅ `make check` + `scripts/test-integration.sh`（含 device-pki `/agent/config` 4 个、qe-api agent_config 1 个集成测试） |
+
+已知取舍：`download_concurrency`/`cache_max_bytes` 的二次下发只 warn“需重启生效”；启动拉取失败会 warn 后回退本地配置。

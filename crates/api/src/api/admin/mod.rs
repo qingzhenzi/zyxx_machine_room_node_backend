@@ -1,3 +1,4 @@
+pub mod agent_configs;
 pub mod announcements;
 pub mod areas;
 pub mod audit;
@@ -110,6 +111,12 @@ pub fn router() -> Router<AppState> {
             "/rooms/{id}/images/{image_id}",
             put(images::assign_room).delete(images::unassign_room),
         )
+        // ---- 节点配置（P2）----
+        .route(
+            "/agent-configs",
+            get(agent_configs::list).put(agent_configs::update),
+        )
+        .route("/agent-configs/effective", get(agent_configs::effective))
 }
 
 #[cfg(test)]

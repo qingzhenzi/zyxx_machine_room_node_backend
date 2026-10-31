@@ -1,6 +1,6 @@
 # 资源与镜像管理（Storage / Image）设计草案 v0.1
 
-> 状态：**P0（后端）与 P1（device-pki 扩展 + 房间节点 agent）已实现**；真实 RustFS/mTLS/Incus/libvirt 端到端待环境联调。目标是为房间节点提供「资源分发 / 收集」与「镜像（Docker/OCI、LXC rootfs、VM 磁盘）管理」的独立模块。
+> 状态：**P0（后端）、P1（device-pki 扩展 + 房间节点 agent）、P2（节点配置管理）已实现**；RustFS/mTLS/Incus/libvirt/配置拉取与二次下发已在本地真实环境验证，跨机部署待现场联调。目标是为房间节点提供「资源分发 / 收集」与「镜像（Docker/OCI、LXC rootfs、VM 磁盘）管理」的独立模块。
 > 数据面用 S3（RustFS / MinIO / Ceph 等 S3 兼容实现），控制面放在 `qe-api`；**P0 不实现 Registry 协议**。
 
 ## 1. 目标与非目标
@@ -785,3 +785,139 @@ pub trait TopologyImporter: Send + Sync {
 - `scripts/test-integration.sh` 全绿；storage 集成测试扩展断言分配后 `device_downlink` 出现 `image.pull`。
 - device-pki：`/resources/presign` 路由可编译 + 授权/取键逻辑单测；真实 mTLS 端到端由后续手工/环境测试。
 - node-agent：单元测试覆盖 manifest 校验、cache、job 编排（mock PresignClient/TopologyImporter）、三个 importer 命令构造。
+
+---
+
+## 17. P2：节点配置管理（本地默认 + 启动拉取 + 管理端二次下发）
+
+> 架构：**默认配置在节点本地**（配置文件 + env）；agent 启动连上 device-pki 后，
+> 请求 `GET /agent/config` 拉取生效策略（全局 → 区域 → 房间合并），据此加载运行时；
+> 管理端可随时修改策略，通过 device-pki 下行 `config.update` 二次下发。
+> 本地专属字段（mTLS 端点、slot、路径、可执行文件、libvirt pool）**永不接受远端覆盖**。
+
+### 17.1 策略模型（`qe_domain::agent_config`）
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentPolicy {
+    pub lxc_auto_start: bool,          // 默认 false
+    pub poll_interval_secs: u64,       // 默认 2，范围 1..=60
+    pub download_concurrency: usize,   // 默认 4，范围 1..=32
+    pub cache_max_bytes: u64,          // 默认 10 GiB，范围 0..=1 TiB
+}
+impl Default for AgentPolicy { /* 上述默认值 */ }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentPolicyPatch {
+    pub lxc_auto_start: Option<bool>,
+    pub poll_interval_secs: Option<u64>,
+    pub download_concurrency: Option<usize>,
+    pub cache_max_bytes: Option<u64>,
+}
+impl AgentPolicyPatch {
+    pub fn apply_to(&self, policy: &mut AgentPolicy);
+    pub fn applied(&self, base: AgentPolicy) -> AgentPolicy;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigScopeType { Global, Area, Room }
+impl ConfigScopeType { pub const fn as_str(self) -> &'static str; }
+impl std::str::FromStr for ConfigScopeType { type Err = (); }
+
+pub struct AgentConfig {
+    pub id: Uuid, pub scope_type: ConfigScopeType, pub scope_id: Option<Uuid>,
+    pub policy: AgentPolicyPatch, pub revision: i64,
+    pub updated_by: Option<Uuid>, pub created_at: DateTime<Utc>, pub updated_at: DateTime<Utc>,
+}
+
+pub struct EffectiveAgentPolicy { pub policy: AgentPolicy, pub revision: i64 }
+```
+
+校验：`validate_policy_patch(&AgentPolicyPatch) -> DomainResult<()>`（范围按上面；中文错误）。
+
+### 17.2 迁移 `migrations/0012_agent_config.sql` 与仓储
+
+```sql
+CREATE TABLE agent_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope_type TEXT NOT NULL CHECK (scope_type IN ('global','area','room')),
+    scope_id UUID,
+    policy JSONB NOT NULL DEFAULT '{}'::jsonb,
+    revision BIGINT NOT NULL DEFAULT 1,
+    updated_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK ((scope_type = 'global' AND scope_id IS NULL)
+        OR (scope_type <> 'global' AND scope_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX agent_configs_global_uniq ON agent_configs (scope_type) WHERE scope_id IS NULL;
+CREATE UNIQUE INDEX agent_configs_scoped_uniq ON agent_configs (scope_type, scope_id) WHERE scope_id IS NOT NULL;
+```
+
+`crates/db/src/agent_config.rs`（`pub mod agent_config;`）：
+
+```rust
+pub struct AgentConfigRepo { /* PgPool */ }
+impl AgentConfigRepo {
+    pub fn new(db: PgPool) -> Self;
+    pub async fn list(&self) -> DbResult<Vec<AgentConfig>>;
+    /// upsert；不存在则 revision=1，存在则 revision+1。
+    pub async fn upsert(&self, scope_type: ConfigScopeType, scope_id: Option<Uuid>,
+        patch: &AgentPolicyPatch, actor: Uuid) -> DbResult<AgentConfig>;
+    /// 合并 global → area(room.area_id) → room 的 patch，返回完整策略与 revision（取已应用行的最大 revision，无行则 0）。
+    pub async fn effective_for_room(&self, room_id: Uuid) -> DbResult<EffectiveAgentPolicy>;
+    /// 某作用域受影响的房间 id（global=所有绑定 device_slot 的房间；area=该区域所有房间；room=该房间）。
+    pub async fn rooms_for_scope(&self, scope_type: ConfigScopeType, scope_id: Option<Uuid>) -> DbResult<Vec<Uuid>>;
+}
+```
+
+### 17.3 device-pki：`GET /agent/config`（mTLS listener）
+
+- `PeerCert` serial → `device_enrollment`（issued/active）slot → `rooms.device_slot` → room + area_id；
+  未绑定房间时只应用 global。
+- 返回：
+  ```json
+  { "revision": 3, "policy": { "lxc_auto_start": true, "poll_interval_secs": 2,
+    "download_concurrency": 4, "cache_max_bytes": 10737418240 } }
+  ```
+- 实现：按 §17.2 合并逻辑（device-pki 可依赖 `qe-domain` 的 `AgentPolicy`/patch 与 merge；
+  用 `sqlx::query_as` 读 `agent_configs` + `rooms`；无行则默认策略）。DB 错误 → 5xx，鉴权失败 → 401。
+- 路由加入 `mtls_router`；协议文档补端点。
+
+### 17.4 qe-api：配置管理 + 二次下发
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/admin/agent-configs` | `device:read` | 所有作用域配置 |
+| PUT | `/admin/agent-configs` | `device:manage` | body `{scope_type:"global"|"area"|"room", scope_id?, policy:{...patch}}`，upsert 后下发 |
+| GET | `/admin/agent-configs/effective?room_id=` | `device:read` | 某房间合并后的生效策略 |
+
+- PUT 成功：审计 `agent_config.update`；用 `rooms_for_scope` 找受影响房间；对每个有 `device_slot` 的房间：
+  `effective_for_room` → 构造下行 `config.update`（payload `{"policy":{...},"revision":n}`）→
+  `StorageRepo::enqueue_downlink_for_slot(slot,"config.update",json)`；拿到 serial 后 Redis 通知；
+  无设备只 warn。响应 `{config, pushed_rooms: n}`。
+- 不做“配置历史/回滚”（后续）；scope=area/room 时校验目标存在（area/room 不存在 404）。
+
+### 17.5 node-agent：本地配置 + 启动拉取 + 动态应用
+
+- 本地配置文件：`AGENT_CONFIG_FILE`（默认 `<DEVICE_DATA_DIR>/agent-config.json`），格式：
+  ```json
+  { "policy": { "lxc_auto_start": true, "poll_interval_secs": 2 } }
+  ```
+  优先级：内置默认 < 配置文件 patch < env（`LXC_AUTO_START`/`DOWNLOAD_CONCURRENCY` 等，若显式设置）< 远端（global/area/room）。
+- 启动流程：加载本地配置 → mTLS confirm → `GET {mtls_endpoint}/agent/config`；成功则应用远端策略并记录 revision；失败仅 warn，继续用本地配置。
+- 运行时：策略放 `Arc<RwLock<AgentPolicy>>`；`image.pull` 处理时读取最新策略（`lxc_auto_start` 决定是否启动）；
+  主循环按 `poll_interval_secs` 轮询。
+- 下行 `config.update` handler：校验 patch/完整策略 → 替换当前策略 → 记录日志并 ack；
+  `download_concurrency` / `cache_max_bytes` 变更需重启（只 warn，不重建 Puller）；`lxc_auto_start`/`poll_interval_secs` 立即生效。
+- 单测：配置文件解析与优先级、远端策略覆盖、`config.update` 应用、启动拉取失败回退。
+
+### 17.6 验收
+
+- `make check` 通过。
+- 集成测试：qe-api 配置 CRUD/权限/404；device-pki `/agent/config` 合并与鉴权；下发后 `device_downlink.kind='config.update'`。
+- 本地 E2E：agent 启动前管理端设置 room 策略 `lxc_auto_start=true` → agent 启动拉取生效（日志 revision）；
+  运行中修改策略 → agent 收到 `config.update` 并应用（日志）；随后 image.pull 按新策略启动。

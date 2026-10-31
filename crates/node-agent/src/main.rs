@@ -1,10 +1,14 @@
-//! 房间节点 agent 入口（P1）。
+//! 房间节点 agent 入口（P2）。
 //!
-//! 启动流程：读环境变量 → 加载设备证书 → `confirm`（已激活可忽略错误）→ 注册
-//! `image.pull` handler → 每 2s `downlink::poll_once`；Ctrl-C 优雅退出。
+//! 启动流程：读 env + 本地配置文件 → 加载设备证书 → `confirm`（已激活可忽略错误）
+//! → mTLS `GET /agent/config` 拉取远端策略（失败仅 warn、继续用本地策略）
+//! → 注册 `config.update` / `image.pull` handler → 按当前策略的
+//! `poll_interval_secs` 轮询下行；Ctrl-C 优雅退出。
 //!
-//! 导入是重操作，handler 内用 `tokio::sync::Mutex` 串行执行，避免两个镜像同时
-//! `docker load` / `virsh vol-upload`。
+//! `image.pull` 处理时读取**当前**策略的 `lxc_auto_start`（按任务重建
+//! `ImporterSet`）；`download_concurrency` / `cache_max_bytes` 在启动时固化，
+//! 运行中变更只 warn 需重启。导入是重操作，handler 内用 `tokio::sync::Mutex`
+//! 串行执行，避免两个镜像同时 `docker load` / `virsh vol-upload`。
 
 #![deny(unsafe_code)]
 
@@ -19,14 +23,13 @@ use qe_node_agent::cache::ObjectCache;
 use qe_node_agent::config::AgentConfig;
 use qe_node_agent::importer::ImporterSet;
 use qe_node_agent::job::{ImagePullJob, ensure_staging_root};
-use qe_node_agent::presign::MtlsPresignClient;
+use qe_node_agent::policy::{self, RuntimePolicy};
+use qe_node_agent::presign::{MtlsPresignClient, PresignClient};
 use qe_node_agent::pull::{HttpObjectFetcher, ObjectFetcher, Puller};
 use qe_node_agent::report::{MtlsReporter, Reporter};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-/// 下行轮询间隔（契约 §16.4）。
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// 单次拉取的下行消息条数。
 const DOWNLINK_BATCH: i64 = 20;
 
@@ -48,14 +51,19 @@ async fn run() -> Result<()> {
     std::fs::create_dir_all(&config.cache_dir)
         .with_context(|| format!("创建缓存目录失败: {}", config.cache_dir.display()))?;
 
+    // 本地策略 = 内置默认 < 配置文件 patch < env（远端在 confirm 之后覆盖）。
+    let runtime_policy = Arc::new(RuntimePolicy::new(config.local_policy.clone()));
     info!(
         slot = %config.slot,
         endpoint = %config.mtls_endpoint,
         data_dir = %config.data_dir.display(),
         cache_dir = %config.cache_dir.display(),
-        cache_max_bytes = config.cache_max_bytes,
-        download_concurrency = config.download_concurrency,
-        "启动 qe-node-agent"
+        config_file = %config.config_file.display(),
+        lxc_auto_start = config.local_policy.lxc_auto_start,
+        poll_interval_secs = config.local_policy.poll_interval_secs,
+        download_concurrency = config.local_policy.download_concurrency,
+        cache_max_bytes = config.local_policy.cache_max_bytes,
+        "启动 qe-node-agent（本地策略已加载）"
     );
 
     // 1. 设备凭证（复用 device-pki-client 的目录布局：<data_dir>/creds/<slot>）
@@ -89,6 +97,31 @@ async fn run() -> Result<()> {
         ),
     }
 
+    // 2.1 启动拉取远端策略：远端优先级最高；失败只 warn，绝不阻塞启动。
+    match policy::MtlsAgentConfigClient::new(&transport_config(&credentials, &config)) {
+        Ok(client) => match policy::fetch_and_apply(&client, &runtime_policy).await {
+            Ok(change) => info!(revision = change.revision, "启动远端策略拉取完成"),
+            Err(error) => warn!(
+                error = %format!("{error:#}"),
+                "启动拉取远端策略失败，继续使用本地策略"
+            ),
+        },
+        Err(error) => warn!(
+            error = %format!("{error:#}"),
+            "构建远端策略 mTLS 客户端失败，继续使用本地策略"
+        ),
+    }
+
+    // 启动时生效策略：Puller/缓存按此固化（运行中变更需重启）。
+    let startup_policy = runtime_policy.current();
+    info!(
+        lxc_auto_start = startup_policy.lxc_auto_start,
+        poll_interval_secs = startup_policy.poll_interval_secs,
+        download_concurrency = startup_policy.download_concurrency,
+        cache_max_bytes = startup_policy.cache_max_bytes,
+        "当前生效策略"
+    );
+
     // 3. 上行 outbox（持久化，发送成功后删除）
     let outbox = Arc::new(
         OutboxQueue::open(&config.data_dir.join("outbox"))
@@ -99,39 +132,67 @@ async fn run() -> Result<()> {
         Arc::clone(&outbox),
     ));
 
-    // 4. 预签名 + 对象下载 + 内容寻址缓存
-    let presign = Arc::new(
+    // 4. 预签名 + 对象下载 + 内容寻址缓存（并发/上限取启动时策略）
+    let presign: Arc<dyn PresignClient> = Arc::new(
         MtlsPresignClient::new(&transport_config(&credentials, &config))
             .context("构建预签名 mTLS 客户端失败")?,
     );
     let fetcher: Arc<dyn ObjectFetcher> =
         Arc::new(HttpObjectFetcher::new().context("构建对象下载客户端失败")?);
-    let cache = Arc::new(ObjectCache::new(&config.cache_dir, config.cache_max_bytes));
-    let puller = Puller::new(presign, fetcher, cache, config.download_concurrency);
+    let cache = Arc::new(ObjectCache::new(
+        &config.cache_dir,
+        startup_policy.cache_max_bytes,
+    ));
+    let startup_concurrency = startup_policy.download_concurrency.max(1);
 
-    // 5. 导入适配器 + job
+    // 5. staging 根目录
     let staging_root = config.data_dir.join("staging");
     ensure_staging_root(&staging_root)?;
-    let job = Arc::new(ImagePullJob::new(
-        puller,
-        ImporterSet::builtin(&config),
-        reporter,
-        &staging_root,
-    ));
 
-    // 6. 下行分发：image.pull 串行执行
+    // 6. 下行分发：image.pull 串行执行；config.update 立即应用。
     let dispatcher = Arc::new(Dispatcher::new());
     let import_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+    // 6.1 image.pull：每次任务开始时读当前策略，按 lxc_auto_start 重建 ImporterSet。
     {
-        let job = Arc::clone(&job);
+        let runtime_policy = Arc::clone(&runtime_policy);
+        let config = config.clone();
+        let presign = Arc::clone(&presign);
+        let fetcher = Arc::clone(&fetcher);
+        let cache = Arc::clone(&cache);
+        let reporter = Arc::clone(&reporter);
+        let staging_root = staging_root.clone();
         let import_lock = Arc::clone(&import_lock);
         dispatcher.subscribe("image.pull", move |message: DownlinkMessage| {
-            let job = Arc::clone(&job);
+            let runtime_policy = Arc::clone(&runtime_policy);
+            let config = config.clone();
+            let presign = Arc::clone(&presign);
+            let fetcher = Arc::clone(&fetcher);
+            let cache = Arc::clone(&cache);
+            let reporter = Arc::clone(&reporter);
+            let staging_root = staging_root.clone();
             let import_lock = Arc::clone(&import_lock);
             async move {
                 // 导入必须串行：docker load / incus image import / virsh vol-upload
                 // 同时跑会争抢同一份运行时状态。
                 let _guard = import_lock.lock().await;
+                // 持锁只到 clone 为止，绝不跨 await。
+                let current = runtime_policy.current();
+                let mut task_config = config.clone();
+                task_config.lxc_auto_start = current.lxc_auto_start;
+                // Puller 很轻（只持有 Arc 与启动时并发数）；按任务重建以套用
+                // 当前 lxc_auto_start，download_concurrency 仍按启动时策略。
+                let job = ImagePullJob::new(
+                    Puller::new(
+                        Arc::clone(&presign),
+                        Arc::clone(&fetcher),
+                        Arc::clone(&cache),
+                        startup_concurrency,
+                    ),
+                    ImporterSet::builtin(&task_config),
+                    Arc::clone(&reporter),
+                    &staging_root,
+                );
                 match job.run(&message.payload).await {
                     Ok(outcome) if outcome.ok => info!(
                         transfer_id = %outcome.transfer_id,
@@ -157,13 +218,35 @@ async fn run() -> Result<()> {
         });
     }
 
-    // 7. 下行轮询循环 + Ctrl-C
+    // 6.2 config.update：校验完整策略后替换；坏 payload 返回 Err → 不 ack，下轮重投。
+    {
+        let runtime_policy = Arc::clone(&runtime_policy);
+        dispatcher.subscribe("config.update", move |message: DownlinkMessage| {
+            let runtime_policy = Arc::clone(&runtime_policy);
+            async move {
+                match policy::handle_config_update(&message.payload, &runtime_policy) {
+                    Ok(_change) => Ok(()),
+                    Err(error) => {
+                        error!(
+                            id = message.id,
+                            error = %format!("{error:#}"),
+                            "config.update 处理失败，不 ack（下轮重投）"
+                        );
+                        Err(qe_device_pki_client::Error::Unexpected(format!(
+                            "config.update 处理失败: {error:#}"
+                        )))
+                    }
+                }
+            }
+        });
+    }
+
+    // 7. 下行轮询循环 + Ctrl-C：每次轮询后按当前策略的 poll_interval_secs 休眠。
     let downlink_config = transport_config(&credentials, &config);
     let state_file = downlink::state_path(&config.slot, Some(&config.data_dir))
         .context("定位下行游标文件失败")?;
-    let mut ticker = tokio::time::interval(POLL_INTERVAL);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // interval 的第一次 tick 立即就绪：启动后马上拉一次，之后按 2s 周期。
+    // 第一次立即轮询，之后睡眠间隔取「处理完之后」的最新策略。
+    let mut next_delay = Duration::ZERO;
 
     loop {
         tokio::select! {
@@ -171,7 +254,7 @@ async fn run() -> Result<()> {
                 info!("收到 Ctrl-C，停止轮询并退出");
                 break;
             }
-            _ = ticker.tick() => {
+            _ = tokio::time::sleep(next_delay) => {
                 match downlink::poll_once(
                     &downlink_config,
                     &dispatcher,
@@ -184,9 +267,12 @@ async fn run() -> Result<()> {
                     Ok(count) => info!(count, "处理下行消息"),
                     Err(error) => warn!(
                         error = %error,
-                        "轮询下行失败，{:?} 后重试", POLL_INTERVAL
+                        "轮询下行失败，下轮按当前策略间隔重试"
                     ),
                 }
+                // 本批可能刚应用了 config.update，睡眠取处理之后的最新策略，
+                // 保证 poll_interval_secs 从下一轮立即生效。
+                next_delay = runtime_policy.poll_interval();
             }
         }
     }

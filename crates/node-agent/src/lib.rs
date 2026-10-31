@@ -1,8 +1,9 @@
 //! 房间节点 agent：经 device-pki mTLS 拉取、校验并导入镜像/资源。
 //!
-//! 实现契约见 `docs/storage-design.md` §16.4 / §16.5：
+//! 实现契约见 `docs/storage-design.md` §16.4 / §16.5 / §17.5：
 //!
-//! - [`config::AgentConfig`]：环境变量配置
+//! - [`config::AgentConfig`]：环境变量 + 本地配置文件（`AGENT_CONFIG_FILE`）
+//! - [`policy::RuntimePolicy`]：启动拉取 + `config.update` 的运行时策略
 //! - [`manifest::Manifest`]：与 §14.2 对齐的清单 + sha256 digest + Ed25519 验签
 //! - [`presign::PresignClient`]：mTLS 预签名（`POST /resources/presign`）
 //! - [`cache::ObjectCache`]：内容寻址缓存 + LRU
@@ -24,6 +25,7 @@ pub mod config;
 pub mod importer;
 pub mod job;
 pub mod manifest;
+pub mod policy;
 pub mod presign;
 pub mod pull;
 pub mod report;
@@ -33,6 +35,7 @@ pub use config::AgentConfig;
 pub use importer::{ImportRequest, ImportResult, ImporterSet, TopologyImporter};
 pub use job::{ImagePullJob, ImagePullPayload, JobOutcome};
 pub use manifest::{Manifest, ManifestChunk, ManifestRuntime};
+pub use policy::{MtlsAgentConfigClient, RuntimePolicy};
 pub use presign::{
     MtlsPresignClient, PresignClient, PresignKind, PresignReply, PresignRequest, UrlItem,
 };

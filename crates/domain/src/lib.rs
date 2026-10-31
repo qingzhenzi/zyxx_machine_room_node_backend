@@ -4,6 +4,7 @@
 //! HTTP 状态码与错误响应在 `backend`。权限匹配算法来自 `qe-auth`，本 crate 只保留
 //! 业务侧权限点常量。
 
+pub mod agent_config;
 pub mod device;
 pub mod error;
 pub mod models;
