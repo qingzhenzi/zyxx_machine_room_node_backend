@@ -106,6 +106,7 @@ struct AreaRow {
     name: String,
     description: String,
     timezone: String,
+    webhook_url: Option<String>,
     parent_id: Option<Uuid>,
     is_active: bool,
     metadata: Value,
@@ -121,6 +122,7 @@ impl From<AreaRow> for Area {
             name: row.name,
             description: row.description,
             timezone: row.timezone,
+            webhook_url: row.webhook_url,
             parent_id: row.parent_id,
             is_active: row.is_active,
             metadata: row.metadata,
@@ -499,8 +501,8 @@ impl From<DeliveryJobRow> for DeliveryJob {
 // 通用 SQL 片段
 // ---------------------------------------------------------------------------
 
-const AREA_COLUMNS: &str = "a.id, a.code, a.name, a.description, a.timezone, a.parent_id,
-     a.is_active, a.metadata, a.created_at, a.updated_at";
+const AREA_COLUMNS: &str = "a.id, a.code, a.name, a.description, a.timezone, a.webhook_url,
+     a.parent_id, a.is_active, a.metadata, a.created_at, a.updated_at";
 
 const ROOM_COLUMNS: &str = "r.id, r.area_id, a.name AS area_name, r.code, r.name, r.capacity,
      r.device_slot, r.webhook_url, a.timezone AS timezone, r.is_active, r.metadata,
@@ -724,8 +726,9 @@ impl AreaRepo {
     pub async fn create(&self, input: &NewArea) -> DbResult<Area> {
         let sql = format!(
             "WITH inserted AS (
-                INSERT INTO areas (code, name, description, timezone, parent_id, is_active, metadata)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO areas
+                    (code, name, description, timezone, webhook_url, parent_id, is_active, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING *
              )
              SELECT {AREA_COLUMNS}
@@ -736,6 +739,7 @@ impl AreaRepo {
             .bind(&input.name)
             .bind(&input.description)
             .bind(&input.timezone)
+            .bind(&input.webhook_url)
             .bind(input.parent_id)
             .bind(input.is_active)
             .bind(&input.metadata)
@@ -749,6 +753,10 @@ impl AreaRepo {
             Some(value) => (true, value),
             None => (false, None),
         };
+        let (webhook_changed, webhook_url) = match &input.webhook_url {
+            Some(value) => (true, value.clone()),
+            None => (false, None),
+        };
 
         let sql = format!(
             "WITH updated AS (
@@ -759,7 +767,8 @@ impl AreaRepo {
                     timezone = COALESCE($5, timezone),
                     parent_id = CASE WHEN $6 THEN $7 ELSE parent_id END,
                     is_active = COALESCE($8, is_active),
-                    metadata = COALESCE($9, metadata)
+                    metadata = COALESCE($9, metadata),
+                    webhook_url = CASE WHEN $10 THEN $11 ELSE webhook_url END
                 WHERE id = $1
                 RETURNING *
              )
@@ -776,6 +785,8 @@ impl AreaRepo {
             .bind(parent_id)
             .bind(input.is_active)
             .bind(&input.metadata)
+            .bind(webhook_changed)
+            .bind(webhook_url)
             .fetch_optional(&self.db)
             .await?;
         Ok(row.map(Area::from))

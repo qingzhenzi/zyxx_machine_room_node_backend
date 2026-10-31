@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -47,6 +47,9 @@ pub struct CreateAreaRequest {
     /// IANA 时区名；缺省 `Asia/Shanghai`。
     #[serde(default)]
     pub timezone: Option<String>,
+    /// 区域级设备在线事件 webhook；空字符串归一为 `None`。
+    #[serde(default)]
+    pub webhook_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,6 +71,22 @@ pub struct UpdateAreaRequest {
     /// 缺失 = 不修改；变更成功后自动重建该区域未来的排课实例。
     #[serde(default)]
     pub timezone: Option<String>,
+    /// 缺失 = 不修改；`null` = 清空。
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    pub webhook_url: Option<Option<String>>,
+}
+
+/// 区分「字段缺失」与显式 `null`。
+///
+/// 直接用 `Option<Option<T>>` 时 serde 会把 `null` 反序列化成外层的 `None`，
+/// 与字段缺失无法区分；这里在字段存在时强制返回 `Some(...)`，让
+/// `Some(None)` 表示「显式清空」。
+fn deserialize_nullable<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// 区域/房间名称没有独立的领域校验函数，这里做与其它名称字段一致的长度约束。
@@ -143,6 +162,12 @@ pub async fn create(
         is_active: request.is_active.unwrap_or(true),
         metadata: normalize_metadata(request.metadata)?,
         timezone,
+        webhook_url: request
+            .webhook_url
+            .as_deref()
+            .map(validation::normalize_webhook_url)
+            .transpose()?
+            .flatten(),
     };
     let area = state.areas.create(&input).await?;
 
@@ -157,6 +182,7 @@ pub async fn create(
             "name": area.name,
             "parent_id": area.parent_id,
             "timezone": area.timezone,
+            "webhook_url": area.webhook_url,
         }),
         ip.as_deref(),
     )
@@ -181,6 +207,7 @@ pub async fn update(
         && request.is_active.is_none()
         && request.metadata.is_none()
         && request.timezone.is_none()
+        && request.webhook_url.is_none()
     {
         return Err(AppError::bad_request("没有需要更新的字段"));
     }
@@ -216,6 +243,11 @@ pub async fn update(
             .as_deref()
             .map(validation::validate_timezone)
             .transpose()?,
+        webhook_url: match request.webhook_url {
+            Some(Some(raw)) => Some(validation::normalize_webhook_url(&raw)?),
+            Some(None) => Some(None),
+            None => None,
+        },
     };
     let area = state
         .areas
@@ -235,6 +267,7 @@ pub async fn update(
             "is_active": area.is_active,
             "parent_id": area.parent_id,
             "timezone": area.timezone,
+            "webhook_url": area.webhook_url,
         }),
         ip.as_deref(),
     )

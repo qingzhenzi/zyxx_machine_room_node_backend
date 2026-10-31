@@ -52,6 +52,7 @@ pub async fn json_spec() -> Json<Value> {
             { "name": "Schedules", "description": "课表：周模板、单日覆盖与排课实例" },
             { "name": "ScheduleEvents", "description": "触发规则、事件与投递重放/重试" },
             { "name": "Devices", "description": "设备：注册状态、在线状态与区域/房间绑定（v3）" },
+            { "name": "DeviceEvents", "description": "设备在线事件：历史查询、SSE 实时流与可靠投递记录（P3）" },
             { "name": "Storage", "description": "对象存储：预签名上传、对象登记、分发/收集任务（P0，S3 兼容）" },
             { "name": "Images", "description": "镜像：manifest、验证、发布与房间分配（P0，不做 Registry 协议）" },
             { "name": "AgentConfigs", "description": "节点配置：按 global → area → room 合并的生效策略与二次下发（P2）" },
@@ -277,6 +278,7 @@ pub async fn json_spec() -> Json<Value> {
                         "is_active": { "type": "boolean" },
                         "metadata": { "type": "object" },
                         "timezone": { "type": "string", "example": "Asia/Shanghai", "description": "IANA 时区；房间/课表继承该时区，所有时间点以 UTC 存储、按此时区展示本地时间。" },
+                        "webhook_url": { "type": ["string", "null"], "format": "uri", "description": "区域级设备在线事件 webhook；房间未配置时使用，再回退到全局配置。" },
                         "created_at": { "type": "string", "format": "date-time" },
                         "updated_at": { "type": "string", "format": "date-time" }
                     }
@@ -300,7 +302,8 @@ pub async fn json_spec() -> Json<Value> {
                         "parent_id": { "type": ["string", "null"], "format": "uuid" },
                         "is_active": { "type": "boolean" },
                         "metadata": { "type": "object" },
-                        "timezone": { "type": "string", "example": "Asia/Shanghai", "description": "IANA 时区名，缺省 Asia/Shanghai。" }
+                        "timezone": { "type": "string", "example": "Asia/Shanghai", "description": "IANA 时区名，缺省 Asia/Shanghai。" },
+                        "webhook_url": { "type": ["string", "null"], "format": "uri", "description": "区域级设备在线事件 webhook；空字符串表示不配置。" }
                     }
                 },
                 "UpdateAreaRequest": {
@@ -312,7 +315,8 @@ pub async fn json_spec() -> Json<Value> {
                         "parent_id": { "type": ["string", "null"], "format": "uuid", "description": "缺失 = 不修改；null = 清空。" },
                         "is_active": { "type": "boolean" },
                         "metadata": { "type": ["object", "null"] },
-                        "timezone": { "type": "string", "description": "修改后按新时区自动重建该区域下所有课表的未来排课实例。" }
+                        "timezone": { "type": "string", "description": "修改后按新时区自动重建该区域下所有课表的未来排课实例。" },
+                        "webhook_url": { "type": ["string", "null"], "description": "缺失 = 不修改；null = 清空。" }
                     }
                 },
                 "Room": {
@@ -1054,6 +1058,51 @@ pub async fn json_spec() -> Json<Value> {
                         "room_id": { "type": "string", "format": "uuid" },
                         "policy": { "$ref": "#/components/schemas/AgentPolicy" },
                         "revision": { "type": "integer", "description": "已应用行中的最大 revision；无配置为 0。" }
+                    }
+                },
+                "PresenceEvent": {
+                    "type": "object",
+                    "required": ["id", "serial", "device_slot", "previous_state", "current_state", "occurred_at", "payload"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "serial": { "type": "string" },
+                        "device_slot": { "type": "string" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid", "description": "null = 事件发生时设备未绑定房间。" },
+                        "area_id": { "type": ["string", "null"], "format": "uuid" },
+                        "previous_state": { "type": "string", "enum": ["online", "offline"] },
+                        "current_state": { "type": "string", "enum": ["online", "offline"] },
+                        "occurred_at": { "type": "string", "format": "date-time" },
+                        "payload": { "type": "object", "description": "worker 组装的投递/SSE 载荷（含房间/区域快照）。" }
+                    }
+                },
+                "PresenceEventList": {
+                    "type": "object",
+                    "required": ["items", "total"],
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/PresenceEvent" } },
+                        "total": { "type": "integer", "description": "本次返回条数（不是全表总数）。" }
+                    }
+                },
+                "PresenceDelivery": {
+                    "type": "object",
+                    "required": ["id", "event_id", "target_url", "status", "attempts", "next_attempt_at", "last_attempt_at", "last_error"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "event_id": { "type": "integer", "format": "int64" },
+                        "target_url": { "type": "string", "format": "uri" },
+                        "status": { "type": "string", "enum": ["pending", "delivered", "failed"] },
+                        "attempts": { "type": "integer" },
+                        "next_attempt_at": { "type": "string", "format": "date-time" },
+                        "last_attempt_at": { "type": ["string", "null"], "format": "date-time" },
+                        "last_error": { "type": ["string", "null"] }
+                    }
+                },
+                "PresenceDeliveryList": {
+                    "type": "object",
+                    "required": ["items", "total"],
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/PresenceDelivery" } },
+                        "total": { "type": "integer", "description": "本次返回条数。" }
                     }
                 }
             }
@@ -2050,6 +2099,54 @@ pub async fn json_spec() -> Json<Value> {
                         "404": error_response("房间不存在")
                     }
                 }
+            },
+            "/admin/device-events": {
+                "get": {
+                    "tags": ["DeviceEvents"],
+                    "summary": "设备在线事件（id 倒序；limit 1–200，默认 50）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } },
+                        { "name": "after_id", "in": "query", "schema": { "type": "integer", "format": "int64", "minimum": 0 }, "description": "只返回 id > after_id 的事件。" }
+                    ],
+                    "responses": {
+                        "200": { "description": "事件列表", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PresenceEventList" } } } },
+                        "400": error_response("limit / after_id 不合法"),
+                        "403": error_response("缺少 device:read")
+                    }
+                }
+            },
+            "/admin/device-events/stream": {
+                "get": {
+                    "tags": ["DeviceEvents"],
+                    "summary": "设备在线事件 SSE 流（先补发历史，之后每 2s 增量 + 15s 心跳）",
+                    "description": "事件类型 `device.presence`，data 为 PresenceEvent JSON；心跳事件类型 `heartbeat`。跨副本以查库为准。",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "after_id", "in": "query", "schema": { "type": "integer", "format": "int64", "minimum": 0 }, "description": "从该事件 id 之后开始补发；缺省返回最近 200 条。" }
+                    ],
+                    "responses": {
+                        "200": { "description": "SSE 流", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
+                        "400": error_response("after_id 不合法"),
+                        "403": error_response("缺少 device:read")
+                    }
+                }
+            },
+            "/admin/device-presence-deliveries": {
+                "get": {
+                    "tags": ["DeviceEvents"],
+                    "summary": "设备在线事件投递记录（id 倒序，排障用）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["pending", "delivered", "failed"] } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "投递列表", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PresenceDeliveryList" } } } },
+                        "400": error_response("status / limit 不合法"),
+                        "403": error_response("缺少 device:read")
+                    }
+                }
             }
         }
     }))
@@ -2093,6 +2190,9 @@ mod tests {
         assert!(paths.contains_key("/admin/collections"));
         assert!(paths.contains_key("/admin/agent-configs"));
         assert!(paths.contains_key("/admin/agent-configs/effective"));
+        assert!(paths.contains_key("/admin/device-events"));
+        assert!(paths.contains_key("/admin/device-events/stream"));
+        assert!(paths.contains_key("/admin/device-presence-deliveries"));
         assert!(
             spec["tags"]
                 .as_array()
@@ -2127,6 +2227,13 @@ mod tests {
                 .expect("tags")
                 .iter()
                 .any(|tag| tag["name"] == "AgentConfigs")
+        );
+        assert!(
+            spec["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .any(|tag| tag["name"] == "DeviceEvents")
         );
         assert_eq!(
             spec["components"]["securitySchemes"]["bearerAuth"]["scheme"],

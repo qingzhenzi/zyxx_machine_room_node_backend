@@ -72,6 +72,10 @@ fn test_config() -> Config {
         device_presence_tick_secs: 5,
         device_presence_webhook_timeout_secs: 5,
         device_presence_notify_online: false,
+        device_presence_global_webhook_url: None,
+        device_presence_webhook_max_attempts: 5,
+        device_presence_webhook_batch: 20,
+        device_presence_retry_base_seconds: 5,
         public_enroll_endpoint: "https://enroll.test:4440".to_owned(),
         storage: None,
     }

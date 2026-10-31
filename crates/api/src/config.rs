@@ -73,6 +73,14 @@ pub struct Config {
     pub device_presence_webhook_timeout_secs: u64,
     /// 是否同时通知 `device.online`（默认只通知 offline）。
     pub device_presence_notify_online: bool,
+    /// 房间/区域都未配置 webhook 时的全局回退地址。
+    pub device_presence_global_webhook_url: Option<String>,
+    /// 单条投递最大尝试次数。
+    pub device_presence_webhook_max_attempts: u32,
+    /// 每轮领取投递上限。
+    pub device_presence_webhook_batch: i64,
+    /// 重试退避基数（秒）。
+    pub device_presence_retry_base_seconds: u64,
     // ---- 对象存储（S3 兼容）----
     /// 未配置 `S3_ENDPOINT` + `S3_BUCKET` 时为 None，存储/镜像接口返回 503。
     pub storage: Option<StorageConfig>,
@@ -198,6 +206,21 @@ impl Config {
             bail!("DEVICE_PRESENCE_WEBHOOK_TIMEOUT_SECONDS 需在 1-60 秒之间");
         }
         let device_presence_notify_online = env_parse_bool("DEVICE_PRESENCE_NOTIFY_ONLINE", false)?;
+        let device_presence_global_webhook_url = env_optional("DEVICE_PRESENCE_GLOBAL_WEBHOOK_URL");
+        let device_presence_webhook_max_attempts =
+            env_parse("DEVICE_PRESENCE_WEBHOOK_MAX_ATTEMPTS", 5_u32)?;
+        if !(1..=20).contains(&device_presence_webhook_max_attempts) {
+            bail!("DEVICE_PRESENCE_WEBHOOK_MAX_ATTEMPTS 需在 1-20 之间");
+        }
+        let device_presence_webhook_batch = env_parse("DEVICE_PRESENCE_WEBHOOK_BATCH", 20_i64)?;
+        if !(1..=200).contains(&device_presence_webhook_batch) {
+            bail!("DEVICE_PRESENCE_WEBHOOK_BATCH 需在 1-200 之间");
+        }
+        let device_presence_retry_base_seconds =
+            env_parse("DEVICE_PRESENCE_RETRY_BASE_SECONDS", 5_u64)?;
+        if !(1..=60).contains(&device_presence_retry_base_seconds) {
+            bail!("DEVICE_PRESENCE_RETRY_BASE_SECONDS 需在 1-60 之间");
+        }
         let schedule_delivery_batch = env_parse("SCHEDULE_DELIVERY_BATCH", 50_i64)?;
         if !(1..=500).contains(&schedule_delivery_batch) {
             bail!("SCHEDULE_DELIVERY_BATCH 需在 1-500 之间");
@@ -261,6 +284,10 @@ impl Config {
             device_presence_tick_secs,
             device_presence_webhook_timeout_secs,
             device_presence_notify_online,
+            device_presence_global_webhook_url,
+            device_presence_webhook_max_attempts,
+            device_presence_webhook_batch,
+            device_presence_retry_base_seconds,
             public_enroll_endpoint: env_optional("PUBLIC_ENROLL_ENDPOINT")
                 .unwrap_or_else(|| "https://localhost:4440".to_owned())
                 .trim_end_matches('/')

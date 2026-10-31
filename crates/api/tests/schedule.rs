@@ -87,6 +87,10 @@ fn test_config() -> Config {
         device_presence_tick_secs: 5,
         device_presence_webhook_timeout_secs: 5,
         device_presence_notify_online: false,
+        device_presence_global_webhook_url: None,
+        device_presence_webhook_max_attempts: 5,
+        device_presence_webhook_batch: 20,
+        device_presence_retry_base_seconds: 5,
         public_enroll_endpoint: "https://localhost:4440".to_owned(),
         storage: None,
     }
@@ -147,6 +151,7 @@ async fn weekly_template_exceptions_and_occurrences() {
             is_active: true,
             metadata: json!({}),
             timezone: "Asia/Shanghai".to_owned(),
+            webhook_url: None,
         })
         .await
         .expect("create area");
@@ -333,6 +338,7 @@ async fn engine_triggers_events_and_webhook_delivery() {
             is_active: true,
             metadata: json!({}),
             timezone: "Asia/Shanghai".to_owned(),
+            webhook_url: None,
         })
         .await
         .expect("create area");

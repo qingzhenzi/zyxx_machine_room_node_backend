@@ -49,6 +49,7 @@ cargo test -p qe-api --test storage -- --ignored --nocapture
 
 echo "Running agent config (node policy) integration tests against $TEST_DATABASE_URL"
 cargo test -p qe-api --test agent_config -- --ignored --nocapture
+cargo test -p qe-api --test device_presence -- --ignored --nocapture
 
 echo "Running device-PKI enrollment flow tests against $TEST_DATABASE_URL"
 cargo test -p qe-device-pki --test enroll_flow -- --ignored --nocapture

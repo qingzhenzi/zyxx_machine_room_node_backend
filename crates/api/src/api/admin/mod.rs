@@ -2,6 +2,7 @@ pub mod agent_configs;
 pub mod announcements;
 pub mod areas;
 pub mod audit;
+pub mod device_events;
 pub mod devices;
 pub mod images;
 pub mod roles;
@@ -117,6 +118,13 @@ pub fn router() -> Router<AppState> {
             get(agent_configs::list).put(agent_configs::update),
         )
         .route("/agent-configs/effective", get(agent_configs::effective))
+        // ---- 设备在线事件与可靠投递（P3）----
+        .route("/device-events", get(device_events::list))
+        .route("/device-events/stream", get(device_events::stream))
+        .route(
+            "/device-presence-deliveries",
+            get(device_events::list_deliveries),
+        )
 }
 
 #[cfg(test)]

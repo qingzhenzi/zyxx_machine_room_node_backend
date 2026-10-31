@@ -62,7 +62,10 @@ pub async fn run() -> anyhow::Result<()> {
         tracing::info!(
             tick_secs = config.device_presence_tick_secs,
             notify_online = config.device_presence_notify_online,
-            "设备在线状态 webhook 通知已启动"
+            batch = config.device_presence_webhook_batch,
+            max_attempts = config.device_presence_webhook_max_attempts,
+            global_webhook_configured = config.device_presence_global_webhook_url.is_some(),
+            "设备在线事件 worker 已启动"
         );
     }
 

@@ -12,6 +12,7 @@ use crate::{
         announcements::AnnouncementRepo,
         audit::AuditLogRepo,
         device::DeviceRepo,
+        presence::{PresenceEventRecord, PresenceRepo},
         roles::RoleRepo,
         schedule::{AreaRepo, EventRuleRepo, RoomRepo, ScheduleEventRepo, ScheduleRepo},
         security::SecurityRepo,
@@ -19,6 +20,9 @@ use crate::{
         users::UserRepo,
     },
 };
+
+/// 本地事件广播缓冲：慢消费者落后超过该数量会收到 `Lagged`，SSE 侧应回查数据库。
+const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// 所有 handler 共享的应用状态。各 Repo 内部持有连接池克隆，成本很低。
 #[derive(Clone)]
@@ -38,6 +42,10 @@ pub struct AppState {
     pub schedule_events: ScheduleEventRepo,
     // ---- 设备 ----
     pub devices: DeviceRepo,
+    // ---- 设备在线事件与可靠投递（P3）----
+    pub presence: PresenceRepo,
+    /// 事件落库后的本地广播（SSE 实时推送；跨副本仍以查库为准）。
+    pub presence_events: tokio::sync::broadcast::Sender<PresenceEventRecord>,
     // ---- 节点配置（P2：global → area → room）----
     pub agent_configs: AgentConfigRepo,
     // ---- 资源与镜像（S3 兼容对象存储）----
@@ -59,6 +67,7 @@ impl AppState {
         let instance_id =
             std::env::var("HOSTNAME").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
         let storage = build_storage(config.storage.as_ref());
+        let (presence_events, _) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             users: UserRepo::new(db.pool().clone()),
             roles: RoleRepo::new(db.pool().clone()),
@@ -71,6 +80,8 @@ impl AppState {
             event_rules: EventRuleRepo::new(db.pool().clone()),
             schedule_events: ScheduleEventRepo::new(db.pool().clone()),
             devices: DeviceRepo::new(db.pool().clone()),
+            presence: PresenceRepo::new(db.pool().clone()),
+            presence_events,
             agent_configs: AgentConfigRepo::new(db.pool().clone()),
             storage,
             storage_repo: StorageRepo::new(db.pool().clone()),

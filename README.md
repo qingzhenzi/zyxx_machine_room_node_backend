@@ -343,9 +343,9 @@ schedule_events（事件，event_key 唯一保证幂等）──< schedule_event
 | 方法 | 路径 | 所需权限 | 说明 |
 | --- | --- | --- | --- |
 | GET | `/areas?page=&page_size=&keyword=&include_inactive=` | `area:read` | 区域分页 |
-| POST | `/areas` | `area:manage` | 创建区域（可选 `timezone`，缺省 `Asia/Shanghai`） |
+| POST | `/areas` | `area:manage` | 创建区域（可选 `timezone`，缺省 `Asia/Shanghai`；可选 `webhook_url`） |
 | GET | `/areas/{id}` | `area:read` | 区域详情 |
-| PATCH | `/areas/{id}` | `area:manage` | 局部更新；`parent_id` / `metadata` 可传 `null`；`timezone` 变更后重建区域实例 |
+| PATCH | `/areas/{id}` | `area:manage` | 局部更新；`parent_id` / `metadata` / `webhook_url` 可传 `null` 清空；`timezone` 变更后重建区域实例 |
 | DELETE | `/areas/{id}` | `area:manage` | 删除区域；仍有房间时 409 |
 | GET | `/rooms?area_id=&page=&page_size=&keyword=&include_inactive=` | `room:read` | 房间分页 |
 | POST | `/rooms` | `room:manage` | 创建房间 |
@@ -745,11 +745,18 @@ P2 待做：zstd/gzip 压缩与解压校验、chunk 复用/增量、S3 Event 兜
 agent 收到后应用策略：`lxc_auto_start` / `poll_interval_secs` 立即生效，
 `download_concurrency` / `cache_max_bytes` 需重启（只 warn）。
 
-## 设备离线通知（Webhook）
+## 设备在线事件（P3：持久化 / 可靠投递 / SSE）
 
 device-pki 心跳判定 `offline` 后写入 `device_session`；qe-api 后台按
 `DEVICE_PRESENCE_TICK_SECONDS`（默认 5s）扫描该表，检测 `online -> offline`
-（可选 `offline -> online`），向房间配置的 `webhook_url` POST：
+（可选 `offline -> online`）。翻转事件先落 `device_presence_events`，再按
+**房间 → 区域 → 全局** 解析 webhook 目标：
+
+1. `rooms.webhook_url`（`PATCH /api/v1/admin/rooms/{id}` 配置）；
+2. `areas.webhook_url`（`PATCH /api/v1/admin/areas/{id}` 配置）；
+3. `DEVICE_PRESENCE_GLOBAL_WEBHOOK_URL`（全局回退）。
+
+三者都未配置时事件只落库、不建投递。投递载荷（`payload`）示例：
 
 ```json
 {
@@ -766,11 +773,40 @@ device-pki 心跳判定 `offline` 后写入 `device_session`；qe-api 后台按
 ```
 
 - Headers：`X-QE-Event: device.offline`、`X-QE-Event-Id`、`X-QE-Delivery-Id`；
-- 房间 `webhook_url` 通过 `PATCH /api/v1/admin/rooms/{id}` 配置，未配置的房间只记录日志；
 - 默认只通知 `offline`；`DEVICE_PRESENCE_NOTIFY_ONLINE=true` 时也通知重新上线；
 - 离线判定本身约 **15–20s** 延迟（5s tick × 连续 3 次 miss），webhook 在这之后发出；
-- 当前为**单实例**实现：投递失败只记日志、不阻塞状态；多副本部署会重复投递，
-  需要去重时后续可加 Redis 锁（当前不做持久化重试队列）。
+- **幂等**：事件唯一键 `(serial, current_state, source_updated_at)`，投递唯一键
+  `(event_id, target_url)`；多副本扫描同一翻转只落一行/一条投递；
+- **可靠投递**：worker 用 `FOR UPDATE SKIP LOCKED` 领取到期投递（60s 租约），
+  2xx 置 `delivered`；失败 `attempts+1`，达到
+  `DEVICE_PRESENCE_WEBHOOK_MAX_ATTEMPTS`（默认 5）置 `failed`，
+  否则按 `min(300s, DEVICE_PRESENCE_RETRY_BASE_SECONDS * 2^(attempts-1))` 退避重试；
+- 多副本安全：领取投递是原子 SQL，不依赖单实例内存队列；SSE 以查库补发为准。
+
+### 管理端查询与实时推送
+
+需要 `device:read`：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/v1/admin/device-events?limit=&after_id=` | 最近事件（id 倒序；`limit` 1–200，默认 50） |
+| GET | `/api/v1/admin/device-events/stream?after_id=` | SSE：先补发 `after_id` 之后最多 200 条，再每 2s 查增量，15s 心跳 |
+| GET | `/api/v1/admin/device-presence-deliveries?status=&limit=` | 投递记录（id 倒序；status=`pending`/`delivered`/`failed`，limit 1–200，默认 100） |
+
+事件列表与投递列表返回 `{ "items": [...], "total": items.length }`。SSE 帧示例：
+
+```text
+id: 42
+event: device.presence
+data: {"id":42,"serial":"3f2a9c…","device_slot":"node-101","room_id":"…","area_id":"…","previous_state":"online","current_state":"offline","occurred_at":"2026-11-02T08:00:00Z","payload":{…}}
+
+event: heartbeat
+data: {}
+```
+
+浏览器原生 `EventSource` 不能自定义 `Authorization` 头，前端应使用
+`fetch(..., { headers: { Authorization: "Bearer …" }, signal })` + `ReadableStream`
+读取；断线后带最后一条事件的 `id` 作为 `after_id` 重连即可补齐。
 
 ## 请求追踪与日志
 
@@ -913,6 +949,10 @@ Grafana Explore 里可以直接查：
 | `DEVICE_PRESENCE_TICK_SECONDS` | `5` | 状态扫描间隔（2–60 秒） |
 | `DEVICE_PRESENCE_WEBHOOK_TIMEOUT_SECONDS` | `5` | webhook 请求超时（1–60 秒） |
 | `DEVICE_PRESENCE_NOTIFY_ONLINE` | `false` | true 时同时投递 `device.online`，默认只投递离线 |
+| `DEVICE_PRESENCE_GLOBAL_WEBHOOK_URL` | 空 | 房间/区域都未配置时的全局回退地址 |
+| `DEVICE_PRESENCE_WEBHOOK_MAX_ATTEMPTS` | `5` | 单条投递最大尝试次数（1–20） |
+| `DEVICE_PRESENCE_WEBHOOK_BATCH` | `20` | 每轮领取到期投递上限（1–200） |
+| `DEVICE_PRESENCE_RETRY_BASE_SECONDS` | `5` | 失败重试指数退避基数（1–60 秒） |
 | `RUST_LOG` | `info,sqlx=warn` | 日志过滤 |
 | `LOG_FORMAT` | `pretty` | 本地日志格式；compose 容器内固定为 `json` |
 

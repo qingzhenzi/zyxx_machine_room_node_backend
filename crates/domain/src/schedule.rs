@@ -32,6 +32,8 @@ pub struct Area {
     pub name: String,
     pub description: String,
     pub timezone: String,
+    /// 区域级设备在线事件 webhook；房间未配置时使用（再回退到全局配置）。
+    pub webhook_url: Option<String>,
     pub parent_id: Option<Uuid>,
     pub is_active: bool,
     pub metadata: serde_json::Value,
@@ -45,6 +47,7 @@ pub struct NewArea {
     pub name: String,
     pub description: String,
     pub timezone: String,
+    pub webhook_url: Option<String>,
     pub parent_id: Option<Uuid>,
     pub is_active: bool,
     pub metadata: serde_json::Value,
@@ -56,7 +59,8 @@ pub struct UpdateArea {
     pub name: Option<String>,
     pub description: Option<String>,
     pub timezone: Option<String>,
-    pub parent_id: Option<Option<Uuid>>, // Some(None) = 清空
+    pub webhook_url: Option<Option<String>>, // Some(None) = 清空
+    pub parent_id: Option<Option<Uuid>>,     // Some(None) = 清空
     pub is_active: Option<bool>,
     pub metadata: Option<serde_json::Value>,
 }

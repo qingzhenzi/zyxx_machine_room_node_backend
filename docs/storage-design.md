@@ -1,6 +1,6 @@
 # 资源与镜像管理（Storage / Image）设计草案 v0.1
 
-> 状态：**P0（后端）、P1（device-pki 扩展 + 房间节点 agent）、P2（节点配置管理）已实现**；RustFS/mTLS/Incus/libvirt/配置拉取与二次下发已在本地真实环境验证，跨机部署待现场联调。目标是为房间节点提供「资源分发 / 收集」与「镜像（Docker/OCI、LXC rootfs、VM 磁盘）管理」的独立模块。
+> 状态：**P0（后端）、P1（device-pki 扩展 + 房间节点 agent）、P2（节点配置管理）、P3（设备在线事件持久化/可靠投递/SSE）已实现**；RustFS/mTLS/Incus/libvirt/配置拉取与二次下发/离线通知已在本地真实环境验证，跨机部署待现场联调。目标是为房间节点提供「资源分发 / 收集」与「镜像（Docker/OCI、LXC rootfs、VM 磁盘）管理」的独立模块。
 > 数据面用 S3（RustFS / MinIO / Ceph 等 S3 兼容实现），控制面放在 `qe-api`；**P0 不实现 Registry 协议**。
 
 ## 1. 目标与非目标
@@ -921,3 +921,119 @@ impl AgentConfigRepo {
 - 集成测试：qe-api 配置 CRUD/权限/404；device-pki `/agent/config` 合并与鉴权；下发后 `device_downlink.kind='config.update'`。
 - 本地 E2E：agent 启动前管理端设置 room 策略 `lxc_auto_start=true` → agent 启动拉取生效（日志 revision）；
   运行中修改策略 → agent 收到 `config.update` 并应用（日志）；随后 image.pull 按新策略启动。
+
+---
+
+## 18. P3：设备在线事件持久化、可靠投递与实时推送
+
+目标：解决 §17 之后离线通知的四个遗留问题：
+1. 多副本重复投递 → 事件/投递落库，唯一约束 + `FOR UPDATE SKIP LOCKED` 领取；
+2. 投递失败无重试 → `device_presence_deliveries` 持久化 + 指数退避重试；
+3. 仅房间级 webhook → 支持 **房间 → 区域 → 全局** 回退链（区域新增 `webhook_url`，
+   全局用 `DEVICE_PRESENCE_GLOBAL_WEBHOOK_URL`）；
+4. 管理端只能轮询 → 新增 SSE 实时流与事件/投递查询接口。
+
+### 18.1 迁移 `migrations/0013_device_presence.sql`
+
+```sql
+ALTER TABLE areas ADD COLUMN webhook_url TEXT;
+
+CREATE TABLE device_presence_events (
+    id BIGSERIAL PRIMARY KEY,
+    serial TEXT NOT NULL,
+    device_slot TEXT NOT NULL,
+    room_id UUID,
+    area_id UUID,
+    previous_state TEXT NOT NULL,
+    current_state TEXT NOT NULL CHECK (current_state IN ('online','offline')),
+    source_updated_at TIMESTAMPTZ NOT NULL,   -- 触发翻转的 device_session.updated_at
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    UNIQUE (serial, current_state, source_updated_at)   -- 多副本幂等
+);
+CREATE INDEX device_presence_events_id_desc ON device_presence_events (id DESC);
+
+CREATE TABLE device_presence_deliveries (
+    id BIGSERIAL PRIMARY KEY,
+    event_id BIGINT NOT NULL REFERENCES device_presence_events(id) ON DELETE CASCADE,
+    target_url TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','delivered','failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_attempt_at TIMESTAMPTZ,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (event_id, target_url)                       -- 多副本不重复建投递
+);
+CREATE INDEX device_presence_deliveries_due
+    ON device_presence_deliveries (next_attempt_at)
+    WHERE status = 'pending';
+```
+
+### 18.2 `crates/db/src/presence.rs`（`PresenceRepo`）
+
+```rust
+pub struct PresenceEventRecord { id, serial, device_slot, room_id: Option<Uuid>, area_id: Option<Uuid>,
+    previous_state, current_state, occurred_at, payload: serde_json::Value }
+pub struct PresenceDeliveryRecord { id, event_id, target_url, status, attempts,
+    next_attempt_at, last_attempt_at, last_error }
+pub struct DueDelivery { id, event_id, target_url, attempts }
+
+impl PresenceRepo {
+    /// 幂等插入；重复返回 None。
+    async fn insert_event(&self, event: &NewPresenceEvent) -> DbResult<Option<i64>>;
+    async fn add_delivery(&self, event_id: i64, url: &str) -> DbResult<bool>;
+    /// 领取到期投递：`UPDATE ... SET next_attempt_at = now() + lease WHERE id IN
+    /// (SELECT id ... FOR UPDATE SKIP LOCKED)`，lease 60s，避免多副本重复领取。
+    async fn claim_due(&self, limit: i64) -> DbResult<Vec<DueDelivery>>;
+    async fn mark_delivered(&self, id: i64) -> DbResult<()>;
+    async fn mark_retry(&self, id: i64, attempts: i32, next_at: DateTime<Utc>, err: &str) -> DbResult<()>;
+    async fn mark_failed(&self, id: i64, attempts: i32, err: &str) -> DbResult<()>;
+    async fn list_events(&self, limit: i64, after_id: Option<i64>) -> DbResult<Vec<PresenceEventRecord>>;
+    async fn list_deliveries(&self, limit: i64, status: Option<&str>) -> DbResult<Vec<PresenceDeliveryRecord>>;
+}
+```
+`NewPresenceEvent` 包含上述事件字段（payload 由 worker 组装）。
+
+### 18.3 presence worker（重写 `crates/api/src/presence.rs`）
+
+- 每 `DEVICE_PRESENCE_TICK_SECONDS` 扫描一次 `device_session ⋈ rooms ⋈ areas`：
+  解析目标 URL：`rooms.webhook_url` → `areas.webhook_url` → `DEVICE_PRESENCE_GLOBAL_WEBHOOK_URL`，
+  都没有则只落事件、不建投递；
+- 翻转 → `insert_event`（唯一约束去重）→ 若新插入且目标存在则 `add_delivery`；
+- 同一 tick 再 `claim_due` 批次投递（`DEVICE_PRESENCE_WEBHOOK_BATCH` 默认 20）：
+  POST（`X-QE-Event` / `X-QE-Event-Id` / `X-QE-Delivery-Id`）→ 2xx `mark_delivered`；
+  失败 `attempts+1`，超过 `DEVICE_PRESENCE_WEBHOOK_MAX_ATTEMPTS`（默认 5）`mark_failed`，
+  否则 `mark_retry(next = now + min(300s, 5s * 2^(attempts-1)))`；
+- 事件落库后另做**本地广播**（`tokio::sync::broadcast::Sender<PresenceEventRecord>`），
+  供 SSE 实时推送；跨副本 SSE 由 DB 轮询兜底（订阅时先查 `after` 之后的事件）。
+
+### 18.4 配置新增
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `DEVICE_PRESENCE_GLOBAL_WEBHOOK_URL` | 空 | 房间/区域都未配置时的全局回退地址 |
+| `DEVICE_PRESENCE_WEBHOOK_MAX_ATTEMPTS` | `5` | 单条投递最大尝试次数（1–20） |
+| `DEVICE_PRESENCE_WEBHOOK_BATCH` | `20` | 每轮领取投递上限（1–200） |
+| `DEVICE_PRESENCE_RETRY_BASE_SECONDS` | `5` | 退避基数（1–60） |
+
+`AppState` 增加 `presence: PresenceRepo`。
+
+### 18.5 qe-api 新增接口
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/admin/device-events?limit=&after_id=` | `device:read` | 最近事件（倒序，limit 1–200） |
+| GET | `/admin/device-events/stream?after_id=` | `device:read` | SSE 流：先补发 `after_id` 之后历史事件，之后每 2s 查库增量 + 15s 心跳；`event: device.presence` |
+| GET | `/admin/device-presence-deliveries?status=&limit=` | `device:read` | 投递记录（排障用） |
+
+区域接口增加 `webhook_url`（可空、`PATCH` 语义与房间一致），OpenAPI/README 同步。
+
+### 18.6 验收
+
+- `make check` 全绿；
+- 集成测试：重复事件插入只产生 1 行；同一投递被两个 worker 并发 claim 只成功一次（DB 层）；
+- 本地 E2E：房间不配 webhook、只配区域/全局 → 仍收到 offline；
+  webhook 首次返回 500、第二次 200 → `deliveries.status=delivered` 且 attempts≥2；
+  管理端 SSE 在事件产生后收到 `device.presence`。
