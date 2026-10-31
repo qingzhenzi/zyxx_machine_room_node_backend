@@ -44,6 +44,9 @@ cargo test -p qe-api --test schedule -- --ignored --nocapture
 echo "Running device-room integration tests against $TEST_DATABASE_URL"
 cargo test -p qe-api --test device_room -- --ignored --nocapture
 
+echo "Running storage/image integration tests against $TEST_DATABASE_URL"
+cargo test -p qe-api --test storage -- --ignored --nocapture
+
 echo "Running device-PKI enrollment flow tests against $TEST_DATABASE_URL"
 cargo test -p qe-device-pki --test enroll_flow -- --ignored --nocapture
 

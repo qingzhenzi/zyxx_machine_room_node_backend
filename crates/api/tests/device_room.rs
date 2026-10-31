@@ -66,6 +66,7 @@ fn test_config() -> Config {
         schedule_webhook_max_attempts: 5,
         schedule_delivery_batch: 50,
         public_enroll_endpoint: "https://enroll.test:4440".to_owned(),
+        storage: None,
     }
 }
 

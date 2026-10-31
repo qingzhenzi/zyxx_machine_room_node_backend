@@ -64,6 +64,22 @@ pub struct Config {
     // ---- 设备 ----
     /// 设备注册服务对外地址，用于拼装注册链接（如 `https://node:4440`）。
     pub public_enroll_endpoint: String,
+    // ---- 对象存储（S3 兼容）----
+    /// 未配置 `S3_ENDPOINT` + `S3_BUCKET` 时为 None，存储/镜像接口返回 503。
+    pub storage: Option<StorageConfig>,
+}
+
+/// S3 兼容存储配置（RustFS / MinIO / Ceph 等）。
+#[derive(Clone)]
+pub struct StorageConfig {
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub path_style: bool,
+    pub presign_ttl_secs: u64,
+    pub signing_key_base64: Option<String>,
 }
 
 impl Config {
@@ -167,6 +183,8 @@ impl Config {
             bail!("SCHEDULE_DELIVERY_BATCH 需在 1-500 之间");
         }
 
+        let storage = parse_storage_config()?;
+
         reject_insecure_production_defaults(
             environment,
             &jwt_secret,
@@ -223,6 +241,7 @@ impl Config {
                 .unwrap_or_else(|| "https://localhost:4440".to_owned())
                 .trim_end_matches('/')
                 .to_owned(),
+            storage,
         })
     }
 
@@ -240,6 +259,33 @@ fn parse_environment() -> Result<Environment> {
             _ => bail!("APP_ENV 只能是 development 或 production"),
         },
     }
+}
+
+/// 解析 S3 配置：`S3_ENDPOINT` 与 `S3_BUCKET` 同时存在才启用。
+fn parse_storage_config() -> Result<Option<StorageConfig>> {
+    let endpoint = env_optional("S3_ENDPOINT");
+    let bucket = env_optional("S3_BUCKET");
+    let storage = match (endpoint, bucket) {
+        (None, None) => None,
+        (Some(endpoint), Some(bucket)) => {
+            let presign_ttl_secs = env_parse("STORAGE_PRESIGN_TTL_SECONDS", 900_u64)?;
+            if !(60..=86_400).contains(&presign_ttl_secs) {
+                bail!("STORAGE_PRESIGN_TTL_SECONDS 需在 60-86400 秒之间");
+            }
+            Some(StorageConfig {
+                endpoint: endpoint.trim_end_matches('/').to_owned(),
+                region: env_optional("S3_REGION").unwrap_or_else(|| "us-east-1".to_owned()),
+                bucket,
+                access_key: env_optional("S3_ACCESS_KEY").unwrap_or_default(),
+                secret_key: env_optional("S3_SECRET_KEY").unwrap_or_default(),
+                path_style: env_parse_bool("S3_PATH_STYLE", true)?,
+                presign_ttl_secs,
+                signing_key_base64: env_optional("STORAGE_SIGNING_KEY_BASE64"),
+            })
+        }
+        _ => bail!("S3_ENDPOINT 与 S3_BUCKET 必须同时设置（或都不设置以禁用对象存储）"),
+    };
+    Ok(storage)
 }
 
 fn reject_insecure_production_defaults(

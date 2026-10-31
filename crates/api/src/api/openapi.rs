@@ -52,6 +52,8 @@ pub async fn json_spec() -> Json<Value> {
             { "name": "Schedules", "description": "课表：周模板、单日覆盖与排课实例" },
             { "name": "ScheduleEvents", "description": "触发规则、事件与投递重放/重试" },
             { "name": "Devices", "description": "设备：注册状态、在线状态与区域/房间绑定（v3）" },
+            { "name": "Storage", "description": "对象存储：预签名上传、对象登记、分发/收集任务（P0，S3 兼容）" },
+            { "name": "Images", "description": "镜像：manifest、验证、发布与房间分配（P0，不做 Registry 协议）" },
             { "name": "Health" }
         ],
         "components": {
@@ -674,6 +676,310 @@ pub async fn json_spec() -> Json<Value> {
                 "ReplayResult": {
                     "type": "object",
                     "properties": { "reset": { "type": "integer" } }
+                },
+                "ImageKind": { "type": "string", "enum": ["docker", "oci", "lxc_rootfs", "vm_disk"] },
+                "ImageFormat": { "type": "string", "enum": ["docker_archive", "oci_layout", "tar", "qcow2", "raw"] },
+                "Compression": { "type": "string", "enum": ["none", "zstd", "gzip"], "description": "P0 只接受 none。" },
+                "ArtifactStatus": { "type": "string", "enum": ["uploaded", "manifest_ready", "verifying", "verified", "published", "deprecated", "revoked"] },
+                "ImageChannel": { "type": "string", "enum": ["dev", "test", "prod"] },
+                "TransferStatus": { "type": "string", "enum": ["pending", "running", "completed", "failed", "expired"] },
+                "CollectionStatus": { "type": "string", "enum": ["pending", "uploaded", "verified", "rejected"] },
+                "StorageObject": {
+                    "type": "object",
+                    "required": ["id", "bucket", "object_key", "sha256", "size", "content_type", "created_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "bucket": { "type": "string" },
+                        "object_key": { "type": "string", "example": "objects/ab12…" },
+                        "sha256": { "type": "string", "description": "64 位小写 hex；内容寻址键。" },
+                        "size": { "type": "integer", "format": "int64" },
+                        "content_type": { "type": "string" },
+                        "created_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "StorageObjectRequest": {
+                    "type": "object",
+                    "required": ["sha256", "size"],
+                    "properties": {
+                        "sha256": { "type": "string", "description": "对象内容的 SHA-256（小写 hex）。" },
+                        "size": { "type": "integer", "format": "int64", "minimum": 1, "maximum": 67108864, "description": "P0 上限 64 MiB（服务端登记需读回内容）。" },
+                        "content_type": { "type": ["string", "null"], "default": "application/octet-stream" }
+                    }
+                },
+                "PresignObjectReply": {
+                    "type": "object",
+                    "required": ["bucket", "object_key", "upload_url", "expires_at"],
+                    "properties": {
+                        "bucket": { "type": "string" },
+                        "object_key": { "type": "string", "example": "objects/ab12…" },
+                        "upload_url": { "type": "string", "format": "uri", "description": "短 TTL 预签名 PUT 地址。" },
+                        "expires_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "StorageObjectReply": {
+                    "type": "object",
+                    "required": ["object", "download_url", "expires_at"],
+                    "properties": {
+                        "object": { "$ref": "#/components/schemas/StorageObject" },
+                        "download_url": { "type": "string", "format": "uri", "description": "短 TTL 预签名 GET 地址。" },
+                        "expires_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Transfer": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "direction": { "type": "string", "enum": ["download", "upload"] },
+                        "room_id": { "type": "string", "format": "uuid" },
+                        "image_id": { "type": ["string", "null"], "format": "uuid" },
+                        "manifest_digest": { "type": ["string", "null"] },
+                        "status": { "$ref": "#/components/schemas/TransferStatus" },
+                        "progress": { "type": "integer", "minimum": 0, "maximum": 100 },
+                        "error": { "type": ["string", "null"] },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "TransferPage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Transfer" } },
+                        "total": { "type": "integer" },
+                        "page": { "type": "integer" },
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "Collection": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "area_id": { "type": ["string", "null"], "format": "uuid" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid" },
+                        "kind": { "type": "string" },
+                        "object_key": { "type": "string" },
+                        "sha256": { "type": "string" },
+                        "size": { "type": "integer", "format": "int64" },
+                        "status": { "$ref": "#/components/schemas/CollectionStatus" },
+                        "created_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "CollectionPage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Collection" } },
+                        "total": { "type": "integer" },
+                        "page": { "type": "integer" },
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "ImageArtifact": {
+                    "type": "object",
+                    "required": ["id", "name", "version", "kind", "format", "compression", "platform", "total_size", "status", "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "name": { "type": "string" },
+                        "version": { "type": "string" },
+                        "kind": { "$ref": "#/components/schemas/ImageKind" },
+                        "format": { "$ref": "#/components/schemas/ImageFormat" },
+                        "compression": { "$ref": "#/components/schemas/Compression" },
+                        "platform": { "type": "string", "example": "linux/amd64" },
+                        "manifest_digest": { "type": ["string", "null"], "description": "manifest 的 sha256（小写 hex）；提交 manifest 后写入。" },
+                        "total_size": { "type": "integer", "format": "int64" },
+                        "status": { "$ref": "#/components/schemas/ArtifactStatus" },
+                        "created_by": { "type": ["string", "null"], "format": "uuid" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "ImagePage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/ImageArtifact" } },
+                        "total": { "type": "integer" },
+                        "page": { "type": "integer" },
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "ImageChunk": {
+                    "type": "object",
+                    "properties": {
+                        "manifest_digest": { "type": "string" },
+                        "index": { "type": "integer", "minimum": 0 },
+                        "object_key": { "type": "string" },
+                        "sha256": { "type": "string" },
+                        "size": { "type": "integer", "format": "int64" },
+                        "offset": { "type": "integer", "format": "int64", "description": "逻辑拼接偏移；从 0 连续。" }
+                    }
+                },
+                "ImageVerification": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "artifact_id": { "type": "string", "format": "uuid" },
+                        "ok": { "type": "boolean" },
+                        "report": {
+                            "type": "object",
+                            "properties": {
+                                "manifest_digest": { "type": "string" },
+                                "checks": { "type": "array", "items": { "type": "object", "properties": { "name": { "type": "string" }, "ok": { "type": "boolean" }, "detail": { "type": "string" } } } },
+                                "errors": { "type": "array", "items": { "type": "string" } }
+                            }
+                        },
+                        "verified_by": { "type": "string", "format": "uuid" },
+                        "verified_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "ImageChannelRow": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "artifact_id": { "type": "string", "format": "uuid" },
+                        "channel": { "$ref": "#/components/schemas/ImageChannel" },
+                        "is_current": { "type": "boolean" },
+                        "created_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "ImageAssignment": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "image_id": { "type": "string", "format": "uuid" },
+                        "area_id": { "type": ["string", "null"], "format": "uuid" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid" },
+                        "channel": { "$ref": "#/components/schemas/ImageChannel" },
+                        "rollout_state": { "type": "string" },
+                        "assigned_by": { "type": "string", "format": "uuid" },
+                        "assigned_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "ImageDetail": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/ImageArtifact" },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "chunks": { "type": "array", "items": { "$ref": "#/components/schemas/ImageChunk" } },
+                                "latest_verification": { "oneOf": [{ "$ref": "#/components/schemas/ImageVerification" }, { "type": "null" }] },
+                                "channels": { "type": "array", "items": { "$ref": "#/components/schemas/ImageChannelRow" } }
+                            }
+                        }
+                    ]
+                },
+                "CreateImageRequest": {
+                    "type": "object",
+                    "required": ["name", "version", "kind", "format", "platform"],
+                    "properties": {
+                        "name": { "type": "string", "description": "1-64 位小写字母数字 - _ ." },
+                        "version": { "type": "string", "description": "1-64 位字母数字 . - _ +" },
+                        "kind": { "$ref": "#/components/schemas/ImageKind" },
+                        "format": { "$ref": "#/components/schemas/ImageFormat" },
+                        "compression": { "$ref": "#/components/schemas/Compression", "default": "none" },
+                        "platform": { "type": "string", "example": "linux/amd64" }
+                    }
+                },
+                "ManifestPart": {
+                    "type": "object",
+                    "required": ["index", "sha256", "size", "offset"],
+                    "properties": {
+                        "index": { "type": "integer", "minimum": 0, "description": "从 0 连续递增。" },
+                        "sha256": { "type": "string", "description": "必须指向已登记的 `objects/{sha256}`。" },
+                        "size": { "type": "integer", "format": "int64", "minimum": 1 },
+                        "offset": { "type": "integer", "format": "int64", "description": "逻辑偏移；从 0 连续。" }
+                    }
+                },
+                "ManifestRuntimeInput": {
+                    "type": "object",
+                    "properties": {
+                        "docker": { "type": "object", "properties": { "image_ref": { "type": "string" } } },
+                        "lxc": { "type": "object", "properties": { "distro": { "type": "string" }, "release": { "type": "string" } } },
+                        "vm": { "type": "object", "properties": { "os": { "type": "string" }, "disk_size": { "type": "integer", "format": "int64" } } }
+                    }
+                },
+                "SubmitManifestRequest": {
+                    "type": "object",
+                    "required": ["total_size", "parts"],
+                    "properties": {
+                        "total_size": { "type": "integer", "format": "int64", "minimum": 1, "description": "必须等于分片 size 之和。" },
+                        "parts": { "type": "array", "minItems": 1, "items": { "$ref": "#/components/schemas/ManifestPart" } },
+                        "runtime": { "$ref": "#/components/schemas/ManifestRuntimeInput" },
+                        "annotations": { "type": "object" }
+                    }
+                },
+                "ManifestRuntime": {
+                    "type": "object",
+                    "properties": {
+                        "docker_image_ref": { "type": ["string", "null"] },
+                        "lxc_distro": { "type": ["string", "null"] },
+                        "lxc_release": { "type": ["string", "null"] },
+                        "vm_os": { "type": ["string", "null"] },
+                        "vm_disk_size": { "type": ["integer", "null"], "format": "int64" }
+                    }
+                },
+                "ManifestChunk": {
+                    "type": "object",
+                    "properties": {
+                        "index": { "type": "integer" },
+                        "object_key": { "type": "string" },
+                        "sha256": { "type": "string" },
+                        "size": { "type": "integer", "format": "int64" },
+                        "offset": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "Manifest": {
+                    "type": "object",
+                    "properties": {
+                        "schema": { "type": "integer", "const": 1 },
+                        "kind": { "$ref": "#/components/schemas/ImageKind" },
+                        "name": { "type": "string" },
+                        "version": { "type": "string" },
+                        "platform": { "type": "string" },
+                        "format": { "$ref": "#/components/schemas/ImageFormat" },
+                        "compression": { "$ref": "#/components/schemas/Compression" },
+                        "total_size": { "type": "integer", "format": "int64" },
+                        "chunks": { "type": "array", "items": { "$ref": "#/components/schemas/ManifestChunk" } },
+                        "runtime": { "$ref": "#/components/schemas/ManifestRuntime" },
+                        "annotations": { "type": "object" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "created_by": { "type": ["string", "null"], "format": "uuid" }
+                    }
+                },
+                "SubmitManifestReply": {
+                    "type": "object",
+                    "required": ["artifact", "manifest_digest", "manifest"],
+                    "properties": {
+                        "artifact": { "$ref": "#/components/schemas/ImageArtifact" },
+                        "manifest_digest": { "type": "string", "description": "manifest 原始字节的 sha256（小写 hex）。" },
+                        "manifest": { "$ref": "#/components/schemas/Manifest" }
+                    }
+                },
+                "VerifyReply": {
+                    "type": "object",
+                    "required": ["artifact", "verification"],
+                    "properties": {
+                        "artifact": { "$ref": "#/components/schemas/ImageArtifact" },
+                        "verification": { "$ref": "#/components/schemas/ImageVerification" }
+                    }
+                },
+                "ManifestReply": {
+                    "type": "object",
+                    "required": ["artifact_id", "manifest_digest", "manifest", "download_url", "expires_at"],
+                    "properties": {
+                        "artifact_id": { "type": "string", "format": "uuid" },
+                        "manifest_digest": { "type": "string" },
+                        "manifest": { "$ref": "#/components/schemas/Manifest" },
+                        "download_url": { "type": "string", "format": "uri" },
+                        "expires_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "PublishImageRequest": {
+                    "type": "object",
+                    "required": ["channel"],
+                    "properties": { "channel": { "$ref": "#/components/schemas/ImageChannel" } }
+                },
+                "AssignImageRequest": {
+                    "type": "object",
+                    "properties": { "channel": { "$ref": "#/components/schemas/ImageChannel", "default": "prod" } }
                 }
             }
         },
@@ -1402,6 +1708,234 @@ pub async fn json_spec() -> Json<Value> {
                         "404": error_response("事件或投递记录不存在")
                     }
                 }
+            },
+            "/admin/storage/objects/presign": {
+                "post": {
+                    "tags": ["Storage"],
+                    "summary": "初始化对象上传：返回 objects/{sha256} 的短 TTL 预签名 PUT",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageObjectRequest" } } } },
+                    "responses": {
+                        "200": { "description": "预签名上传地址", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PresignObjectReply" } } } },
+                        "400": error_response("sha256 / size / content_type 不合法"),
+                        "403": error_response("缺少 storage:manage"),
+                        "503": error_response("未配置 S3 或对象存储不可用")
+                    }
+                }
+            },
+            "/admin/storage/objects": {
+                "post": {
+                    "tags": ["Storage"],
+                    "summary": "登记已上传对象（服务端从 S3 读回并重算 sha256/size，不一致 400）",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageObjectRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已登记", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageObject" } } } },
+                        "400": error_response("sha256 不匹配 / size 不一致 / 参数不合法"),
+                        "403": error_response("缺少 storage:manage"),
+                        "503": error_response("未配置 S3 或读取对象失败")
+                    }
+                }
+            },
+            "/admin/storage/objects/{sha256}": {
+                "get": {
+                    "tags": ["Storage"],
+                    "summary": "对象详情 + 预签名下载地址",
+                    "security": secured(),
+                    "parameters": [{ "name": "sha256", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "responses": {
+                        "200": { "description": "对象详情", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StorageObjectReply" } } } },
+                        "400": error_response("sha256 不合法"),
+                        "403": error_response("缺少 storage:read"),
+                        "404": error_response("对象未登记"),
+                        "503": error_response("未配置 S3 或对象存储不可用")
+                    }
+                }
+            },
+            "/admin/images": {
+                "get": {
+                    "tags": ["Images"],
+                    "summary": "镜像分页（kind / status / name）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "kind", "in": "query", "schema": { "$ref": "#/components/schemas/ImageKind" } },
+                        { "name": "status", "in": "query", "schema": { "$ref": "#/components/schemas/ArtifactStatus" } },
+                        { "name": "name", "in": "query", "schema": { "type": "string" }, "description": "按名称模糊匹配。" },
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "镜像分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImagePage" } } } },
+                        "400": error_response("kind / status / 分页参数不合法"),
+                        "403": error_response("缺少 image:read")
+                    }
+                },
+                "post": {
+                    "tags": ["Images"],
+                    "summary": "创建镜像制品（uploaded；name+version+platform 唯一）",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateImageRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImageArtifact" } } } },
+                        "400": error_response("名称/版本/平台不合法，kind 与 format 不匹配，或 compression 非 none"),
+                        "403": error_response("缺少 image:manage"),
+                        "409": error_response("同名同版本同平台的镜像已存在")
+                    }
+                }
+            },
+            "/admin/images/{id}": {
+                "get": {
+                    "tags": ["Images"],
+                    "summary": "镜像详情 + 分片 + 最近验证报告 + 已发布通道",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "镜像详情", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImageDetail" } } } },
+                        "403": error_response("缺少 image:read"),
+                        "404": error_response("镜像不存在")
+                    }
+                }
+            },
+            "/admin/images/{id}/manifest": {
+                "get": {
+                    "tags": ["Images"],
+                    "summary": "读取 manifest JSON + 预签名原始下载地址",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "manifest 与下载地址", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ManifestReply" } } } },
+                        "403": error_response("缺少 image:read"),
+                        "404": error_response("镜像不存在"),
+                        "409": error_response("镜像尚未提交 manifest"),
+                        "503": error_response("未配置 S3 或对象存储不可用")
+                    }
+                },
+                "post": {
+                    "tags": ["Images"],
+                    "summary": "提交 manifest：校验分片对象、签名并写入 S3，状态置 manifest_ready",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SubmitManifestRequest" } } } },
+                    "responses": {
+                        "200": { "description": "manifest 已生成", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SubmitManifestReply" } } } },
+                        "400": error_response("parts 不连续 / 分片对象未登记 / size 不一致 / compression 非 none"),
+                        "403": error_response("缺少 image:manage"),
+                        "404": error_response("镜像不存在"),
+                        "409": error_response("已发布/废弃/吊销的镜像不能提交 manifest"),
+                        "503": error_response("未配置 S3 或写入失败")
+                    }
+                }
+            },
+            "/admin/images/{id}/verify": {
+                "post": {
+                    "tags": ["Images"],
+                    "summary": "同步验证：分片 sha256/size、总大小、格式 magic、manifest 签名；写验证报告",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "验证结果（artifact.status = verified，失败时回到 manifest_ready 且 report.ok=false）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VerifyReply" } } } },
+                        "400": error_response("compression 非 none"),
+                        "403": error_response("缺少 image:manage"),
+                        "404": error_response("镜像不存在"),
+                        "409": error_response("镜像尚未提交 manifest 或没有分片"),
+                        "503": error_response("未配置 S3 或对象存储不可用")
+                    }
+                }
+            },
+            "/admin/images/{id}/publish": {
+                "post": {
+                    "tags": ["Images"],
+                    "summary": "发布到通道（dev / test / prod），仅 verified 可发布",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PublishImageRequest" } } } },
+                    "responses": {
+                        "200": { "description": "已发布", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImageArtifact" } } } },
+                        "400": error_response("channel 不合法"),
+                        "403": error_response("缺少 image:manage"),
+                        "404": error_response("镜像不存在"),
+                        "409": error_response("镜像不是 verified 状态")
+                    }
+                }
+            },
+            "/admin/rooms/{id}/images/{image_id}": {
+                "put": {
+                    "tags": ["Images"],
+                    "summary": "把已发布镜像分配到房间（创建 download transfer）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "image_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+                    ],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AssignImageRequest" } } } },
+                    "responses": {
+                        "200": { "description": "分配结果", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImageAssignment" } } } },
+                        "400": error_response("channel 不合法"),
+                        "403": error_response("缺少 image:manage"),
+                        "404": error_response("镜像或房间不存在"),
+                        "409": error_response("镜像未发布")
+                    }
+                },
+                "delete": {
+                    "tags": ["Images"],
+                    "summary": "取消房间分配",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "image_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+                    ],
+                    "responses": {
+                        "204": { "description": "已取消分配" },
+                        "403": error_response("缺少 image:manage"),
+                        "404": error_response("该房间未分配此镜像")
+                    }
+                }
+            },
+            "/admin/transfers": {
+                "get": {
+                    "tags": ["Storage"],
+                    "summary": "分发/收集任务分页（按房间过滤，created_at 倒序）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "room_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "任务分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransferPage" } } } },
+                        "403": error_response("缺少 storage:read")
+                    }
+                }
+            },
+            "/admin/transfers/{id}/retry": {
+                "post": {
+                    "tags": ["Storage"],
+                    "summary": "重试分发任务（failed / expired → pending，进度清零）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "重置后的任务", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Transfer" } } } },
+                        "403": error_response("缺少 storage:manage"),
+                        "404": error_response("任务不存在"),
+                        "409": error_response("任务不是 failed / expired 状态")
+                    }
+                }
+            },
+            "/admin/collections": {
+                "get": {
+                    "tags": ["Storage"],
+                    "summary": "收集登记分页（按房间过滤，created_at 倒序）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "room_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "收集分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CollectionPage" } } } },
+                        "403": error_response("缺少 storage:read")
+                    }
+                }
             }
         }
     }))
@@ -1432,6 +1966,17 @@ mod tests {
         assert!(paths.contains_key("/admin/devices/{serial}"));
         assert!(paths.contains_key("/admin/rooms/{id}/device"));
         assert!(paths.contains_key("/admin/rooms/{id}/device-token"));
+        assert!(paths.contains_key("/admin/storage/objects/presign"));
+        assert!(paths.contains_key("/admin/storage/objects"));
+        assert!(paths.contains_key("/admin/storage/objects/{sha256}"));
+        assert!(paths.contains_key("/admin/images"));
+        assert!(paths.contains_key("/admin/images/{id}/manifest"));
+        assert!(paths.contains_key("/admin/images/{id}/verify"));
+        assert!(paths.contains_key("/admin/images/{id}/publish"));
+        assert!(paths.contains_key("/admin/rooms/{id}/images/{image_id}"));
+        assert!(paths.contains_key("/admin/transfers"));
+        assert!(paths.contains_key("/admin/transfers/{id}/retry"));
+        assert!(paths.contains_key("/admin/collections"));
         assert!(
             spec["tags"]
                 .as_array()
@@ -1445,6 +1990,20 @@ mod tests {
                 .expect("tags")
                 .iter()
                 .any(|tag| tag["name"] == "Devices")
+        );
+        assert!(
+            spec["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .any(|tag| tag["name"] == "Storage")
+        );
+        assert!(
+            spec["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .any(|tag| tag["name"] == "Images")
         );
         assert_eq!(
             spec["components"]["securitySchemes"]["bearerAuth"]["scheme"],

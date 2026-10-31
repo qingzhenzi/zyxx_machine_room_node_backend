@@ -24,6 +24,10 @@ pub mod permissions {
     pub const SCHEDULE_EVENT_MANAGE: &str = "schedule:event:manage";
     pub const DEVICE_READ: &str = "device:read";
     pub const DEVICE_MANAGE: &str = "device:manage";
+    pub const STORAGE_READ: &str = "storage:read";
+    pub const STORAGE_MANAGE: &str = "storage:manage";
+    pub const IMAGE_READ: &str = "image:read";
+    pub const IMAGE_MANAGE: &str = "image:manage";
 
     pub const ALL: &[&str] = &[
         ANNOUNCEMENT_READ,
@@ -43,6 +47,10 @@ pub mod permissions {
         SCHEDULE_EVENT_MANAGE,
         DEVICE_READ,
         DEVICE_MANAGE,
+        STORAGE_READ,
+        STORAGE_MANAGE,
+        IMAGE_READ,
+        IMAGE_MANAGE,
     ];
 }
 
@@ -84,6 +92,22 @@ mod tests {
         ] {
             assert!(permissions::ALL.contains(&code), "缺少权限：{code}");
         }
-        assert_eq!(permissions::ALL.len(), 17);
+        assert_eq!(permissions::ALL.len(), 21);
+    }
+
+    #[test]
+    fn storage_and_image_permissions_are_registered() {
+        for code in [
+            permissions::STORAGE_READ,
+            permissions::STORAGE_MANAGE,
+            permissions::IMAGE_READ,
+            permissions::IMAGE_MANAGE,
+        ] {
+            assert!(permissions::ALL.contains(&code), "缺少权限：{code}");
+        }
+        assert_eq!(permissions::STORAGE_READ, "storage:read");
+        assert_eq!(permissions::STORAGE_MANAGE, "storage:manage");
+        assert_eq!(permissions::IMAGE_READ, "image:read");
+        assert_eq!(permissions::IMAGE_MANAGE, "image:manage");
     }
 }

@@ -13,6 +13,7 @@ pub mod roles;
 pub mod rows;
 pub mod schedule;
 pub mod security;
+pub mod storage;
 pub mod users;
 
 pub use db::Db;

@@ -2,10 +2,12 @@ pub mod announcements;
 pub mod areas;
 pub mod audit;
 pub mod devices;
+pub mod images;
 pub mod roles;
 pub mod rooms;
 pub mod schedule_events;
 pub mod schedules;
+pub mod storage;
 pub mod users;
 
 use axum::{
@@ -88,6 +90,25 @@ pub fn router() -> Router<AppState> {
         .route(
             "/schedule-events/{id}/deliveries/{delivery_id}/retry",
             post(schedule_events::retry_delivery),
+        )
+        // ---- 资源与镜像（P0）----
+        .route("/storage/objects/presign", post(storage::presign_object))
+        .route("/storage/objects", post(storage::register_object))
+        .route("/storage/objects/{sha256}", get(storage::get_object))
+        .route("/transfers", get(storage::list_transfers))
+        .route("/transfers/{id}/retry", post(storage::retry_transfer))
+        .route("/collections", get(storage::list_collections))
+        .route("/images", get(images::list).post(images::create))
+        .route("/images/{id}", get(images::get))
+        .route(
+            "/images/{id}/manifest",
+            get(images::get_manifest).post(images::submit_manifest),
+        )
+        .route("/images/{id}/verify", post(images::verify))
+        .route("/images/{id}/publish", post(images::publish))
+        .route(
+            "/rooms/{id}/images/{image_id}",
+            put(images::assign_room).delete(images::unassign_room),
         )
 }
 

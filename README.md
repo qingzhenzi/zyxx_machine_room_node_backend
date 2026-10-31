@@ -512,6 +512,173 @@ device:read    device:manage
 | --- | --- | --- |
 | `PUBLIC_ENROLL_ENDPOINT` | `https://localhost:4440` | 设备注册服务对外地址，用于拼装 token 响应里的 `link`（自动去掉末尾 `/`） |
 
+## 资源与镜像管理（P0）
+
+房间节点运行 Docker 容器、LXC 容器与 KVM/VM，三者用同一套抽象管理产物：
+**内容寻址分片 + manifest + Ed25519 签名 + 验证报告**。数据面是 S3 兼容对象存储
+（开发 MinIO，目标 RustFS，生产可换 Ceph/云 OSS），控制面在 `qe-api`。
+**P0 不实现 OCI Registry 协议**（需要标准 `docker pull` 时见设计文档 §9）。
+设计契约见 [`docs/storage-design.md`](docs/storage-design.md) §14，迁移为 `migrations/0011_storage.sql`。
+
+```text
+<bucket>/
+  objects/{sha256}                   # 分片 / 单文件（内容寻址，天然去重）
+  manifests/{manifest_sha256}.json   # 清单（权威标识 = manifest 的 sha256）
+  signatures/{manifest_sha256}.sig   # Ed25519 签名，覆盖 manifest 原始字节
+```
+
+### S3 / RustFS 配置
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `S3_ENDPOINT` | 无 | S3 兼容端点；与 `S3_BUCKET` **同时**设置才启用本模块 |
+| `S3_BUCKET` | 无 | 桶名 |
+| `S3_REGION` | `us-east-1` | SigV4 签名区域 |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | 空 | 凭证（生产建议走 Secret） |
+| `S3_PATH_STYLE` | `true` | MinIO / RustFS 通常需要 path-style |
+| `STORAGE_PRESIGN_TTL_SECONDS` | `900` | 预签名 TTL，60..=86400 |
+| `STORAGE_SIGNING_KEY_BASE64` | 空 | 32 字节 Ed25519 seed 的 base64；不设则启动时随机生成（**仅开发**） |
+
+未配置 `S3_ENDPOINT` + `S3_BUCKET`（或 `StorageService` 初始化失败）时 API 仍可启动，
+所有存储/镜像接口返回 `503 service_unavailable`，其它模块不受影响。
+
+本地起 RustFS（compose profile `storage`）：
+
+```bash
+docker compose --profile storage up -d rustfs   # 9000 = S3，9001 = 控制台
+# .env
+S3_ENDPOINT=http://127.0.0.1:9000
+S3_BUCKET=qestudio
+S3_ACCESS_KEY=rustfsadmin
+S3_SECRET_KEY=rustfsadmin
+# 开发可以把 Ed25519 种子固定下来，重启后已签 manifest 仍可验签：
+# STORAGE_SIGNING_KEY_BASE64=$(head -c 32 /dev/urandom | base64)
+```
+
+进程内集成测试用 fake S3（axum + 内存 map）覆盖上传/验证/发布链路，不依赖真实 RustFS。
+
+### API（`/api/v1/admin`）
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| POST | `/storage/objects/presign` | `storage:manage` | `{sha256,size,content_type?}` → `{bucket,object_key,upload_url,expires_at}`，对象键固定 `objects/{sha256}` |
+| POST | `/storage/objects` | `storage:manage` | 登记对象：服务端从 S3 读回内容重算 sha256/size，不一致 400 |
+| GET | `/storage/objects/{sha256}` | `storage:read` | 对象详情 + 预签名下载地址；未登记 404 |
+| POST | `/images` | `image:manage` | 创建制品（`uploaded`）；`name+version+platform` 唯一 |
+| GET | `/images?kind=&status=&name=&page=&page_size=` | `image:read` | 镜像分页（`name` 模糊） |
+| GET | `/images/{id}` | `image:read` | 详情 + chunks + 最近验证报告 + 已发布通道 |
+| POST | `/images/{id}/manifest` | `image:manage` | 提交分片清单 → 写 manifest/签名 → 状态 `manifest_ready` |
+| POST | `/images/{id}/verify` | `image:manage` | 同步验证并落报告；通过置 `verified` |
+| POST | `/images/{id}/publish` | `image:manage` | `{channel:"dev"\|"test"\|"prod"}`，仅 `verified` 可发布 |
+| GET | `/images/{id}/manifest` | `image:read` | manifest JSON + 预签名下载地址 |
+| PUT | `/rooms/{id}/images/{image_id}` | `image:manage` | `{channel?}`（缺省 `prod`）分配并创建 `download` transfer |
+| DELETE | `/rooms/{id}/images/{image_id}` | `image:manage` | 取消分配（不删镜像） |
+| GET | `/transfers?room_id=&page=&page_size=` | `storage:read` | 分发/收集任务（`created_at` 倒序） |
+| POST | `/transfers/{id}/retry` | `storage:manage` | 仅 `failed` / `expired` 可重试（重置进度与错误） |
+| GET | `/collections?room_id=&page=&page_size=` | `storage:read` | 收集登记列表 |
+
+典型流程（`curl` 片段，token 省略）：
+
+```bash
+# 1. 预签名上传一个分片（sha256/size 由客户端先算好）
+curl -s -X POST localhost:8080/api/v1/admin/storage/objects/presign \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"sha256":"<64位hex>","size":1048576,"content_type":"application/octet-stream"}'
+# 2. PUT 到 upload_url，然后登记对象
+curl -s -X POST localhost:8080/api/v1/admin/storage/objects \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"sha256":"<64位hex>","size":1048576}'
+# 3. 创建镜像 → 提交 manifest → 验证 → 发布
+curl -s -X POST localhost:8080/api/v1/admin/images \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"web-console","version":"2026.10.31-1","kind":"vm_disk","format":"qcow2","platform":"linux/amd64"}'
+# ...
+```
+
+### Manifest 结构
+
+`POST /images/{id}/manifest` 的请求体：
+
+```json
+{
+  "total_size": 16777216,
+  "parts": [
+    { "index": 0, "sha256": "ab12…", "size": 16777216, "offset": 0 }
+  ],
+  "runtime": {
+    "docker": { "image_ref": "web-console:2026.10.31-1" },
+    "lxc": { "distro": "ubuntu", "release": "24.04" },
+    "vm": { "os": "windows-11", "disk_size": 34359738368 }
+  },
+  "annotations": {}
+}
+```
+
+服务端据此生成的 manifest（存 `manifests/{digest}.json`，字段顺序固定，签名与 digest 都基于这份字节）：
+
+```json
+{
+  "schema": 1,
+  "kind": "vm_disk",
+  "name": "web-console",
+  "version": "2026.10.31-1",
+  "platform": "linux/amd64",
+  "format": "qcow2",
+  "compression": "none",
+  "total_size": 16777216,
+  "chunks": [
+    { "index": 0, "object_key": "objects/ab12…", "sha256": "ab12…", "size": 16777216, "offset": 0 }
+  ],
+  "runtime": { "docker_image_ref": null, "lxc_distro": null, "lxc_release": null, "vm_os": "windows-11", "vm_disk_size": 34359738368 },
+  "annotations": {},
+  "created_at": "2026-10-31T05:00:00Z",
+  "created_by": "<uuid>"
+}
+```
+
+- `version` 只用于展示/排序；**权威标识是 manifest 的 sha256**（即 `manifest_digest`）。
+- 分片 `index`/`offset` 必须从 0 连续、`size > 0`、sha256 不重复，`total_size` 必须等于分片大小之和；
+  每个分片必须先以 `objects/{sha256}` 登记且 size 一致，否则 400。
+- P0 只接受 `compression = none`；`zstd` / `gzip` 字段保留，传非 `none` 直接 400。
+- 签名单独存 `signatures/{digest}.sig`（64 字节 Ed25519），manifest JSON 里不含 `signature` 字段。
+
+### 验证清单（`POST /images/{id}/verify`）
+
+| 检查 | 说明 |
+| --- | --- |
+| `chunk.{i}.sha256` | 从 S3 读回分片并重算 sha256，与 manifest 一致 |
+| `chunk.{i}.size` | 读回字节数与该分片 `size` 一致 |
+| `total_size` | 所有分片实际字节数之和等于 `total_size` |
+| `magic` | qcow2 `QFI\xfb`；tar / docker-archive / oci-layout 在 offset 257 有 `ustar`；raw 跳过 |
+| `manifest.digest` | `sha256(manifest 原始字节) == manifest_digest` |
+| `manifest.signature` | 用 `signatures/{digest}.sig` 做 Ed25519 验签 |
+
+- 报告结构：`{"manifest_digest":"…","checks":[{"name":"chunk.0.sha256","ok":true,"detail":"…"}],"errors":[]}`，
+  写入 `image_verifications`（保留历史）。
+- 全部通过 → `status = verified`；任何一项失败 → `report.ok = false`，状态回到 `manifest_ready`，
+  修好分片后可重新提交 manifest/再次验证（**fail-closed**）。
+- 已发布/废弃/吊销的镜像不能重新验证（409），避免把 `published` 降级。
+
+### 权限与审计
+
+```
+storage:read    storage:manage
+image:read      image:manage
+```
+
+- `storage:read` / `image:read`：查看对象、任务、镜像与验证报告；
+- `storage:manage` / `image:manage`：上传登记、提交 manifest、验证、发布、分配/取消分配、重试任务；
+- `admin` 角色自动拥有全部权限；`viewer` / `editor` 默认只有 `storage:read` 与 `image:read`。
+- 审计动作：`storage.object.register`、`image.create` / `verify` / `publish` / `assign` / `unassign`、`transfer.retry`。
+
+### P1 说明
+
+- 节点侧 agent（独立 Rust 二进制）：拉 manifest → 验签 → 逐 chunk 校验 → 按 kind 导入
+  （`docker load` / `ctr images import`、LXC/Incus rootfs、`qemu-img` + libvirt），上报 `transfer.completed`；
+  与课表事件联动（上课前分发）。
+- zstd/gzip 压缩与解压校验、chunk 复用/增量更新、S3 Event 通知兜底、收集上传（`collections`）、
+  配额/保留期/GC、`transfers`/`collections` 的状态过滤、只读 Registry（Zot facade）、Trivy 安全扫描。
+
 ## 请求追踪与日志
 
 ### trace_id / request_id
@@ -642,6 +809,13 @@ Grafana Explore 里可以直接查：
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | 空 | 设置后启用 OTLP/HTTP trace 导出 |
 | `OTEL_SERVICE_NAME` | `qestudio-backend` | OTel service.name |
 | `OTEL_LOGS_ENABLED` | `false` | 同时导出 OTLP logs（默认仅 stdout） |
+| `S3_ENDPOINT` | 空 | 对象存储端点；与 `S3_BUCKET` 同时设置才启用资源/镜像模块 |
+| `S3_BUCKET` | 空 | 对象存储桶名 |
+| `S3_REGION` | `us-east-1` | SigV4 区域 |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | 空 | 对象存储凭证 |
+| `S3_PATH_STYLE` | `true` | MinIO/RustFS 用 path-style |
+| `STORAGE_PRESIGN_TTL_SECONDS` | `900` | 预签名有效期，60..=86400 |
+| `STORAGE_SIGNING_KEY_BASE64` | 空 | Ed25519 seed（32 字节 base64），不设则每次启动随机生成 |
 | `RUST_LOG` | `info,sqlx=warn` | 日志过滤 |
 | `LOG_FORMAT` | `pretty` | 本地日志格式；compose 容器内固定为 `json` |
 

@@ -9,4 +9,5 @@ pub mod error;
 pub mod models;
 pub mod rbac;
 pub mod schedule;
+pub mod storage;
 pub mod validation;

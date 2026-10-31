@@ -14,6 +14,11 @@ use crate::{
     },
 };
 
+pub use crate::storage::{
+    validate_image_name, validate_image_version, validate_manifest, validate_object_key,
+    validate_platform, validate_sha256_hex,
+};
+
 pub const MAX_PAGE_SIZE: i64 = 100;
 pub const DEFAULT_PAGE_SIZE: i64 = 20;
 
