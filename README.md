@@ -745,6 +745,33 @@ P2 待做：zstd/gzip 压缩与解压校验、chunk 复用/增量、S3 Event 兜
 agent 收到后应用策略：`lxc_auto_start` / `poll_interval_secs` 立即生效，
 `download_concurrency` / `cache_max_bytes` 需重启（只 warn）。
 
+## 设备离线通知（Webhook）
+
+device-pki 心跳判定 `offline` 后写入 `device_session`；qe-api 后台按
+`DEVICE_PRESENCE_TICK_SECONDS`（默认 5s）扫描该表，检测 `online -> offline`
+（可选 `offline -> online`），向房间配置的 `webhook_url` POST：
+
+```json
+{
+  "event": "device.offline",
+  "occurred_at": "2026-11-02T08:00:00Z",
+  "serial": "3f2a9c…",
+  "device_slot": "node-101",
+  "last_seen_at": "2026-11-02T07:59:50Z",
+  "previous_state": "online",
+  "current_state": "offline",
+  "room_id": "…", "room_code": "room-101", "room_name": "…",
+  "area_id": "…", "area_code": "area-1", "area_name": "…"
+}
+```
+
+- Headers：`X-QE-Event: device.offline`、`X-QE-Event-Id`、`X-QE-Delivery-Id`；
+- 房间 `webhook_url` 通过 `PATCH /api/v1/admin/rooms/{id}` 配置，未配置的房间只记录日志；
+- 默认只通知 `offline`；`DEVICE_PRESENCE_NOTIFY_ONLINE=true` 时也通知重新上线；
+- 离线判定本身约 **15–20s** 延迟（5s tick × 连续 3 次 miss），webhook 在这之后发出；
+- 当前为**单实例**实现：投递失败只记日志、不阻塞状态；多副本部署会重复投递，
+  需要去重时后续可加 Redis 锁（当前不做持久化重试队列）。
+
 ## 请求追踪与日志
 
 ### trace_id / request_id
@@ -882,6 +909,10 @@ Grafana Explore 里可以直接查：
 | `S3_PATH_STYLE` | `true` | MinIO/RustFS 用 path-style |
 | `STORAGE_PRESIGN_TTL_SECONDS` | `900` | 预签名有效期，60..=86400 |
 | `STORAGE_SIGNING_KEY_BASE64` | 空 | Ed25519 seed（32 字节 base64），不设则每次启动随机生成 |
+| `DEVICE_PRESENCE_ENABLED` | `true` | 是否在 qe-api 侧扫描 `device_session` 并投递在线状态 webhook |
+| `DEVICE_PRESENCE_TICK_SECONDS` | `5` | 状态扫描间隔（2–60 秒） |
+| `DEVICE_PRESENCE_WEBHOOK_TIMEOUT_SECONDS` | `5` | webhook 请求超时（1–60 秒） |
+| `DEVICE_PRESENCE_NOTIFY_ONLINE` | `false` | true 时同时投递 `device.online`，默认只投递离线 |
 | `RUST_LOG` | `info,sqlx=warn` | 日志过滤 |
 | `LOG_FORMAT` | `pretty` | 本地日志格式；compose 容器内固定为 `json` |
 

@@ -47,13 +47,6 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = ["
 opentelemetry-appender-tracing = "0.31"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-
-[dev-dependencies]
-hex = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-sha2 = "0.10"
-http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring",
@@ -62,3 +55,10 @@ sqlx = { version = "0.8", default-features = false, features = [
     "chrono",
     "json",
 ] }
+
+[dev-dependencies]
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "0.10"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

@@ -64,6 +64,15 @@ pub struct Config {
     // ---- 设备 ----
     /// 设备注册服务对外地址，用于拼装注册链接（如 `https://node:4440`）。
     pub public_enroll_endpoint: String,
+    // ---- 设备在线状态通知（device.offline / device.online webhook）----
+    /// 是否启用在 qe-api 侧扫描 `device_session` 并投递状态变化 webhook。
+    pub device_presence_enabled: bool,
+    /// 扫描间隔（秒）。
+    pub device_presence_tick_secs: u64,
+    /// webhook 请求超时（秒）。
+    pub device_presence_webhook_timeout_secs: u64,
+    /// 是否同时通知 `device.online`（默认只通知 offline）。
+    pub device_presence_notify_online: bool,
     // ---- 对象存储（S3 兼容）----
     /// 未配置 `S3_ENDPOINT` + `S3_BUCKET` 时为 None，存储/镜像接口返回 503。
     pub storage: Option<StorageConfig>,
@@ -178,6 +187,17 @@ impl Config {
         if !(1..=20).contains(&schedule_webhook_max_attempts) {
             bail!("SCHEDULE_WEBHOOK_MAX_ATTEMPTS 需在 1-20 之间");
         }
+        let device_presence_enabled = env_parse_bool("DEVICE_PRESENCE_ENABLED", true)?;
+        let device_presence_tick_secs = env_parse("DEVICE_PRESENCE_TICK_SECONDS", 5_u64)?;
+        if !(2..=60).contains(&device_presence_tick_secs) {
+            bail!("DEVICE_PRESENCE_TICK_SECONDS 需在 2-60 秒之间");
+        }
+        let device_presence_webhook_timeout_secs =
+            env_parse("DEVICE_PRESENCE_WEBHOOK_TIMEOUT_SECONDS", 5_u64)?;
+        if !(1..=60).contains(&device_presence_webhook_timeout_secs) {
+            bail!("DEVICE_PRESENCE_WEBHOOK_TIMEOUT_SECONDS 需在 1-60 秒之间");
+        }
+        let device_presence_notify_online = env_parse_bool("DEVICE_PRESENCE_NOTIFY_ONLINE", false)?;
         let schedule_delivery_batch = env_parse("SCHEDULE_DELIVERY_BATCH", 50_i64)?;
         if !(1..=500).contains(&schedule_delivery_batch) {
             bail!("SCHEDULE_DELIVERY_BATCH 需在 1-500 之间");
@@ -237,6 +257,10 @@ impl Config {
             schedule_webhook_timeout_secs,
             schedule_webhook_max_attempts,
             schedule_delivery_batch,
+            device_presence_enabled,
+            device_presence_tick_secs,
+            device_presence_webhook_timeout_secs,
+            device_presence_notify_online,
             public_enroll_endpoint: env_optional("PUBLIC_ENROLL_ENDPOINT")
                 .unwrap_or_else(|| "https://localhost:4440".to_owned())
                 .trim_end_matches('/')

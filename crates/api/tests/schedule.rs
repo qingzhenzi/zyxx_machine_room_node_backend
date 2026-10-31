@@ -83,6 +83,10 @@ fn test_config() -> Config {
         schedule_webhook_timeout_secs: 5,
         schedule_webhook_max_attempts: 5,
         schedule_delivery_batch: 50,
+        device_presence_enabled: false,
+        device_presence_tick_secs: 5,
+        device_presence_webhook_timeout_secs: 5,
+        device_presence_notify_online: false,
         public_enroll_endpoint: "https://localhost:4440".to_owned(),
         storage: None,
     }

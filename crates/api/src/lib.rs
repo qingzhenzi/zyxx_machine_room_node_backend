@@ -6,6 +6,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod email;
 pub mod error;
+pub mod presence;
 pub mod scheduler;
 pub mod state;
 
@@ -54,6 +55,15 @@ pub async fn run() -> anyhow::Result<()> {
         tracing::info!(tick_secs = config.schedule_tick_secs, "课表事件引擎已启动");
     } else {
         tracing::info!("课表事件引擎已禁用（SCHEDULE_ENGINE_ENABLED=false）");
+    }
+
+    if config.device_presence_enabled {
+        let _presence = presence::spawn(state.clone());
+        tracing::info!(
+            tick_secs = config.device_presence_tick_secs,
+            notify_online = config.device_presence_notify_online,
+            "设备在线状态 webhook 通知已启动"
+        );
     }
 
     let listener = TcpListener::bind(config.bind_addr)
