@@ -10,6 +10,7 @@
 
 pub mod ca;
 pub mod cert_status;
+pub mod channel;
 pub mod challenge;
 pub mod error;
 pub mod messaging;

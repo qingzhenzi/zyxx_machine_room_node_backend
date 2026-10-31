@@ -106,6 +106,38 @@ approval 型响应：
   所以实际换设备流程是：管理员 `/revoke` 旧 serial → 发新链接
 - 请求体：`{ "slot": "S" }`（身份取自 mTLS 证书 CN，与 body 不一致即 401）
 
+### GET /channel  （mTLS listener，WebSocket 隧道）
+
+一条连接同时承担**注册激活**与**双向消息**：升级成功后服务端把 enrollment
+推到 `active`（等价于 `POST /enroll/confirm`，幂等），并先发一帧
+
+```json
+{ "type": "ready", "status": "active", "serial": "..." }
+```
+
+帧协议（JSON 文本帧）：
+
+```text
+设备 → 服务端
+  {"type":"msg","seq":1,"kind":"heartbeat","payload":"{}"}   // 语义同 POST /messages
+  {"type":"ack","up_to":7}                                   // 下行消息处理成功
+  {"type":"ping"}
+
+服务端 → 设备
+  {"type":"ack_msg","seq":1,"status":"ok","duplicate":false}
+  {"type":"down","id":7,"kind":"config","payload":"{}"}
+  {"type":"pong"}
+  {"type":"err","code":"...","message":"..."}
+```
+
+- 上行走同一个 `process_incoming`（收件箱去重 → 业务分发 → 成功才推水位），
+  失败回 `err` 帧且**不推水位**，设备应重发同一条
+- 下行走同一个队列：服务端在「投递通知 + 2s 兜底轮询」时推 `down` 帧，
+  设备处理成功回 `ack` 才标记已投递；没 ack 的在重连后重投
+- 心跳：服务端每 20s 发一帧探活，连续 2 个周期无响应即断开；设备侧 15s 主动发 `ping`
+- **HTTP 端点保留作为兜底**：设备维持不了长连接时仍可用
+  `POST /messages` + `GET /messages/downlink`
+
 ### POST /messages  （mTLS listener，设备上行消息）
 
 ```json

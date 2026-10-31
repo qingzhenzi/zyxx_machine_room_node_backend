@@ -49,6 +49,7 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/enroll/confirm` | 回连验证，`issued → active` 并清空 `cert_pem`，通讯打通 |
+| GET | `/channel` | **WebSocket 隧道**：建连即激活注册，之后双向消息走这一条连接（帧协议见契约 §4） |
 | POST | `/messages` | 设备上行消息；收件箱去重 + 业务分发 + 成功才推水位 |
 | GET | `/messages/downlink` | 设备拉取下行消息（`?after=&limit=`） |
 | POST | `/messages/downlink/ack` | 设备确认已处理（`{"up_to": id}`） |
@@ -130,6 +131,6 @@ let id = messaging::downlink_publish(&pool, &serial, "slot-1", "config", "{}").a
 ## 测试
 
 ```bash
-cargo test -p qe-device-pki                    # 55 个单元测试
-./scripts/test-integration.sh                  # 另加 8 个端到端用例（真实 PostgreSQL）
+cargo test -p qe-device-pki                    # 56 个单元测试
+./scripts/test-integration.sh                  # 另加 9 个端到端用例（真实 PostgreSQL，含 WS 隧道）
 ```

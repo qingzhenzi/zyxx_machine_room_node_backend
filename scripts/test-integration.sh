@@ -41,5 +41,8 @@ cargo test -p qe-api --test integration -- --ignored --nocapture
 echo "Running device-PKI enrollment flow tests against $TEST_DATABASE_URL"
 cargo test -p qe-device-pki --test enroll_flow -- --ignored --nocapture
 
+echo "Running device-PKI WebSocket channel tests against $TEST_DATABASE_URL"
+cargo test -p qe-device-pki --test ws_channel -- --ignored --nocapture
+
 echo "Integration tests passed."
 echo "Services remain running; stop with: docker compose stop postgres redis"

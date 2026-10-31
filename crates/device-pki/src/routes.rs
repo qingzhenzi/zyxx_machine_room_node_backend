@@ -516,48 +516,54 @@ pub async fn confirm(
     if subject != req.slot {
         return Err(Error::Unauthorized);
     }
+    Ok(Json(activate_enrollment(&st, &req.slot).await?))
+}
 
+/// 把 enrollment 从 `issued` 推进到 `active`（幂等）。
+///
+/// HTTP `POST /enroll/confirm` 与 WebSocket 隧道建连都走这里：
+/// **建立一条经证书认证的业务连接 ⇔ 注册真正完成**，两者是同一件事。
+pub async fn activate_enrollment(st: &AppState, slot: &str) -> Result<ConfirmReply> {
     let res = sqlx::query(
         "UPDATE device_enrollment SET status = 'active', activated_at = now(),
                 -- 证书已交付并被使用，DB 不再长期持有它（见 enroll_status 的可取性边界）
                 cert_pem = ''
          WHERE device_slot = $1 AND status = 'issued'",
     )
-    .bind(&req.slot)
+    .bind(slot)
     .execute(&st.db)
     .await?;
     if res.rows_affected() == 0 {
-        // 已经是 active（重复 confirm）视为幂等成功
+        // 已经是 active（重复 confirm / 重复建连）视为幂等成功
         let exists: Option<(String,)> = sqlx::query_as(
             "SELECT serial FROM device_enrollment
              WHERE device_slot = $1 AND status = 'active' LIMIT 1",
         )
-        .bind(&req.slot)
+        .bind(slot)
         .fetch_optional(&st.db)
         .await?;
         let (serial,) = exists.ok_or(Error::EnrollmentNotFound)?;
-        return Ok(Json(ConfirmReply {
+        return Ok(ConfirmReply {
             status: "active".into(),
             serial,
             mtls: "ok".into(),
-        }));
+        });
     }
 
     let (serial,): (String,) = sqlx::query_as(
         "SELECT serial FROM device_enrollment WHERE device_slot = $1 AND status = 'active'",
     )
-    .bind(&req.slot)
+    .bind(slot)
     .fetch_one(&st.db)
     .await?;
 
-    st.sessions
-        .upsert(&serial, &req.slot, SessionState::Online, 0);
+    st.sessions.upsert(&serial, slot, SessionState::Online, 0);
 
-    Ok(Json(ConfirmReply {
+    Ok(ConfirmReply {
         status: "active".into(),
         serial,
         mtls: "ok".into(),
-    }))
+    })
 }
 
 // ---------------- 吊销 ----------------
@@ -802,56 +808,65 @@ pub async fn receive_message(
     peer: crate::tls::PeerCert,
     Json(req): Json<MessageRequest>,
 ) -> Result<Json<MessageReply>> {
+    let reply = process_incoming(&st, &peer, req.seq, &req.kind, &req.payload).await?;
+    Ok(Json(reply))
+}
+
+/// 上行消息的核心处理，HTTP `POST /messages` 与 WebSocket 隧道共用。
+///
+/// 顺序：**收件箱去重 → 会话记活动 → 业务分发 → 成功才推水位**。
+/// 详细语义见 `crate::messaging`。
+pub async fn process_incoming(
+    st: &AppState,
+    peer: &crate::tls::PeerCert,
+    seq: i64,
+    kind: &str,
+    payload: &str,
+) -> Result<MessageReply> {
     use crate::messaging::{Dispatch, Message};
 
     // 身份来自 mTLS 证书，不信任请求体
     let serial = peer.serial_hex.clone().ok_or(Error::Unauthorized)?;
     let slot = peer.common_name().ok_or(Error::Unauthorized)?.to_owned();
 
-    if req.seq <= 0 {
+    if seq <= 0 {
         return Err(Error::BadRequest("seq 必须为正整数".into()));
     }
-    if req.kind.is_empty() || req.kind.len() > 64 {
-        return Err(Error::BadRequest("kind 长度必须在 1..=64".into()));
-    }
-    if req.payload.len() > MAX_MESSAGE_BYTES {
-        return Err(Error::BadRequest(format!(
-            "payload 超过 {MAX_MESSAGE_BYTES} 字节"
-        )));
-    }
+    crate::messaging::validate_kind(kind)?;
+    crate::messaging::validate_payload(payload, MAX_MESSAGE_BYTES)?;
 
     let msg = Message {
         serial: serial.clone(),
         slot: slot.clone(),
-        seq: req.seq,
-        kind: req.kind.clone(),
-        payload: req.payload.clone(),
+        seq,
+        kind: kind.to_owned(),
+        payload: payload.to_owned(),
         received_at: chrono::Utc::now(),
     };
 
     // 1) 收件箱去重：这一步在 DB 上做，重启后依然有效（只靠内存水位不够）
     let inserted = crate::messaging::inbox_store(&st.db, &msg).await?;
     if !inserted {
-        match crate::messaging::inbox_state(&st.db, &serial, req.seq).await? {
+        match crate::messaging::inbox_state(&st.db, &serial, seq).await? {
             Some(row) if row.processed_at.is_some() => {
-                return Ok(Json(MessageReply {
+                return Ok(MessageReply {
                     status: "duplicate".into(),
-                    seq: req.seq,
+                    seq,
                     duplicate: true,
-                }));
+                });
             }
             Some(_) if st.dispatcher.is_in_flight(&msg.key()) => {
-                return Ok(Json(MessageReply {
+                return Ok(MessageReply {
                     status: "in_flight".into(),
-                    seq: req.seq,
+                    seq,
                     duplicate: true,
-                }));
+                });
             }
             // 其余情况 = 上次处理失败（或进程重启中断）：落到下面自愈重投
             _ => tracing::warn!(
                 serial = %serial,
-                seq = req.seq,
-                kind = %req.kind,
+                seq,
+                kind = %kind,
                 "未处理成功的消息重新投递"
             ),
         }
@@ -859,30 +874,30 @@ pub async fn receive_message(
 
     // 2) 会话层：登记未知会话（还没 confirm 过 / 重启后），并记一次活动
     if st.sessions.last_seen_seq(&serial).is_none() {
-        st.sessions.upsert(&serial, &slot, SessionState::Online, req.seq - 1);
+        st.sessions.upsert(&serial, &slot, SessionState::Online, seq - 1);
     }
     st.sessions.mark_seen(&serial).await;
 
-    // 3) 业务分发。失败 → 记原因、不推水位、回 5xx 让客户端重发
+    // 3) 业务分发。失败 → 记原因、不推水位、让调用方返回 5xx 促使客户端重发
     let (status, note) = match st.dispatcher.dispatch(msg).await {
         Ok(Dispatch::Processed) => ("ok", None),
         Ok(Dispatch::NoHandler) => ("no_handler", Some("no handler subscribed for this kind")),
         Err(e) => {
-            crate::messaging::inbox_mark_failed(&st.db, &serial, req.seq, &e.to_string()).await?;
+            crate::messaging::inbox_mark_failed(&st.db, &serial, seq, &e.to_string()).await?;
             return Err(e);
         }
     };
 
-    crate::messaging::inbox_mark_processed(&st.db, &serial, req.seq, note).await?;
+    crate::messaging::inbox_mark_processed(&st.db, &serial, seq, note).await?;
     // 处理成功才推水位：失败的消息必须能被客户端重发覆盖到
-    crate::messaging::bump_watermark(&st.db, &serial, &slot, req.seq).await?;
-    let _ = st.sessions.observe(&serial, req.seq);
+    crate::messaging::bump_watermark(&st.db, &serial, &slot, seq).await?;
+    let _ = st.sessions.observe(&serial, seq);
 
-    Ok(Json(MessageReply {
+    Ok(MessageReply {
         status: status.into(),
-        seq: req.seq,
+        seq,
         duplicate: false,
-    }))
+    })
 }
 
 // ---------------- /messages/downlink（服务端 → 设备） ----------------
@@ -1056,6 +1071,7 @@ pub fn enroll_router(st: AppState) -> Router {
 pub fn mtls_router(st: AppState) -> Router {
     Router::new()
         .route("/enroll/confirm", post(confirm))
+        .route("/channel", get(crate::channel::channel_upgrade))
         .route("/messages", post(receive_message))
         .route("/messages/downlink", get(downlink_pull))
         .route("/messages/downlink/ack", post(downlink_ack))

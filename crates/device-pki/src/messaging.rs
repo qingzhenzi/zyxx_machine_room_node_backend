@@ -337,6 +337,45 @@ pub async fn bump_watermark(
 /// 单台设备**未 ACK** 的下行消息上限：达到后拒绝继续投递（背压）。
 pub const MAX_UNACKED_DOWNLINK: i64 = 1000;
 
+/// 进程内「该设备有新下行消息」的通知器。
+///
+/// 长连接（WebSocket 隧道）用它做到达即推，而不是每秒轮询数据库。
+///
+/// 两点说明：
+/// - 这是**进程内**的；多进程部署时另一进程的投递不会唤醒本进程，
+///   所以长连接侧仍保留一个低频兜底轮询
+/// - `notify_waiters` 只唤醒"此刻正在等"的连接；正在处理消息时的投递会漏掉，
+///   因此长连接在每处理完一条后都会再拉一次队列
+#[derive(Debug, Default)]
+pub struct Notifier {
+    waiters: dashmap::DashMap<String, std::sync::Arc<tokio::sync::Notify>>,
+}
+
+impl Notifier {
+    /// 取（或创建）某台设备的通知句柄。
+    pub fn waiter(&self, serial: &str) -> std::sync::Arc<tokio::sync::Notify> {
+        self.waiters
+            .entry(serial.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// 唤醒该设备当前正在等待的长连接。
+    pub fn notify(&self, serial: &str) {
+        if let Some(w) = self.waiters.get(serial) {
+            w.notify_waiters();
+        }
+    }
+}
+
+static GLOBAL_NOTIFIER: std::sync::LazyLock<Notifier> =
+    std::sync::LazyLock::new(Notifier::default);
+
+/// 进程级通知器（`downlink_publish*` 投递成功后会自动用它唤醒长连接）。
+pub fn notifier() -> &'static Notifier {
+    &GLOBAL_NOTIFIER
+}
+
 /// 一次下行投递。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DownlinkMessage {
@@ -367,6 +406,8 @@ pub fn validate_payload(payload: &str, max: usize) -> Result<()> {
 ///
 /// 背压：单台设备未 ACK 的消息超过 [`MAX_UNACKED_DOWNLINK`] 时报错，
 /// 而不是无限堆积 —— 设备失联时业务方必须感知，而不是把库写爆。
+///
+/// 投递成功会顺手唤醒该设备的长连接（见 [`notifier`]），实现到达即推。
 pub async fn downlink_publish(
     pool: &PgPool,
     serial: &str,
@@ -398,6 +439,7 @@ pub async fn downlink_publish(
     .bind(payload)
     .fetch_one(pool)
     .await?;
+    notifier().notify(serial);
     Ok(id)
 }
 

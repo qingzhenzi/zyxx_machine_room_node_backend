@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use qe_device_pki_client::channel;
 use qe_device_pki_client::creds::{CredIssue, Credentials};
 use qe_device_pki_client::downlink;
 use qe_device_pki_client::enroll::{self, EnrollOptions, EnrollOutcome};
@@ -52,6 +53,8 @@ enum Cmd {
     },
     /// 用正式证书完成 mTLS 回连确认（通讯真正打通）
     Confirm,
+    /// 建立 WebSocket 隧道：**建连即完成注册激活**，之后双向消息走这一条连接
+    Channel,
     /// 续跑一次被中断的 approval 注册（用落盘的 pending 状态，不需要原链接）
     Poll {
         /// 最长等待管理员批准的时间（秒）
@@ -145,6 +148,33 @@ async fn main() -> Result<()> {
             println!("  status : {}", reply.status);
             println!("  serial : {}", reply.serial);
             println!("  mtls   : {}", reply.mtls);
+        }
+        Cmd::Channel => {
+            let cfg = load_transport(&data_dir, cli.slot.as_deref())?;
+            let outbox = Arc::new(OutboxQueue::open(&data_dir.join("outbox"))?);
+            let dispatcher = Arc::new(downlink::Dispatcher::new());
+            dispatcher.subscribe_all(|m: transport::DownlinkMessage| async move {
+                println!("▼ 收到下行消息 id={} kind={} payload={}", m.id, m.kind, m.payload);
+                Ok(())
+            });
+            let state_file = data_dir.join(format!("downlink-{}.json", cfg.creds.device_slot));
+
+            println!("→ 建立 mTLS WebSocket 隧道 {} ...", cfg.mtls_endpoint);
+            // 建连即注册激活：拿到 ready 帧说明服务端已把 enrollment 推到 active
+            let (ws, ready) = channel::open(&cfg).await?;
+            println!("✓ 隧道已建立，注册已激活（不再需要单独 confirm）");
+            println!("  serial : {}", ready.serial);
+            println!("  status : {}", ready.status);
+            println!("  心跳后保持长连接，Ctrl-C 结束");
+
+            // 在这条连接上跑会话（上行重放 + 下行接收）
+            tokio::spawn(async move {
+                if let Err(e) = channel::run_on(ws, &outbox, &dispatcher, &state_file).await {
+                    tracing::warn!(error = %e, "隧道会话结束");
+                }
+            });
+            tokio::signal::ctrl_c().await.context("等待 Ctrl-C")?;
+            println!("✓ 已断开");
         }
         Cmd::Poll { wait_secs } => {
             let slot = match cli.slot.clone() {

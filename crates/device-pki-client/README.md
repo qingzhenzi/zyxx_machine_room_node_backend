@@ -16,7 +16,10 @@ qe-device-pki-client enroll "https://...&token=T&slot=S" --trust --wait
 # 1b. 等待审批期间中断/超时后续跑（私钥与 enroll_id 已落盘，不需要原链接）
 qe-device-pki-client poll --slot S --wait-secs 300
 
-# 2. mTLS 回连确认 —— 这一步成功才算通讯打通
+# 2. 建立 WebSocket 隧道（**建连即完成注册激活**，双向消息走这一条连接）
+qe-device-pki-client channel
+
+# 2b. 或者走 HTTP 兜底：mTLS 回连确认
 qe-device-pki-client confirm
 
 # 3. 心跳 + 防抖重连演示
@@ -95,5 +98,5 @@ handler 必须**幂等**（服务端是至少一次，处理失败会重投）�
 ## 测试
 
 ```bash
-cargo test -p qe-device-pki-client   # 51 passed（47 单元 + 4 跨 crate 契约）
+cargo test -p qe-device-pki-client   # 53 passed（49 单元 + 4 跨 crate 契约）
 ```
