@@ -43,7 +43,8 @@ x-api-environment: &api-environment
   OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-qestudio-backend}
   OTEL_LOGS_ENABLED: ${OTEL_LOGS_ENABLED:-false}
   # ---- 对象存储（S3 兼容；留空则资源/镜像接口返回 503）----
-  S3_ENDPOINT: ${S3_ENDPOINT:-}
+  # 容器内访问 RustFS 用服务名（本地 cargo run 时 .env 里用 127.0.0.1）；未设置则禁用存储模块。
+  S3_ENDPOINT: ${S3_ENDPOINT_DOCKER:-}
   S3_REGION: ${S3_REGION:-us-east-1}
   S3_BUCKET: ${S3_BUCKET:-}
   S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}

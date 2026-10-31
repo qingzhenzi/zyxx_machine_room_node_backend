@@ -545,15 +545,25 @@ device:read    device:manage
 本地起 RustFS（compose profile `storage`）：
 
 ```bash
-docker compose --profile storage up -d rustfs   # 9000 = S3，9001 = 控制台
-# .env
+docker compose --profile storage up -d rustfs
+# 9000 = S3 API；9001 = 控制台（路径 http://127.0.0.1:9001/rustfs/console/）
+# 默认开发凭证 rustfsadmin / rustfsadmin，生产务必改成强凭证（多节点还需 RUSTFS_RPC_SECRET）
+# 首次需要建桶：控制台登录后创建 bucket，名称与 S3_BUCKET 一致（默认 qestudio）
+# 数据持久化在 docker volume qestudio_rustfsdata
+
+# .env（本地 cargo run）
 S3_ENDPOINT=http://127.0.0.1:9000
 S3_BUCKET=qestudio
 S3_ACCESS_KEY=rustfsadmin
 S3_SECRET_KEY=rustfsadmin
-# 开发可以把 Ed25519 种子固定下来，重启后已签 manifest 仍可验签：
+# 固定 Ed25519 种子，重启后已签 manifest 仍可验签（qe-api 与 device-pki 必须一致）：
 # STORAGE_SIGNING_KEY_BASE64=$(head -c 32 /dev/urandom | base64)
+
+# 若 API 本身跑在 compose 里，容器内要访问服务名：
+# S3_ENDPOINT_DOCKER=http://rustfs:9000
 ```
+
+设备端（`qe-device-pki`）不读 `.env`，需直接 export 同一套 `S3_*` 与 `STORAGE_SIGNING_KEY_BASE64`。
 
 进程内集成测试用 fake S3（axum + 内存 map）覆盖上传/验证/发布链路，不依赖真实 RustFS。
 
