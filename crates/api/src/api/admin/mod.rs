@@ -127,6 +127,21 @@ pub fn router() -> Router<AppState> {
         )
 }
 
+/// 反序列化 `Option<Option<T>>`：区分“字段缺失”（`None`）与显式 `null`（`Some(None)`）。
+///
+/// serde 默认会把显式 `null` 也解析成外层 `None`，导致 PATCH 的“清空”语义失效；
+/// 所有可空 PATCH 字段都应使用 `#[serde(default, deserialize_with = "deserialize_nullable")]`。
+pub(super) fn deserialize_nullable<'de, T, D>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

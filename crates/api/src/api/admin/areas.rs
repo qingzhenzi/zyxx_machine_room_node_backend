@@ -3,10 +3,11 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
+use super::deserialize_nullable;
 use crate::{
     api::extractors::{ApiJson, AuthUser, ClientIp},
     auth::authorization,
@@ -61,12 +62,12 @@ pub struct UpdateAreaRequest {
     #[serde(default)]
     pub description: Option<String>,
     /// 缺失 = 不修改；`null` = 清空上级区域。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable")]
     pub parent_id: Option<Option<Uuid>>,
     #[serde(default)]
     pub is_active: Option<bool>,
     /// 缺失 = 不修改；`null` = 重置为 `{}`。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable")]
     pub metadata: Option<Option<Value>>,
     /// 缺失 = 不修改；变更成功后自动重建该区域未来的排课实例。
     #[serde(default)]
@@ -77,18 +78,6 @@ pub struct UpdateAreaRequest {
 }
 
 /// 区分「字段缺失」与显式 `null`。
-///
-/// 直接用 `Option<Option<T>>` 时 serde 会把 `null` 反序列化成外层的 `None`，
-/// 与字段缺失无法区分；这里在字段存在时强制返回 `Some(...)`，让
-/// `Some(None)` 表示「显式清空」。
-fn deserialize_nullable<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-where
-    T: Deserialize<'de>,
-    D: Deserializer<'de>,
-{
-    Option::<T>::deserialize(deserializer).map(Some)
-}
-
 /// 区域/房间名称没有独立的领域校验函数，这里做与其它名称字段一致的长度约束。
 pub(super) fn normalize_name(raw: &str, label: &str) -> AppResult<String> {
     let name = raw.trim().to_owned();

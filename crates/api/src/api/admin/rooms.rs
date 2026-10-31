@@ -64,15 +64,15 @@ pub struct UpdateRoomRequest {
     #[serde(default)]
     pub capacity: Option<i32>,
     /// 缺失 = 不修改；`null` = 清空（解除设备槽位绑定）。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::deserialize_nullable")]
     pub device_slot: Option<Option<String>>,
     /// 缺失 = 不修改；`null` = 清空。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::deserialize_nullable")]
     pub webhook_url: Option<Option<String>>,
     #[serde(default)]
     pub is_active: Option<bool>,
     /// 缺失 = 不修改；`null` = 重置为 `{}`。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::deserialize_nullable")]
     pub metadata: Option<Option<Value>>,
 }
 
@@ -293,4 +293,40 @@ pub async fn delete(
     .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// serde 默认会把显式 `null` 解析成外层 `None`；可空 PATCH 字段必须用
+    /// `deserialize_nullable` 区分「缺失」与「显式 null」。
+    #[test]
+    fn update_room_request_distinguishes_missing_and_null() {
+        let missing: UpdateRoomRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(missing.device_slot.is_none());
+        assert!(missing.webhook_url.is_none());
+        assert!(missing.metadata.is_none());
+
+        let cleared: UpdateRoomRequest = serde_json::from_value(serde_json::json!({
+            "device_slot": null,
+            "webhook_url": null,
+            "metadata": null
+        }))
+        .unwrap();
+        assert_eq!(cleared.device_slot, Some(None));
+        assert_eq!(cleared.webhook_url, Some(None));
+        assert_eq!(cleared.metadata, Some(None));
+
+        let set: UpdateRoomRequest = serde_json::from_value(serde_json::json!({
+            "device_slot": "node-1",
+            "webhook_url": "https://hooks.example/x"
+        }))
+        .unwrap();
+        assert_eq!(set.device_slot, Some(Some("node-1".into())));
+        assert_eq!(
+            set.webhook_url,
+            Some(Some("https://hooks.example/x".into()))
+        );
+    }
 }
