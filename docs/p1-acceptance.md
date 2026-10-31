@@ -134,6 +134,7 @@ psql "$DATABASE_URL" -c "SELECT image_id,room_id,rollout_state FROM image_assign
 | plain LXC（Incus 未安装） | ✅ 自动退回 rootfs tar 解包，目录结构正确 |
 | VM / libvirt | ✅ `vol-create-as` + `vol-upload` 到 pool `default` |
 | 状态回写 | ✅ `transfers.status=completed`（progress 100）、`image_assignments.rollout_state=deployed` |
+| 管理端上传 Linux LXC 镜像 → agent 接入 → 下发 → 导入并**启动** | ✅ Debian 12 rootfs（75MiB/5 分片）→ Incus 容器 `debian12-lxc` RUNNING，`incus exec` 读到 `/etc/os-release`；`/admin/devices` 可见接入客户端 |
 | Incus 真实导入 | ✅ 安装 Incus 7.5.1 后导入成功（alias `incus-e2e`，CONTAINER/0.02MiB） |
 | 跨机网络 / systemd 部署 | ❌ 本机同机 127.0.0.1，未覆盖防火墙/证书域名/服务权限 |
 
@@ -147,4 +148,7 @@ psql "$DATABASE_URL" -c "SELECT image_id,room_id,rollout_state FROM image_assign
    `incus image import --alias <name> --reuse <metadata.tar> <rootfs.tar>`；
    注意不能写成 `alias=<name>`（会被当成 image property，而不是 alias）。
 
-结论：**P1 主链路（含 Incus）已可在本地完整验证通过**；跨机部署/防火墙/证书域名需现场验证。
+结论：**P1 主链路（含 Incus 导入 + 启动）已可在本地完整验证通过**；跨机部署/防火墙/证书域名需现场验证。
+
+Incus 主机要求（本机踩坑）：`newuidmap`/`newgidmap` 需 setuid；`/etc/subuid`、`/etc/subgid`
+需为 `root` 提供 ≥65536 范围；运行 agent 的用户需在 `incus-admin` 组。

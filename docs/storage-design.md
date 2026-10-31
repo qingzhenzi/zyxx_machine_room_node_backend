@@ -745,7 +745,8 @@ pub trait TopologyImporter: Send + Sync {
   - Docker `docker_archive`：`{docker_bin} load -i <artifact_path>`；`oci_layout`：`{ctr_bin} images import <artifact_path>`；
   - Incus `tar`：先在 staging 合成最小 `metadata.yaml` 并打包为 `metadata.tar`，再
     `{incus_bin} image import --alias <imported_name> --reuse <metadata.tar> <artifact_path>`
-    （Incus 不支持把纯 rootfs tar 直接单文件导入）；若 `incus_bin` 为空/不存在则 plain LXC 兜底：
+    （Incus 不支持把纯 rootfs tar 直接单文件导入）；`LXC_AUTO_START=true` 时继续
+    `{incus_bin} launch <alias> <instance>`（已存在则 restart）；若 `incus_bin` 为空/不存在则 plain LXC 兜底：
     解包 tar 到 `{lxc_rootfs_dir}/<name>/rootfs`（先 staging 解包再原子 rename）；
   - VM `qcow2`/`raw`：`{virsh_bin} vol-create-as <pool> <vol> <size>` + `vol-upload <vol> <artifact_path> --pool <pool>`；
     pool 名从 env `LIBVIRT_POOL`（默认 `default`），卷名 `<name>-<version>`。
@@ -757,6 +758,10 @@ pub trait TopologyImporter: Send + Sync {
   - manifest 验签/伪签名拒绝、chunk 校验、cache LRU、config 解析；
   - 用 `PresignClient` mock + 内存 S3/文件 URL 或 trait mock 测 pull；
   - importer 用临时 fake 可执行脚本（`tempfile`）断言命令参数与 staging 布局；plain LXC 解包测试用临时目录。
+
+> Incus 主机前置：安装并 `incus admin init`，`newuidmap/newgidmap` 需 setuid，
+> `/etc/subuid`、`/etc/subgid` 需为 `root` 提供 ≥65536 的 UID/GID 范围，
+> 运行 agent 的用户需在 `incus-admin` 组（否则 `incus launch` 会报 idmap 配置错误）。
 
 ### 16.5 配置（agent）
 
@@ -770,6 +775,7 @@ pub trait TopologyImporter: Send + Sync {
 | `DOWNLOAD_CONCURRENCY` | `4` | 并发分片 |
 | `DOCKER_BIN` / `CTR_BIN` / `INCUS_BIN` / `VIRSH_BIN` | 对应命令名 | 可指向 mock 脚本 |
 | `LIBVIRT_URI` | `qemu:///system` | libvirt 连接 URI |
+| `LXC_AUTO_START` | `false` | Incus 导入成功后是否自动启动实例 |
 | `LIBVIRT_POOL` | `default` | libvirt storage pool |
 | `LXC_ROOTFS_DIR` | `/var/lib/lxc` | plain LXC 根目录 |
 

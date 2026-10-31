@@ -67,9 +67,10 @@ impl ImporterSet {
     pub fn builtin(config: &AgentConfig) -> Self {
         Self::new(vec![
             Arc::new(DockerImporter::new(&config.docker_bin, &config.ctr_bin)),
-            Arc::new(IncusImporter::new(
+            Arc::new(IncusImporter::with_auto_start(
                 &config.incus_bin,
                 &config.lxc_rootfs_dir,
+                config.lxc_auto_start,
             )),
             Arc::new(VmImporter::with_uri(
                 &config.virsh_bin,
@@ -160,6 +161,7 @@ mod tests {
             libvirt_uri: "qemu:///system".into(),
             libvirt_pool: "default".into(),
             lxc_rootfs_dir: PathBuf::from("/var/lib/lxc"),
+            lxc_auto_start: false,
         }
     }
 

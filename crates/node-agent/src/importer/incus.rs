@@ -27,14 +27,25 @@ const MAX_ERROR_OUTPUT: usize = 2048;
 pub struct IncusImporter {
     incus_bin: String,
     lxc_rootfs_dir: PathBuf,
+    auto_start: bool,
 }
 
 impl IncusImporter {
     /// `incus_bin` 可为空或不存在（此时直接走 plain LXC）；`lxc_rootfs_dir` 默认 `/var/lib/lxc`。
     pub fn new(incus_bin: impl AsRef<str>, lxc_rootfs_dir: impl AsRef<Path>) -> Self {
+        Self::with_auto_start(incus_bin, lxc_rootfs_dir, false)
+    }
+
+    /// 同 [`Self::new`]，并控制导入成功后是否 `incus launch` 启动实例。
+    pub fn with_auto_start(
+        incus_bin: impl AsRef<str>,
+        lxc_rootfs_dir: impl AsRef<Path>,
+        auto_start: bool,
+    ) -> Self {
         Self {
             incus_bin: incus_bin.as_ref().trim().to_owned(),
             lxc_rootfs_dir: lxc_rootfs_dir.as_ref().to_path_buf(),
+            auto_start,
         }
     }
 
@@ -51,6 +62,7 @@ impl IncusImporter {
         if name.is_empty() {
             bail!("LXC 导入缺少 imported_name");
         }
+        validate_container_name(name)?;
 
         if let Some(result) = self.try_incus(request, name).await? {
             return Ok(result);
@@ -93,6 +105,9 @@ impl IncusImporter {
         };
 
         if output.status.success() {
+            if self.auto_start {
+                self.launch_instance(name, name).await?;
+            }
             return Ok(Some(ImportResult {
                 imported_ref: format!("incus:{name}"),
             }));
@@ -108,6 +123,39 @@ impl IncusImporter {
             return Ok(None);
         }
 
+        Err(command_failure(bin, &output))
+    }
+
+    /// 导入成功后启动容器；已存在则 restart（幂等）。
+    async fn launch_instance(&self, alias: &str, instance: &str) -> Result<()> {
+        let bin = self.incus_bin.as_str();
+        let output = Command::new(bin)
+            .arg("launch")
+            .arg(alias)
+            .arg(instance)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("无法启动 `{bin} launch`"))?;
+        if output.status.success() {
+            tracing::info!(instance, alias, "Incus 实例已启动");
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        if stderr.contains("already exists") {
+            let restart = Command::new(bin)
+                .arg("restart")
+                .arg(instance)
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .with_context(|| format!("无法启动 `{bin} restart`"))?;
+            if restart.status.success() {
+                tracing::info!(instance, "Incus 实例已存在，已 restart");
+                return Ok(());
+            }
+            return Err(command_failure(bin, &restart));
+        }
         Err(command_failure(bin, &output))
     }
 

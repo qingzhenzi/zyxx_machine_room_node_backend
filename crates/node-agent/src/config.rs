@@ -43,6 +43,8 @@ pub struct AgentConfig {
     pub libvirt_pool: String,
     /// plain LXC 根目录。
     pub lxc_rootfs_dir: PathBuf,
+    /// Incus 导入成功后是否自动 `incus launch` 启动实例。
+    pub lxc_auto_start: bool,
 }
 
 impl AgentConfig {
@@ -105,6 +107,7 @@ impl AgentConfig {
             libvirt_uri: string_or(&get, "LIBVIRT_URI", "qemu:///system"),
             libvirt_pool: string_or(&get, "LIBVIRT_POOL", "default"),
             lxc_rootfs_dir: path_or(&get, "LXC_ROOTFS_DIR", "/var/lib/lxc"),
+            lxc_auto_start: bool_or(&get, "LXC_AUTO_START", false)?,
         })
     }
 }
@@ -124,6 +127,21 @@ where
     F: Fn(&str) -> Option<String>,
 {
     get(key).unwrap_or_else(|| default.to_owned())
+}
+
+fn bool_or<F>(get: &F, key: &str, default: bool) -> Result<bool>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(raw) = get(key) else {
+        return Ok(default);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(default),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => anyhow::bail!("{key} 不是合法布尔值: {other}"),
+    }
 }
 
 fn path_or<F>(get: &F, key: &str, default: &str) -> PathBuf
@@ -171,6 +189,7 @@ mod tests {
         assert_eq!(config.libvirt_uri, "qemu:///system");
         assert_eq!(config.libvirt_pool, "default");
         assert_eq!(config.lxc_rootfs_dir, PathBuf::from("/var/lib/lxc"));
+        assert!(!config.lxc_auto_start);
     }
 
     #[test]
@@ -187,6 +206,7 @@ mod tests {
             ("VIRSH_BIN", "/usr/bin/virsh"),
             ("LIBVIRT_POOL", "images"),
             ("LXC_ROOTFS_DIR", "/srv/lxc"),
+            ("LXC_AUTO_START", "true"),
         ]);
         let config = AgentConfig::from_lookup(lookup_from(&pairs)).unwrap();
 
@@ -201,6 +221,7 @@ mod tests {
         assert_eq!(config.virsh_bin, "/usr/bin/virsh");
         assert_eq!(config.libvirt_pool, "images");
         assert_eq!(config.lxc_rootfs_dir, PathBuf::from("/srv/lxc"));
+        assert!(config.lxc_auto_start);
     }
 
     #[test]

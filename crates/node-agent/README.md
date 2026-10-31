@@ -12,7 +12,8 @@ device-pki 消息只承载控制信令与状态。设计契约见
 4. 拉取 → Ed25519 验签 manifest → 逐 chunk 校验 sha256/size → 格式 magic；
 5. 按类型导入：
    - `docker_archive` → `docker load -i`；`oci_layout` → `ctr images import`
-   - `tar`（LXC）→ `incus image import`；无 Incus 时 plain LXC 解包到 `LXC_ROOTFS_DIR/<name>/rootfs`
+   - `tar`（LXC）→ 合成 metadata 后 `incus image import`；`LXC_AUTO_START=true` 时继续 `incus launch`；
+     无 Incus 时 plain LXC 解包到 `LXC_ROOTFS_DIR/<name>/rootfs`
    - `qcow2`/`raw`（虚拟机）→ `virsh vol-create-as` + `vol-upload` 到 `LIBVIRT_POOL`
 6. 上行 `transfer.progress` / `transfer.completed` 回写 `transfers` 与房间发布状态。
 
@@ -29,6 +30,7 @@ device-pki 消息只承载控制信令与状态。设计契约见
 | `DOCKER_BIN` / `CTR_BIN` / `INCUS_BIN` / `VIRSH_BIN` | 同名命令 | 可指向 mock 脚本 |
 | `LIBVIRT_URI` | `qemu:///system` | libvirt 连接 URI（非 root 必须显式，否则默认 session 连接找不到 pool） |
 | `LIBVIRT_POOL` | `default` | libvirt storage pool |
+| `LXC_AUTO_START` | `false` | Incus 导入成功后是否自动 `incus launch` 启动实例 |
 | `LXC_ROOTFS_DIR` | `/var/lib/lxc` | plain LXC rootfs 目录 |
 
 ## 运行
