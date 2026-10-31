@@ -1,6 +1,7 @@
 //! LXC / Incus 导入适配器（§16.4）。
 //!
-//! 优先使用 Incus：`{incus_bin} image import <artifact_path> alias=<imported_name>`；
+//! 优先使用 Incus：先为该 rootfs tar 生成最小 `metadata.yaml` 元数据包，再
+//! `{incus_bin} image import --alias <name> --reuse <metadata.tar> <artifact_path>`；
 //! 当 `incus_bin` 未配置、指向的文件不存在或命令返回 “not found” 时，退回 plain LXC：
 //! 用系统 `tar -xf` 把 rootfs 归档解包到 staging 目录，再原子 rename 到
 //! `{lxc_rootfs_dir}/<imported_name>/rootfs`，避免留下半成品。
@@ -69,11 +70,17 @@ impl IncusImporter {
         }
 
         let bin = self.incus_bin.as_str();
+        // Incus 需要 metadata tarball + rootfs tarball 两段式导入；rootfs 产物本身不带
+        // metadata.yaml，这里在 staging 内合成一个最小元数据包。
+        let metadata_tar = build_metadata_tarball(request, name).await?;
         let output = match Command::new(bin)
             .arg("image")
             .arg("import")
+            .arg("--alias")
+            .arg(name)
+            .arg("--reuse")
+            .arg(&metadata_tar)
             .arg(&request.artifact_path)
-            .arg(format!("alias={name}"))
             .stdin(Stdio::null())
             .output()
             .await
@@ -208,6 +215,58 @@ async fn extract_tar(artifact: &Path, destination: &Path) -> Result<()> {
         return Ok(());
     }
     Err(command_failure(bin, &output))
+}
+
+/// 为 rootfs tar 生成 Incus 需要的最小 metadata tarball。
+///
+/// Incus Image Store 的导入接口要求 `metadata.yaml`（至少 architecture/creation_date），
+/// 而我们的产物是纯 rootfs tar；这里在 `staging_dir` 内合成
+/// `incus-metadata/metadata.yaml` 并打包为 `incus-metadata.tar`。
+async fn build_metadata_tarball(request: &ImportRequest, name: &str) -> Result<PathBuf> {
+    let meta_dir = request.staging_dir.join("incus-metadata");
+    fs::create_dir_all(&meta_dir)
+        .await
+        .with_context(|| format!("无法创建 Incus metadata 目录 {}", meta_dir.display()))?;
+
+    // Incus 使用 Rust 的 arch 命名（x86_64 / aarch64）即可。
+    let arch = std::env::consts::ARCH;
+    let description = yaml_escape(&format!(
+        "{} {} (qe-node-agent)",
+        name,
+        if request.version.trim().is_empty() {
+            ""
+        } else {
+            request.version.trim()
+        }
+    ));
+    let metadata = format!(
+        "architecture: {arch}\ncreation_date: {}\nproperties:\n  description: \"{description}\"\n  os: \"linux\"\n",
+        chrono::Utc::now().timestamp()
+    );
+    let metadata_path = meta_dir.join("metadata.yaml");
+    fs::write(&metadata_path, metadata)
+        .await
+        .with_context(|| format!("写入 {} 失败", metadata_path.display()))?;
+
+    let metadata_tar = request.staging_dir.join("incus-metadata.tar");
+    let output = Command::new("tar")
+        .arg("-cf")
+        .arg(&metadata_tar)
+        .arg("-C")
+        .arg(&meta_dir)
+        .arg("metadata.yaml")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .with_context(|| "无法启动 `tar` 生成 Incus metadata tarball")?;
+    if !output.status.success() {
+        return Err(command_failure("tar", &output));
+    }
+    Ok(metadata_tar)
+}
+
+fn yaml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn command_failure(bin: &str, output: &std::process::Output) -> anyhow::Error {
@@ -354,15 +413,18 @@ mod tests {
         let result = import_with_retry(&importer, &import_request).await.unwrap();
 
         assert_eq!(result.imported_ref, "incus:web-1.0");
-        assert_eq!(
-            recorded_args(&script),
-            vec![
-                "image".to_owned(),
-                "import".to_owned(),
-                artifact.to_string_lossy().into_owned(),
-                "alias=web-1.0".to_owned(),
-            ]
+        let args = recorded_args(&script);
+        assert_eq!(args.len(), 7, "{args:?}");
+        assert_eq!(args[0], "image");
+        assert_eq!(args[1], "import");
+        assert_eq!(args[2], "--alias");
+        assert_eq!(args[3], "web-1.0");
+        assert_eq!(args[4], "--reuse");
+        assert!(
+            args[5].ends_with("incus-metadata.tar"),
+            "第五段应为 metadata tarball：{args:?}"
         );
+        assert_eq!(args[6], artifact.to_string_lossy());
         // 走 incus 时不应创建 plain LXC 目录
         assert!(!lxc_dir.exists());
     }

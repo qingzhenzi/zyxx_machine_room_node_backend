@@ -134,11 +134,17 @@ psql "$DATABASE_URL" -c "SELECT image_id,room_id,rollout_state FROM image_assign
 | plain LXC（Incus 未安装） | ✅ 自动退回 rootfs tar 解包，目录结构正确 |
 | VM / libvirt | ✅ `vol-create-as` + `vol-upload` 到 pool `default` |
 | 状态回写 | ✅ `transfers.status=completed`（progress 100）、`image_assignments.rollout_state=deployed` |
-| Incus 真实导入 | ❌ 本机未安装 Incus（已验证 plain LXC 兜底分支） |
+| Incus 真实导入 | ✅ 安装 Incus 7.5.1 后导入成功（alias `incus-e2e`，CONTAINER/0.02MiB） |
 | 跨机网络 / systemd 部署 | ❌ 本机同机 127.0.0.1，未覆盖防火墙/证书域名/服务权限 |
 
-联调中发现并修复：非 root 的 `virsh` 默认连接是 session 而非 `qemu:///system`，
-默认连接找不到 pool。已新增 agent 配置 **`LIBVIRT_URI`（默认 `qemu:///system`）**，
-`VirtualImporter` 会为 `vol-create-as`/`vol-upload` 前置 `--connect <uri>`。
+联调中发现并修复：
 
-结论：**P1 主链路可以在本地完整验证通过**；Incus 与跨机部署需到现场验证。
+1. 非 root 的 `virsh` 默认连接是 session 而非 `qemu:///system`，找不到 pool。
+   已新增 agent 配置 **`LIBVIRT_URI`（默认 `qemu:///system`）**，VM importer 前置 `--connect <uri>`。
+2. Incus Image Store 的导入接口要求 metadata tarball + rootfs tarball 两段式，
+   纯 rootfs tar 会报 `Metadata tarball is missing metadata.yaml`。Importer 现在会：
+   在 staging 内合成最小 `metadata.yaml`（architecture/creation_date/properties）→
+   `incus image import --alias <name> --reuse <metadata.tar> <rootfs.tar>`；
+   注意不能写成 `alias=<name>`（会被当成 image property，而不是 alias）。
+
+结论：**P1 主链路（含 Incus）已可在本地完整验证通过**；跨机部署/防火墙/证书域名需现场验证。

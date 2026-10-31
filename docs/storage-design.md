@@ -743,7 +743,9 @@ pub trait TopologyImporter: Send + Sync {
 
 - 导入实现（命令路径可配，便于测试 mock）：
   - Docker `docker_archive`：`{docker_bin} load -i <artifact_path>`；`oci_layout`：`{ctr_bin} images import <artifact_path>`；
-  - Incus `tar`：`{incus_bin} image import <artifact_path> alias=<imported_name>`；若 `incus_bin` 为空/不存在则 plain LXC 兜底：
+  - Incus `tar`：先在 staging 合成最小 `metadata.yaml` 并打包为 `metadata.tar`，再
+    `{incus_bin} image import --alias <imported_name> --reuse <metadata.tar> <artifact_path>`
+    （Incus 不支持把纯 rootfs tar 直接单文件导入）；若 `incus_bin` 为空/不存在则 plain LXC 兜底：
     解包 tar 到 `{lxc_rootfs_dir}/<name>/rootfs`（先 staging 解包再原子 rename）；
   - VM `qcow2`/`raw`：`{virsh_bin} vol-create-as <pool> <vol> <size>` + `vol-upload <vol> <artifact_path> --pool <pool>`；
     pool 名从 env `LIBVIRT_POOL`（默认 `default`），卷名 `<name>-<version>`。
