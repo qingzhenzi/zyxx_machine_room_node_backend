@@ -53,6 +53,12 @@ cargo test -p qe-device-pki --test enroll_flow -- --ignored --nocapture
 echo "Running device-PKI WebSocket channel tests against $TEST_DATABASE_URL"
 cargo test -p qe-device-pki --test ws_channel -- --ignored --nocapture
 
+echo "Running device-PKI resource presign tests against $TEST_DATABASE_URL"
+cargo test -p qe-device-pki --test resource_presign -- --ignored --nocapture
+
+echo "Running device-PKI transfer status tests against $TEST_DATABASE_URL"
+cargo test -p qe-device-pki --test transfer_flow -- --ignored --nocapture
+
 echo "Running device-PKI cross-process notify tests (redis-notify feature)"
 cargo test -p qe-device-pki --features redis-notify --lib -- notify_redis
 

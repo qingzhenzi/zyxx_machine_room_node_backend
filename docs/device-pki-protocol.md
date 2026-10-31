@@ -30,6 +30,9 @@
 
 ## 4. 端点（注册 listener，单向 TLS）
 
+> mTLS listener 上的 P1 新端点 `POST /resources/presign` 与两个上行 kind
+> （`transfer.progress` / `transfer.completed`）见 §9。
+
 ### POST /enroll/challenge
 
 请求：
@@ -351,3 +354,106 @@ CREATE INDEX device_message_inbox_unprocessed
 | `internal` | 服务端内部错误（500） |
 
 > `pending` **不是错误码**：challenge/enroll 轮询阶段它以 `{"status":"pending"}` 正常返回 200。
+
+## 9. 资源预签名与传输上报（P1）
+
+> 契约来源：`docs/storage-design.md` §16.1 / §16.2。
+> **大文件不走 device-pki 的消息通道**：设备用 mTLS 身份换对象存储的短期预签名 URL，
+> 直连 S3 下载分片；下载/校验/导入的结果再经上行消息回报。
+
+### POST /resources/presign（mTLS listener）
+
+请求：
+
+```json
+{ "manifest_digest": "<64hex>", "kind": "manifest|signature|chunk",
+  "index": 0, "count": 64 }
+```
+
+- `kind=manifest|signature`：返回一个固定键的 URL，`index`/`count` 忽略。
+- `kind=chunk`：从 `index`（缺省 0，负值按 0）起，按 `index` **升序**返回最多
+  `count` 个分片；`count` 缺省 64 并 clamp 到 **1..=64**。
+- `manifest_digest` 必须是 64 位十六进制（大小写均可，服务端统一转小写后拼键）。
+
+响应：
+
+```json
+{ "urls": [ { "key": "objects/<sha256>", "url": "https://…",
+              "expires_at": "2026-01-01T00:00:00Z" } ],
+  "public_key_base64": "<Ed25519 公钥>" }
+```
+
+- `expires_at` 为绝对时间（RFC3339），有效期取服务端 `STORAGE_PRESIGN_TTL_SECONDS`
+  （默认 900 秒，允许 60..=86400）。
+- `public_key_base64` 用于设备侧校验 manifest 签名；**私钥只在服务端**，绝不下发。
+- 对象键规则（与 P0 存储契约一致）：
+
+| kind | key |
+|---|---|
+| `manifest` | `manifests/{digest}.json` |
+| `signature` | `signatures/{digest}.sig` |
+| `chunk` | `objects/{image_chunks.sha256}` |
+
+**鉴权（fail-closed）**，身份只取 mTLS 证书 serial，不信任请求体：
+
+1. serial → `device_enrollment` 中 `status IN ('issued','active')` 的一行 → `device_slot`；
+   证书已吊销 / 未激活 → 拒绝；
+2. `device_slot` → `rooms.device_slot` → `room_id`；槽位未绑定房间 → 拒绝；
+3. `image_artifacts.manifest_digest = <digest>` 必须存在，且 `image_assignments`
+   中存在 `(image_id, room_id)`。
+
+任一步不满足都**拒绝**（不存在"查不到就放行"）。证书状态以数据库为准，
+即使 mTLS 握手缓存尚未刷新，吊销后的设备也拿不到新 URL。
+
+错误码（响应体同为 `{"code","message"}`）：
+
+| code | HTTP | 语义 |
+|---|---|---|
+| `bad_request` | 400 | `manifest_digest` 不是 64 位 hex，或 `kind`/`index`/`count` 非法 |
+| `unauthorized` | 401 | 客户端证书身份缺失（serial 取不到） |
+| `forbidden` | 403 | 证书不在 `issued`/`active`、槽位未绑定房间、镜像未分配到该房间 |
+| `not_found` | 404 | digest 对应的镜像不存在，或请求起始 index 之后没有分片 |
+| `storage_unavailable` | 503 | 服务端未配置对象存储（`S3_ENDPOINT`/`S3_BUCKET` 不同时存在）或初始化失败 |
+| `internal` | 500 | 数据库 / 预签名内部错误 |
+
+### 上行：`transfer.progress` / `transfer.completed`
+
+仍走 `POST /messages`（或 WebSocket 隧道的 `msg` 帧），身份取自证书 serial，
+`payload` 是 **JSON 字符串**（即外层消息的 `payload` 字段）。
+
+进度：
+
+```json
+{ "seq": 12, "kind": "transfer.progress",
+  "payload": "{\"transfer_id\":\"<uuid>\",\"phase\":\"download\",\"progress\":42,\"bytes_done\":1024,\"error\":null}" }
+```
+
+- `phase`：`download|verify|import`，未知值 → `bad_request`（handler 失败 → 5xx，
+  设备按至少一次语义重发，可据此尽早发现客户端 bug）。
+- `progress`：0..100，越界 clamp；`bytes_done` 目前只用于日志/审计。
+- 服务端：`UPDATE transfers SET status='running', progress=$2, error=NULL, updated_at=now()
+  WHERE id=$1`。
+
+完成：
+
+```json
+{ "seq": 13, "kind": "transfer.completed",
+  "payload": "{\"transfer_id\":\"<uuid>\",\"ok\":true,\"manifest_digest\":\"<64hex>\",
+              \"verified\":true,\"imported_ref\":\"docker:name:version\",\"error\":null}" }
+```
+
+- `ok=true`：`transfers.status='completed'`、`progress=100`、`error=NULL`，并把对应
+  `image_assignments.rollout_state` 置为 `deployed`；
+- `ok=false`：`transfers.status='failed'`、`error=<error>`（保留最后一次进度，不清零），
+  并把 `image_assignments.rollout_state` 置为 `failed`；
+- 两条更新在同一事务里；assignment 用 transfer 自身的 `(room_id, image_id)` 定位，
+  不信任请求体里的房间/镜像字段。
+- **幂等**：同一 payload 重放结果一致。`transfer_id` 在 `transfers` 里不存在时记
+  `warn` 并按 no-op 返回 2xx —— 让设备为一条已被清理的 transfer 无限重发只会卡死
+  它自己的 outbox。
+- 归属：`transfer_id` 由下行 `image.pull` 投递给该设备（UUID 不可猜），即本次上报的
+  能力凭证；服务端只按 id 更新，与 §16.1 的 SQL 保持一致。
+
+错误语义与其它上行消息一致（见 §6）：bad JSON / 未知 `phase` → handler 失败 →
+`5xx` 且**不推水位**，设备按至少一次重发；重复 `seq` 走收件箱去重返回
+`{"status":"duplicate"}`；DB 更新失败同样 5xx 重试。

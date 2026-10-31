@@ -359,6 +359,41 @@ async fn image_upload_verify_publish_and_assign_flow() {
         .expect("manifest in fake s3");
     assert_eq!(downloaded.as_ref(), stored_manifest.as_slice());
 
+    // 房间绑定设备槽位 + 插入 active 注册与在线会话：分配后应写入 image.pull 下行。
+    let device_slot = format!("slot-{suffix}");
+    let device_serial = format!("serial-{suffix}");
+    let (status, bound) = send_json(
+        &app,
+        "PUT",
+        &format!("/api/v1/admin/rooms/{room_id}/device"),
+        Some(&admin_token),
+        Some(json!({ "device_slot": device_slot })),
+    )
+    .await;
+    assert_eq!(status, 200, "{bound}");
+    assert_eq!(bound["device_slot"], device_slot, "{bound}");
+    sqlx::query(
+        "INSERT INTO device_enrollment
+            (serial, device_slot, subject_cn, csr_sha256, cert_pem, status, activated_at)
+         VALUES ($1, $2, $3, $4, $5, 'active', now())",
+    )
+    .bind(&device_serial)
+    .bind(&device_slot)
+    .bind(format!("cn-{suffix}"))
+    .bind(vec![0u8; 32])
+    .bind("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----")
+    .execute(state.db.pool())
+    .await
+    .expect("insert active device enrollment");
+    sqlx::query(
+        "INSERT INTO device_session (serial, device_slot, state) VALUES ($1, $2, 'online')",
+    )
+    .bind(&device_serial)
+    .bind(&device_slot)
+    .execute(state.db.pool())
+    .await
+    .expect("insert online device session");
+
     // 分配到房间 → 产生 transfer
     let (status, assignment) = send_json(
         &app,
@@ -380,6 +415,37 @@ async fn image_upload_verify_publish_and_assign_flow() {
     assert_eq!(status, 200, "{transfers}");
     assert_eq!(transfers["total"], 1, "{transfers}");
     assert_eq!(transfers["items"][0]["direction"], "download");
+
+    // 分配后应投递 image.pull（§16.1 字段）到设备的 device_downlink。
+    let (downlink_kind, downlink_payload): (String, String) = sqlx::query_as(
+        "SELECT kind, payload FROM device_downlink
+         WHERE serial = $1
+         ORDER BY id DESC
+         LIMIT 1",
+    )
+    .bind(&device_serial)
+    .fetch_one(state.db.pool())
+    .await
+    .expect("image.pull downlink row");
+    assert_eq!(downlink_kind, "image.pull");
+    let payload: Value = serde_json::from_str(&downlink_payload).expect("image.pull payload json");
+    assert_eq!(
+        payload["transfer_id"], transfers["items"][0]["id"],
+        "{payload}"
+    );
+    assert_eq!(payload["image_id"], image_id, "{payload}");
+    assert_eq!(payload["name"], "win11-base", "{payload}");
+    assert_eq!(payload["version"], "2026.10.31-1", "{payload}");
+    assert_eq!(payload["kind"], "vm_disk", "{payload}");
+    assert_eq!(payload["format"], "qcow2", "{payload}");
+    assert_eq!(payload["platform"], "linux/amd64", "{payload}");
+    assert_eq!(payload["manifest_digest"], manifest_digest, "{payload}");
+    assert_eq!(payload["total_size"], total_size, "{payload}");
+    assert_eq!(payload["chunk_count"], 2, "{payload}");
+    assert_eq!(
+        payload["presign_endpoint"], "/resources/presign",
+        "{payload}"
+    );
 
     // 负例：未验证即可发布 → 非 2xx（400/409）
     let (status, second) = send_json(
@@ -459,6 +525,18 @@ async fn image_upload_verify_publish_and_assign_flow() {
             .execute(state.db.pool())
             .await
             .expect("cleanup storage table");
+    }
+    // 清理设备行（外键顺序：下行 → 会话 → 注册）。
+    for statement in [
+        "DELETE FROM device_downlink WHERE serial = $1",
+        "DELETE FROM device_session WHERE serial = $1",
+        "DELETE FROM device_enrollment WHERE serial = $1",
+    ] {
+        sqlx::query(statement)
+            .bind(&device_serial)
+            .execute(state.db.pool())
+            .await
+            .expect("cleanup device rows");
     }
     for room in [&room_id] {
         let (status, _) = send_json(

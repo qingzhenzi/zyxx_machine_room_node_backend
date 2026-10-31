@@ -30,6 +30,12 @@ pub enum Error {
     AlreadyDownloaded,
     #[error("unauthorized")]
     Unauthorized,
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+    #[error("资源不存在")]
+    NotFound,
+    #[error("对象存储未配置或不可用")]
+    StorageUnavailable,
     #[error("请求过于频繁，请 {0}s 后再试")]
     RateLimited(u64),
     #[error("该设备未 ACK 的下行消息已达 {0} 条，暂停投递（背压）")]
@@ -61,6 +67,9 @@ impl Error {
             Error::EnrollmentNotFound => "enrollment_not_found",
             Error::AlreadyDownloaded => "already_downloaded",
             Error::Unauthorized => "unauthorized",
+            Error::Forbidden(_) => "forbidden",
+            Error::NotFound => "not_found",
+            Error::StorageUnavailable => "storage_unavailable",
             Error::RateLimited(_) => "rate_limited",
             Error::DownlinkFull(_) => "downlink_full",
             Error::BadRequest(_) => "bad_request",
@@ -83,6 +92,10 @@ impl Error {
             Error::EnrollmentNotFound => StatusCode::NOT_FOUND,
             Error::AlreadyDownloaded => StatusCode::GONE,
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
+            Error::Forbidden(_) => StatusCode::FORBIDDEN,
+            Error::NotFound => StatusCode::NOT_FOUND,
+            // 预签名依赖外部对象存储：没配置时不掩盖，让客户端按可重试处理
+            Error::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Error::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
             // 背压：让客户端稍后重试（拉取侧收到它就知道该等了）
             Error::DownlinkFull(_) => StatusCode::SERVICE_UNAVAILABLE,

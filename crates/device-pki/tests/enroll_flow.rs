@@ -78,6 +78,8 @@ async fn setup_with_limit(admin_limit: u32) -> Option<(AppState, Router, Router)
         )),
         mtls_endpoint: Arc::from("https://mtls.integration.test:4441"),
         enroll_endpoint: Arc::from("https://enroll.integration.test:4440"),
+        // 预签名端点未配置 S3：本测试不覆盖对象存储
+        storage: None,
     };
     Some((
         state.clone(),

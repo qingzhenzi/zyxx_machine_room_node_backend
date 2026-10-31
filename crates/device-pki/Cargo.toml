@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+qe-storage = { path = "../storage" }
 axum = { version = "0.8", features = ["ws"] }
 # 跨进程下行通知（可选特性）：单进程部署不必连 Redis
 redis = { version = "1.5", optional = true, default-features = false, features = [

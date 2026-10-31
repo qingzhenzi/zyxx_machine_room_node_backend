@@ -671,13 +671,22 @@ image:read      image:manage
 - `admin` 角色自动拥有全部权限；`viewer` / `editor` 默认只有 `storage:read` 与 `image:read`。
 - 审计动作：`storage.object.register`、`image.create` / `verify` / `publish` / `assign` / `unassign`、`transfer.retry`。
 
-### P1 说明
+### P1（已实现）
 
-- 节点侧 agent（独立 Rust 二进制）：拉 manifest → 验签 → 逐 chunk 校验 → 按 kind 导入
-  （`docker load` / `ctr images import`、LXC/Incus rootfs、`qemu-img` + libvirt），上报 `transfer.completed`；
-  与课表事件联动（上课前分发）。
-- zstd/gzip 压缩与解压校验、chunk 复用/增量更新、S3 Event 通知兜底、收集上传（`collections`）、
-  配额/保留期/GC、`transfers`/`collections` 的状态过滤、只读 Registry（Zot facade）、Trivy 安全扫描。
+- 节点 agent（独立 crate `crates/node-agent`）：复用 **device-pki 认证服务端 + 客户端**
+  （`qe-device-pki-client` 的证书/mTLS/上下行），不新增认证体系；大文件仍走 S3 预签名直连。
+- device-pki 新增 mTLS 端点 `POST /resources/presign`（按设备证书身份签发 manifest/分片/签名 URL），
+  以及上行 kind `transfer.progress` / `transfer.completed`（回写 `transfers` 与房间发布状态）。
+- 房间分配镜像后，qe-api 向该房间设备投递 `image.pull` 信令；agent 拉取 → Ed25519 验签 →
+  chunk 校验 → 导入 → 上报，支持：
+  - Docker/OCI：`docker load` / `ctr images import`；
+  - LXC/Incus：`incus image import`，plain LXC 解包 rootfs；
+  - VM：`virsh vol-create-as/vol-upload` 到 libvirt storage pool。
+- 详见 [`docs/storage-design.md`](docs/storage-design.md) §15–§16 与
+  [`crates/node-agent/README.md`](crates/node-agent/README.md)。
+
+P2 待做：zstd/gzip 压缩与解压校验、chunk 复用/增量、S3 Event 兜底、收集上传、配额/保留期/GC、
+`transfers`/`collections` 状态过滤、只读 Registry（Zot facade）、Trivy 扫描、真实 RustFS/Incus/libvirt 环境联调。
 
 ## 请求追踪与日志
 

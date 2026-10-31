@@ -229,6 +229,8 @@ async fn ws_channel_connects_and_activates_enrollment() {
         )),
         mtls_endpoint: Arc::from("https://localhost:1"), // 测试里不用它
         enroll_endpoint: Arc::from("https://localhost:1"),
+        // 预签名端点未配置 S3：本测试不覆盖对象存储
+        storage: None,
     };
     let enroll_app = routes::enroll_router(state.clone());
     let mtls_app = routes::mtls_router(state.clone());

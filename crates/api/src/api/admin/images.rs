@@ -888,6 +888,106 @@ pub async fn get_manifest(
     }))
 }
 
+/// 分配成功后向房间设备投递 `image.pull`（§16.1 / §16.3）。
+///
+/// 尽力而为：无槽位、无存活设备、入队失败或 Redis 通知失败都只记 `warn!`，
+/// 不影响分配结果；transfer 保持 pending，等待设备上线后补偿。
+async fn dispatch_image_pull(state: &AppState, room_id: Uuid, image_id: Uuid, transfer_id: Uuid) {
+    let slot = match state.rooms.get(room_id).await {
+        Ok(Some(room)) => room.device_slot,
+        Ok(None) => {
+            tracing::warn!(%room_id, "房间不存在，跳过 image.pull 投递");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, %room_id, "读取房间失败，跳过 image.pull 投递");
+            return;
+        }
+    };
+    let Some(slot) = slot
+        .map(|slot| slot.trim().to_owned())
+        .filter(|slot| !slot.is_empty())
+    else {
+        tracing::warn!(%room_id, "房间未绑定设备槽位，image.pull 未投递");
+        return;
+    };
+
+    let artifact = match state.storage_repo.get_image(image_id).await {
+        Ok(Some(artifact)) => artifact,
+        Ok(None) => {
+            tracing::warn!(%room_id, %image_id, "镜像不存在，跳过 image.pull 投递");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, %room_id, %image_id, "加载镜像失败，跳过 image.pull 投递");
+            return;
+        }
+    };
+    if artifact.status != ArtifactStatus::Published {
+        tracing::warn!(
+            %room_id,
+            %image_id,
+            status = %artifact.status,
+            "镜像不是 published 状态，跳过 image.pull 投递"
+        );
+        return;
+    }
+    let Some(manifest_digest) = artifact.manifest_digest.clone() else {
+        tracing::warn!(
+            %room_id,
+            %image_id,
+            "镜像缺少 manifest_digest，跳过 image.pull 投递"
+        );
+        return;
+    };
+    let chunk_count = match state.storage_repo.chunk_count(&manifest_digest).await {
+        Ok(chunk_count) => chunk_count,
+        Err(error) => {
+            tracing::warn!(%error, %room_id, %image_id, "统计镜像分片数失败，跳过 image.pull 投递");
+            return;
+        }
+    };
+
+    // 字段名与 §16.1 的 `image.pull` 严格一致。
+    let payload = json!({
+        "transfer_id": transfer_id,
+        "image_id": artifact.id,
+        "name": artifact.name,
+        "version": artifact.version,
+        "kind": artifact.kind.as_str(),
+        "format": artifact.format.as_str(),
+        "platform": artifact.platform,
+        "manifest_digest": manifest_digest,
+        "total_size": artifact.total_size,
+        "chunk_count": chunk_count,
+        "presign_endpoint": "/resources/presign",
+    })
+    .to_string();
+
+    match state
+        .storage_repo
+        .enqueue_downlink_for_slot(&slot, "image.pull", &payload)
+        .await
+    {
+        Ok(Some(serial)) => {
+            // 唤醒长连接（跨进程尽力而为；失败还有兜底轮询）。
+            if let Err(error) = state
+                .cache
+                .publish(&state.config.schedule_downlink_notify_channel, &serial)
+                .await
+            {
+                tracing::warn!(%error, %serial, "发布设备下行通知失败，image.pull 已入队");
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(%room_id, %slot, "设备槽位当前没有存活设备，image.pull 未投递");
+        }
+        Err(error) => {
+            tracing::warn!(%error, %room_id, %slot, "image.pull 入队失败");
+        }
+    }
+}
+
 /// `PUT /rooms/{id}/images/{image_id}`：把已发布镜像分配到房间并创建分发任务。
 pub async fn assign_room(
     State(state): State<AppState>,
@@ -911,11 +1011,15 @@ pub async fn assign_room(
         ));
     }
 
-    let assignment = state
+    let outcome = state
         .storage_repo
         .assign_room(image_id, room_id, channel, id)
         .await?
         .ok_or_else(|| AppError::not_found("房间不存在"))?;
+    let transfer_id = outcome.transfer.id;
+    let assignment = outcome.assignment;
+
+    dispatch_image_pull(&state, room_id, image_id, transfer_id).await;
 
     super::audit::record_or_log(
         &state,

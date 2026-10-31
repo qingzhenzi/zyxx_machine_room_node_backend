@@ -1,6 +1,6 @@
 # 资源与镜像管理（Storage / Image）设计草案 v0.1
 
-> 状态：**P0（本仓库后端）已实现**；P1（房间节点 agent，独立 crate）待做。目标是为房间节点提供「资源分发 / 收集」与「镜像（Docker/OCI、LXC rootfs、VM 磁盘）管理」的独立模块。
+> 状态：**P0（后端）与 P1（device-pki 扩展 + 房间节点 agent）已实现**；真实 RustFS/mTLS/Incus/libvirt 端到端待环境联调。目标是为房间节点提供「资源分发 / 收集」与「镜像（Docker/OCI、LXC rootfs、VM 磁盘）管理」的独立模块。
 > 数据面用 S3（RustFS / MinIO / Ceph 等 S3 兼容实现），控制面放在 `qe-api`；**P0 不实现 Registry 协议**。
 
 ## 1. 目标与非目标
@@ -605,3 +605,174 @@ device-pki 服务端：复用 `S3_ENDPOINT/S3_BUCKET/S3_*` 与 `STORAGE_SIGNING_
 - 单元测试：manifest 验签/校验、预签名请求构造、导入命令构造（mock 可执行文件）、缓存 LRU。
 - 集成测试：fake S3 + device-pki mTLS（复用现有 enroll_flow 测试设施）+ fake `docker`/`virsh` 脚本，覆盖 assign→downlink→pull→verify→import→completed→`transfers` 状态变化。
 - 手工：真实 RustFS/Incus 环境跑通一个 rootfs 与一个 qcow2 的端到端。
+
+---
+
+## 16. P1 实现契约（v1，开工版）
+
+> 决策：预签名走 device-pki mTLS 端点；首批同时实现 Docker/OCI、LXC/Incus、VM/libvirt 三个导入适配器；
+> agent 为独立 crate `qe-node-agent`，依赖 `qe-device-pki-client`，不新增认证体系。**大文件不走 device-pki 消息**。
+
+### 16.1 控制面消息（device-pki kind）
+
+下行 `image.pull`（qe-api 在房间分配镜像后投递到 `device_downlink`）：
+
+```json
+{ "transfer_id": "uuid", "image_id": "uuid", "name": "...", "version": "...",
+  "kind": "docker|oci|lxc_rootfs|vm_disk", "format": "docker_archive|oci_layout|tar|qcow2|raw",
+  "platform": "linux/amd64", "manifest_digest": "<64hex>",
+  "total_size": 123, "chunk_count": 2, "presign_endpoint": "/resources/presign" }
+```
+
+上行（agent → device-pki `/messages`，`payload` 为 JSON 字符串）：
+
+```json
+{ "kind": "transfer.progress", "payload": { "transfer_id": "uuid", "phase": "download|verify|import",
+    "progress": 0..100, "bytes_done": 123, "error": null } }
+{ "kind": "transfer.completed", "payload": { "transfer_id": "uuid", "ok": true,
+    "manifest_digest": "<64hex>", "verified": true, "imported_ref": "docker:name:version", "error": null } }
+```
+
+device-pki 服务端注册两个 handler：
+- `transfer.progress`：`UPDATE transfers SET status='running', progress=$2, error=NULL, updated_at=now() WHERE id=$1`；
+- `transfer.completed`：`ok=true` → `status='completed', progress=100`，并 `image_assignments.rollout_state='deployed'`；
+  `ok=false` → `status='failed', error=$err`，`image_assignments.rollout_state='failed'`。
+
+### 16.2 device-pki：`POST /resources/presign`（mTLS listener）
+
+请求（`PeerCert` 提供 serial；同现有 mTLS handler）：
+
+```json
+{ "manifest_digest": "<64hex>", "kind": "manifest"|"signature"|"chunk",
+  "index": 0, "count": 64 }
+```
+
+响应：
+
+```json
+{ "urls": [ { "key": "objects/<sha>", "url": "https://…", "expires_at": "RFC3339" } ],
+  "public_key_base64": "…" }
+```
+
+- 授权（fail-closed）：
+  1. serial → `device_enrollment.device_slot`（取 `status IN ('issued','active')`）→ `rooms.device_slot` → `room_id`；
+  2. `image_chunks.manifest_digest` 对应的 `image_artifacts.manifest_digest` 必须存在，且
+     `image_assignments` 中存在 `(image_id, room_id)`；
+  3. 不满足 → 403；对象不存在 → 404。
+- `kind=manifest` 返回 `manifests/{digest}.json`；`signature` 返回 `signatures/{digest}.sig`；
+  `chunk` 按 `index` 顺序返回最多 `count`（clamp 1..=64）个 `objects/{chunk.sha256}`。
+- 服务端新增 `AppState.storage: Option<Arc<qe_storage::StorageService>>`；main 从 `S3_*` 构建（与 qe-api 同套 env），
+  未配置时该端点返回 503；`ExpiresAt` 用 `STORAGE_PRESIGN_TTL_SECONDS`（默认 900）。
+- `crates/device-pki/Cargo.toml` 增加 `qe-storage` 依赖。
+
+### 16.3 qe-api/qe-db：分配后投递 `image.pull`
+
+- `StorageRepo::assign_room` 返回值改为：
+
+```rust
+pub struct AssignOutcome { pub assignment: ImageAssignment, pub transfer: Transfer }
+pub async fn assign_room(&self, image_id: Uuid, room_id: Uuid, channel: ImageChannel, actor: Uuid)
+    -> DbResult<Option<AssignOutcome>>;
+pub async fn chunk_count(&self, manifest_digest: &str) -> DbResult<i64>;
+/// 与 schedule 的 downlink 语义一致：按 device_slot 找存活证书，写 device_downlink，返回 serial。
+pub async fn enqueue_downlink_for_slot(&self, slot: &str, kind: &str, payload: &str) -> DbResult<Option<String>>;
+```
+
+- `PUT /rooms/{id}/images/{image_id}` 成功后：若房间 `device_slot` 非空且有存活设备，构造 §16.1 的 payload 调
+  `enqueue_downlink_for_slot(slot, "image.pull", payload)`，并 `state.cache.publish(state.config.schedule_downlink_notify_channel, serial)`；
+  无槽位/无设备只记 `warn!`，transfer 保持 pending。响应仍为 assignment。
+- 集成测试扩展：房间绑定设备 + 插入 `device_enrollment/device_session` 后分配镜像，断言 `device_downlink.kind='image.pull'`。
+
+### 16.4 node-agent crate（`crates/node-agent`，包名 `qe-node-agent`）
+
+目录（Lead 会建脚手架与 Cargo.toml）：
+
+```text
+crates/node-agent/
+  Cargo.toml
+  src/main.rs          # 读 env、确认证书、订阅 image.pull、轮询下行
+  src/lib.rs           # pub mod ...
+  src/config.rs        # AgentConfig::from_env
+  src/manifest.rs      # 与 §14.2 对齐的 Manifest/Chunk 结构 + sha256 digest + Ed25519 验签
+  src/presign.rs       # PresignClient trait + mTLS 实现（POST /resources/presign）
+  src/cache.rs         # 内容寻址缓存 CACHE_DIR/objects/{sha256}，LRU 到 CACHE_MAX_BYTES
+  src/pull.rs          # 拉 manifest/签名/chunk、校验、组装，阶段回调 progress
+  src/report.rs        # 通过 qe-device-pki-client 上行 transfer.progress/completed（OutboxQueue）
+  src/importer/mod.rs  # TopologyImporter trait + dispatch（按 kind/format）
+  src/importer/docker.rs
+  src/importer/incus.rs   # 同时兼容 plain LXC（rootfs 解包）
+  src/importer/vm.rs      # qcow2/raw → libvirt storage pool
+  src/job.rs           # 一次 image.pull 的编排：pull → verify → import → report
+```
+
+关键签名（db/api/agent 三方契约）：
+
+```rust
+pub struct AgentConfig {
+    pub mtls_endpoint: String,
+    pub slot: String,
+    pub data_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub cache_max_bytes: u64,
+    pub download_concurrency: usize,
+    pub docker_bin: String,   // 默认 docker
+    pub ctr_bin: String,      // 默认 ctr
+    pub incus_bin: String,    // 默认 incus
+    pub virsh_bin: String,    // 默认 virsh
+    pub lxc_rootfs_dir: PathBuf, // 默认 /var/lib/lxc
+}
+impl AgentConfig { pub fn from_env() -> anyhow::Result<Self>; }
+
+pub trait PresignClient: Send + Sync {
+    fn presign<'a>(&'a self, request: &'a PresignRequest)
+        -> BoxFuture<'a, anyhow::Result<PresignReply>>;
+}
+
+pub struct ImportRequest {
+    pub kind: String, pub format: String, pub name: String, pub version: String,
+    pub staging_dir: PathBuf,      // 校验后落盘目录（含组装文件/tar）
+    pub artifact_path: PathBuf,    // 单个文件（qcow2/tar/rootfs tar）或 OCI 目录
+    pub imported_name: String,     // 导入后的本地名称/引用
+}
+pub struct ImportResult { pub imported_ref: String }
+pub trait TopologyImporter: Send + Sync {
+    fn supports(&self, kind: &str, format: &str) -> bool;
+    fn import<'a>(&'a self, request: &'a ImportRequest) -> BoxFuture<'a, anyhow::Result<ImportResult>>;
+}
+```
+
+- 导入实现（命令路径可配，便于测试 mock）：
+  - Docker `docker_archive`：`{docker_bin} load -i <artifact_path>`；`oci_layout`：`{ctr_bin} images import <artifact_path>`；
+  - Incus `tar`：`{incus_bin} image import <artifact_path> alias=<imported_name>`；若 `incus_bin` 为空/不存在则 plain LXC 兜底：
+    解包 tar 到 `{lxc_rootfs_dir}/<name>/rootfs`（先 staging 解包再原子 rename）；
+  - VM `qcow2`/`raw`：`{virsh_bin} vol-create-as <pool> <vol> <size>` + `vol-upload <vol> <artifact_path> --pool <pool>`；
+    pool 名从 env `LIBVIRT_POOL`（默认 `default`），卷名 `<name>-<version>`。
+- 拉取校验：manifest 签名（Ed25519，公钥来自 presign 响应）、chunk sha256/size、总大小、格式 magic
+  （qcow2 `QFI\xfb`；tar 在 offset 257 `ustar`；raw 跳过）。
+- 上报：progress 阶段（download 0-80、verify 80-90、import 90-100）；completed 带 `imported_ref`。
+- main 循环：`confirm`（已激活则跳过）→ 注册 `image.pull` handler → `downlink::poll_once` 周期 2s；handler 内串行执行 job（避免并发导入）。
+- 单测（不依赖真实设备/网络）：
+  - manifest 验签/伪签名拒绝、chunk 校验、cache LRU、config 解析；
+  - 用 `PresignClient` mock + 内存 S3/文件 URL 或 trait mock 测 pull；
+  - importer 用临时 fake 可执行脚本（`tempfile`）断言命令参数与 staging 布局；plain LXC 解包测试用临时目录。
+
+### 16.5 配置（agent）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `DEVICE_PKI_MTLS_URL` | 无（必填） | 如 `https://node:4441` |
+| `DEVICE_SLOT` | 无（必填） | 设备槽位（与证书 CN 一致） |
+| `DEVICE_DATA_DIR` | `./data` | 客户端状态/凭证目录（沿用 device-pki-client） |
+| `CACHE_DIR` | `./cache` | 分片缓存 |
+| `CACHE_MAX_BYTES` | `10737418240` | 缓存上限 |
+| `DOWNLOAD_CONCURRENCY` | `4` | 并发分片 |
+| `DOCKER_BIN` / `CTR_BIN` / `INCUS_BIN` / `VIRSH_BIN` | 对应命令名 | 可指向 mock 脚本 |
+| `LIBVIRT_POOL` | `default` | libvirt storage pool |
+| `LXC_ROOTFS_DIR` | `/var/lib/lxc` | plain LXC 根目录 |
+
+### 16.6 验收
+
+- `make check` 通过（新 crate 加入 workspace；agent/device-pki 单测通过）。
+- `scripts/test-integration.sh` 全绿；storage 集成测试扩展断言分配后 `device_downlink` 出现 `image.pull`。
+- device-pki：`/resources/presign` 路由可编译 + 授权/取键逻辑单测；真实 mTLS 端到端由后续手工/环境测试。
+- node-agent：单元测试覆盖 manifest 校验、cache、job 编排（mock PresignClient/TopologyImporter）、三个 importer 命令构造。

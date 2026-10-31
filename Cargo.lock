@@ -2262,6 +2262,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "hyper-util",
+ "qe-storage",
  "rand 0.9.5",
  "rcgen",
  "redis",
@@ -2331,6 +2332,28 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "qe-node-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "futures-util",
+ "hex",
+ "qe-device-pki-client",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

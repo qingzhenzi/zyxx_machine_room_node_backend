@@ -46,6 +46,9 @@ pub struct AppState {
     pub mtls_endpoint: Arc<str>,
     /// 对外公布的注册端点，用于拼接注册链接（管理端发 token 时用）
     pub enroll_endpoint: Arc<str>,
+    /// S3 适配器：未配置 / 初始化失败时为 `None`，`/resources/presign` 回 503
+    /// （契约 §16.2；main 从 `S3_*` 环境变量构建）
+    pub storage: Option<Arc<qe_storage::StorageService>>,
 }
 
 // ---------------- /enroll/challenge ----------------
@@ -1085,6 +1088,8 @@ pub fn mtls_router(st: AppState) -> Router {
         .route("/messages", post(receive_message))
         .route("/messages/downlink", get(downlink_pull))
         .route("/messages/downlink/ack", post(downlink_ack))
+        // 设备换对象存储预签名 URL（大文件不走消息通道，契约 §16.2）
+        .route("/resources/presign", post(crate::resource::presign))
         .route("/revoke", post(revoke))
         .with_state(st)
 }
@@ -1128,6 +1133,7 @@ mod tests {
             )),
             mtls_endpoint: Arc::from("https://mtls.test:4441"),
             enroll_endpoint: Arc::from("https://enroll.test:4440"),
+            storage: None,
         };
         let mut h = HeaderMap::new();
         h.insert(

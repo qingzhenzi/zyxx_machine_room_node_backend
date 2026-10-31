@@ -6,7 +6,8 @@
 //! - 注册 listener（单向 TLS）：`POST /enroll/challenge`、`POST /enroll`、
 //!   `GET /enroll/{id}`、`POST /admin/tokens`、`GET /admin/enrollments`、
 //!   `DELETE /admin/enrollments/{id}`、`POST /admin/enroll/{id}/decide`、`GET /crl`
-//! - 业务 listener（mTLS）：`POST /enroll/confirm`、`POST /messages`、`POST /revoke`
+//! - 业务 listener（mTLS）：`POST /enroll/confirm`、`POST /messages`、
+//!   `POST /resources/presign`（对象存储预签名，契约 §16.2）、`POST /revoke`
 
 pub mod ca;
 pub mod cert_status;
@@ -18,9 +19,11 @@ pub mod messaging;
 pub mod notify_redis;
 pub mod pop;
 pub mod ratelimit;
+pub mod resource;
 pub mod routes;
 pub mod session;
 pub mod tls;
 pub mod token;
+pub mod transfer;
 
 pub use error::{Error, Result};

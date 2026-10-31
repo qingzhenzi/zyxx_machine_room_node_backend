@@ -403,6 +403,16 @@ impl From<CollectionRow> for Collection {
     }
 }
 
+/// `assign_room` 的结果：分配记录 + 本次创建的分发任务（§16.3）。
+///
+/// 事务内同时 upsert `image_assignments` 并插入 `transfers`，两者一起返回，
+/// 调用方可用 `transfer.id` 构造 `image.pull` 下行 payload。
+#[derive(Debug, Clone)]
+pub struct AssignOutcome {
+    pub assignment: ImageAssignment,
+    pub transfer: Transfer,
+}
+
 // ---------------------------------------------------------------------------
 // 通用 SQL 片段
 // ---------------------------------------------------------------------------
@@ -432,6 +442,37 @@ const COLLECTION_COLUMNS: &str = "id, area_id, room_id, kind, object_key, sha256
 const IMAGE_FILTER: &str = "($1::text IS NULL OR kind = $1)
    AND ($2::text IS NULL OR status = $2)
    AND ($3::text IS NULL OR $3::text = '' OR name ILIKE '%' || $3::text || '%')";
+
+// ---------------------------------------------------------------------------
+// 下行投递
+// ---------------------------------------------------------------------------
+
+/// 与 `qe-device-pki::messaging::MAX_UNACKED_DOWNLINK` / `schedule` 保持一致：
+/// 单台设备未 ACK 的下行消息达到该值即拒绝入队（背压，避免设备失联时写爆库）。
+const MAX_UNACKED_DOWNLINK: i64 = 1000;
+/// 与 `qe-device-pki::messaging::MAX_MESSAGE_BYTES` 保持一致（64 KiB）。
+const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_DOWNLINK_KIND_LEN: usize = 64;
+
+/// 下行消息大小校验（纯函数，无 DB，便于单测）：
+/// `kind` 1..=64 字节；`payload` ≤ 64 KiB。与 device-pki 的 `/messages` 一致。
+fn validate_downlink(kind: &str, payload: &str) -> DbResult<()> {
+    if kind.is_empty() || kind.len() > MAX_DOWNLINK_KIND_LEN {
+        return Err(DbError::bad_request("kind 长度必须在 1..=64"));
+    }
+    if payload.len() > MAX_MESSAGE_BYTES {
+        return Err(DbError::bad_request("payload 超过 65536 字节"));
+    }
+    Ok(())
+}
+
+/// 背压校验（纯函数，无 DB）：单设备未 ACK 队列达到上限时返回 `Conflict`。
+fn ensure_downlink_backpressure(unacked: i64) -> DbResult<()> {
+    if unacked >= MAX_UNACKED_DOWNLINK {
+        return Err(DbError::conflict("设备未 ACK 的下行消息已达上限"));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // 仓储
@@ -660,6 +701,17 @@ impl StorageRepo {
         Ok(rows.into_iter().map(ImageChunk::from).collect())
     }
 
+    /// 某 manifest 的分片数（§16.3：构造 `image.pull` payload 的 `chunk_count`）。
+    pub async fn chunk_count(&self, manifest_digest: &str) -> DbResult<i64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM image_chunks WHERE manifest_digest = $1",
+        )
+        .bind(manifest_digest)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(count)
+    }
+
     // ---- 验证 / 发布 -------------------------------------------------------
 
     pub async fn insert_verification(
@@ -788,7 +840,7 @@ impl StorageRepo {
         room_id: Uuid,
         channel: ImageChannel,
         actor: Uuid,
-    ) -> DbResult<Option<ImageAssignment>> {
+    ) -> DbResult<Option<AssignOutcome>> {
         let mut tx = self.db.begin().await?;
 
         let image = sqlx::query_as::<_, (String, Option<String>)>(
@@ -834,19 +886,24 @@ impl StorageRepo {
             .fetch_one(&mut *tx)
             .await?;
 
-        sqlx::query(
+        let transfer_sql = format!(
             "INSERT INTO transfers
                 (direction, room_id, image_id, manifest_digest, status, progress)
-             VALUES ('download', $1, $2, $3, 'pending', 0)",
-        )
-        .bind(room_id)
-        .bind(image_id)
-        .bind(manifest_digest)
-        .execute(&mut *tx)
-        .await?;
+             VALUES ('download', $1, $2, $3, 'pending', 0)
+             RETURNING {TRANSFER_COLUMNS}"
+        );
+        let transfer_row = sqlx::query_as::<_, TransferRow>(&transfer_sql)
+            .bind(room_id)
+            .bind(image_id)
+            .bind(manifest_digest)
+            .fetch_one(&mut *tx)
+            .await?;
 
         tx.commit().await?;
-        Ok(Some(ImageAssignment::from(row)))
+        Ok(Some(AssignOutcome {
+            assignment: ImageAssignment::from(row),
+            transfer: Transfer::from(transfer_row),
+        }))
     }
 
     pub async fn unassign_room(&self, image_id: Uuid, room_id: Uuid) -> DbResult<bool> {
@@ -919,6 +976,66 @@ impl StorageRepo {
         .await?
         .rows_affected();
         Ok(updated > 0)
+    }
+
+    /// 向设备槽位投递下行消息：返回 `Some(serial)` / `None`（无存活设备）。
+    ///
+    /// 语义与 `schedule::ScheduleEventRepo::enqueue_downlink_for_slot` /
+    /// `qe-device-pki::messaging::downlink_publish_to_slot` 一致：
+    /// - 选 `status ∈ {issued, active}` 的证书，`active` 优先、`activated_at` 最新；
+    /// - 未 ACK 的下行消息达到 1000 条时返回 `Conflict`（背压）；
+    /// - 成功插入 `device_downlink` 后返回设备 `serial`（调用方可据此唤醒长连接）。
+    pub async fn enqueue_downlink_for_slot(
+        &self,
+        slot: &str,
+        kind: &str,
+        payload: &str,
+    ) -> DbResult<Option<String>> {
+        validate_downlink(kind, payload)?;
+
+        let mut tx = self.db.begin().await?;
+
+        let device = sqlx::query_as::<_, (String, String)>(
+            "SELECT serial, device_slot
+             FROM device_enrollment
+             WHERE device_slot = $1 AND status IN ('issued', 'active')
+             ORDER BY (status = 'active') DESC, activated_at DESC NULLS LAST
+             LIMIT 1",
+        )
+        .bind(slot)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((serial, device_slot)) = device else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        let unacked: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+             FROM device_downlink
+             WHERE serial = $1 AND delivered_at IS NULL",
+        )
+        .bind(&serial)
+        .fetch_one(&mut *tx)
+        .await?;
+        if let Err(error) = ensure_downlink_backpressure(unacked) {
+            tx.rollback().await?;
+            return Err(error);
+        }
+
+        sqlx::query(
+            "INSERT INTO device_downlink (serial, device_slot, kind, payload)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&serial)
+        .bind(&device_slot)
+        .bind(kind)
+        .bind(payload)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(serial))
     }
 
     pub async fn list_collections(
@@ -1035,6 +1152,50 @@ mod tests {
         for channel in [ImageChannel::Dev, ImageChannel::Test, ImageChannel::Prod] {
             assert_eq!(channel_from_str(channel_str(channel)), channel);
         }
+    }
+
+    #[test]
+    fn downlink_limits_match_contract() {
+        // 与 qe-device-pki::messaging 的常量保持一致。
+        assert_eq!(MAX_UNACKED_DOWNLINK, 1000);
+        assert_eq!(MAX_MESSAGE_BYTES, 64 * 1024);
+        assert_eq!(MAX_DOWNLINK_KIND_LEN, 64);
+    }
+
+    #[test]
+    fn downlink_validation_enforces_kind_and_payload_limits() {
+        // kind 1..=64 字节；payload ≤ 64 KiB。
+        assert!(validate_downlink("image.pull", "{}").is_ok());
+        assert!(validate_downlink(&"k".repeat(MAX_DOWNLINK_KIND_LEN), "{}").is_ok());
+        assert!(validate_downlink("", "{}").is_err());
+        assert!(validate_downlink(&"k".repeat(MAX_DOWNLINK_KIND_LEN + 1), "{}").is_err());
+        assert!(validate_downlink("image.pull", &"x".repeat(MAX_MESSAGE_BYTES)).is_ok());
+        assert!(validate_downlink("image.pull", &"x".repeat(MAX_MESSAGE_BYTES + 1)).is_err());
+
+        // 超限归类为 400（bad request），便于 API 映射。
+        assert!(matches!(
+            validate_downlink("", "{}"),
+            Err(DbError::BadRequest(_))
+        ));
+        assert!(matches!(
+            validate_downlink("image.pull", &"x".repeat(MAX_MESSAGE_BYTES + 1)),
+            Err(DbError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn downlink_backpressure_conflicts_at_limit() {
+        // 999 未 ACK 仍可入队；达到 1000 即 Conflict（背压）。
+        assert!(ensure_downlink_backpressure(0).is_ok());
+        assert!(ensure_downlink_backpressure(MAX_UNACKED_DOWNLINK - 1).is_ok());
+        assert!(matches!(
+            ensure_downlink_backpressure(MAX_UNACKED_DOWNLINK),
+            Err(DbError::Conflict(_))
+        ));
+        assert!(matches!(
+            ensure_downlink_backpressure(MAX_UNACKED_DOWNLINK + 1),
+            Err(DbError::Conflict(_))
+        ));
     }
 
     #[test]

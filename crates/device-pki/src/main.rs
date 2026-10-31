@@ -166,6 +166,9 @@ async fn main() -> Result<()> {
         );
         Ok(())
     });
+    // 上行传输进度/完成（契约 §16.1）：落 transfers 与 image_assignments.rollout_state。
+    // 注册在独立二进制里，HTTP /messages 与 WebSocket 隧道都走同一个分发器。
+    qe_device_pki::transfer::install(&dispatcher, db.clone());
 
     // 离线判定：没有这个定时器，heartbeat_miss 永远没人调用 ——
     // 设备只会被"消息到达时翻回 online"，永远不会被判 offline（契约 §6）
@@ -191,6 +194,10 @@ async fn main() -> Result<()> {
         }
     }
 
+    // 对象存储（契约 §16.2）：未配置或初始化失败都只记 warn 并继续启动，
+    // 相关端点（/resources/presign）返回 503，不影响注册与消息通道。
+    let storage = qe_device_pki::resource::build_storage_from_env();
+
     let state = AppState {
         db: db.clone(),
         ca: Arc::clone(&ca),
@@ -202,6 +209,7 @@ async fn main() -> Result<()> {
         dispatcher,
         mtls_endpoint: Arc::from(public_mtls.as_str()),
         enroll_endpoint: Arc::from(public_enroll.as_str()),
+        storage,
     };
 
     let enroll_cfg = tls::server_config_enroll(&enroll_cert, &enroll_key)?;
