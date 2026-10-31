@@ -376,6 +376,40 @@ pub fn notifier() -> &'static Notifier {
     &GLOBAL_NOTIFIER
 }
 
+/// 跨进程的下行通知信号。
+///
+/// 进程内的唤醒由 [`Notifier`] 负责（零成本）；这个信号负责**告诉其它实例**
+/// "该设备有新消息了"。不装它时多实例部署会退化为 2s 兜底轮询，
+/// 装了之后延迟与单实例一致。
+///
+/// 实现约定：`publish` 应当**尽快返回**，失败不应影响主流程
+/// （兜底轮询会把漏掉的消息捞回来）。
+pub trait CrossProcessSignal: Send + Sync + 'static {
+    fn publish(&self, serial: String) -> BoxFuture<'static, ()>;
+}
+
+static CROSS_PROCESS: std::sync::OnceLock<Arc<dyn CrossProcessSignal>> =
+    std::sync::OnceLock::new();
+
+/// 安装跨进程通知信号。**只能装一次**（进程级单例），装过返回 `false`。
+pub fn install_cross_process(signal: Arc<dyn CrossProcessSignal>) -> bool {
+    CROSS_PROCESS.set(signal).is_ok()
+}
+
+fn cross_process() -> Option<&'static Arc<dyn CrossProcessSignal>> {
+    CROSS_PROCESS.get()
+}
+
+/// 唤醒**所有进程**里等待该设备的长连接。
+///
+/// 顺序有讲究：先唤醒本进程（同步、零延迟），再通知其它进程（异步、尽力而为）。
+pub async fn signal_downlink(serial: &str) {
+    notifier().notify(serial);
+    if let Some(signal) = cross_process() {
+        signal.publish(serial.to_owned()).await;
+    }
+}
+
 /// 一次下行投递。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DownlinkMessage {
@@ -439,7 +473,8 @@ pub async fn downlink_publish(
     .bind(payload)
     .fetch_one(pool)
     .await?;
-    notifier().notify(serial);
+    // 唤醒长连接：本进程立即、其它进程尽力而为（跨进程信号未安装时退化为兜底轮询）
+    signal_downlink(serial).await;
     Ok(id)
 }
 

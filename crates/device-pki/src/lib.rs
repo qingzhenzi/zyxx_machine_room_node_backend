@@ -14,6 +14,8 @@ pub mod channel;
 pub mod challenge;
 pub mod error;
 pub mod messaging;
+#[cfg(feature = "redis-notify")]
+pub mod notify_redis;
 pub mod pop;
 pub mod ratelimit;
 pub mod routes;

@@ -137,6 +137,10 @@ approval 型响应：
 - 心跳：服务端每 20s 发一帧探活，连续 2 个周期无响应即断开；设备侧 15s 主动发 `ping`
 - **HTTP 端点保留作为兜底**：设备维持不了长连接时仍可用
   `POST /messages` + `GET /messages/downlink`
+- **通知分层**：投递后先唤醒本进程内的连接（`Notifier`，零成本）；多实例部署启用
+  `redis-notify` 特性后，再向 Redis 频道发一条 `serial`，由每个实例的**单条订阅
+  连接**扇出唤醒 —— 连接数 O(1)。通知发送失败或订阅断线都不丢消息，
+  最多退化到 2s 兜底轮询
 
 ### POST /messages  （mTLS listener，设备上行消息）
 

@@ -178,6 +178,25 @@ async fn main() -> Result<()> {
         messaging::OFFLINE_TICK_INTERVAL,
     );
 
+    // 跨进程下行通知（可选特性 redis-notify）：多实例部署时让"某设备有新消息"
+    // 的通知跨进程到达，延迟与单实例一致；不启用则退化为 2s 兜底轮询。
+    // 不设置 NOTIFY_REDIS_URL 就完全不连 Redis，单实例部署零成本。
+    #[cfg(feature = "redis-notify")]
+    if let Ok(redis_url) = std::env::var("NOTIFY_REDIS_URL") {
+        let channel = std::env::var("NOTIFY_REDIS_CHANNEL")
+            .unwrap_or_else(|_| qe_device_pki::notify_redis::DEFAULT_CHANNEL.to_owned());
+        match qe_device_pki::notify_redis::install(&redis_url, &channel).await {
+            Ok(_fanout) => tracing::info!(
+                channel = %channel,
+                "跨进程下行通知已启用（Redis pub/sub：单条订阅连接扇出全部设备）"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "跨进程下行通知连接失败，退化为 2s 兜底轮询"
+            ),
+        }
+    }
+
     let state = AppState {
         db: db.clone(),
         ca: Arc::clone(&ca),

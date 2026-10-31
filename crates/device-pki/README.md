@@ -28,6 +28,23 @@
 | `ADMIN_RATE_LIMIT` | 管理端每 IP 每分钟预算，默认 `30`；`0` = 关闭（前面有反代限速时才考虑） |
 | `PUBLIC_ENROLL_ENDPOINT` | 对外公布的注册地址，用于拼注册链接；默认把监听地址里的 `0.0.0.0` 换成 `localhost` |
 | `PUBLIC_MTLS_ENDPOINT` | 下发给客户端的 mTLS 地址，同上 |
+| `NOTIFY_REDIS_URL` | **多实例部署**：设置后启用跨进程下行通知（需 `--features redis-notify`）；不设置则完全不连 Redis |
+| `NOTIFY_REDIS_CHANNEL` | 跨进程通知频道，默认 `qe-device-pki:downlink` |
+
+### 多实例部署
+
+单实例时下行通知是进程内的 `Notify`（零成本）。多实例时如果不做跨进程通知，
+业务方实例 A 投递的消息要等设备连着的实例 B 轮询到（最多 2s 延迟）。
+启用跨进程通知后延迟与单实例一致：
+
+```bash
+cargo build --release -p qe-device-pki --features redis-notify
+NOTIFY_REDIS_URL=redis://redis:6379 ./qe-device-pki
+```
+
+实现上只用**一条订阅连接**：所有设备的通知都发到同一个频道，载荷是 `serial`，
+进程收到后用进程内的 `Notifier` 唤醒对应连接 —— 连接数 O(1) 而不是 O(设备数)。
+通知发送失败/订阅断线都不会丢消息（2s 兜底轮询会捞回来），只是延迟退化。
 
 ## 端点
 

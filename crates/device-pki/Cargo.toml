@@ -10,6 +10,11 @@ authors.workspace = true
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
+# 跨进程下行通知（可选特性）：单进程部署不必连 Redis
+redis = { version = "1.5", optional = true, default-features = false, features = [
+  "tokio-comp",
+  "connection-manager",
+] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
 rcgen = { version = "0.13", features = ["x509-parser"] }
@@ -34,6 +39,11 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "service", 
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
 futures-util = "0.3"
+
+[features]
+default = []
+# 多实例部署：用 Redis pub/sub 让"有新下行消息"的通知跨进程到达
+redis-notify = ["dep:redis"]
 
 [dev-dependencies]
 tempfile = "3"
