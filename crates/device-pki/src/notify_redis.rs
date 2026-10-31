@@ -14,8 +14,8 @@
 //! - 订阅断开：指数退避重连。重连期间漏掉的通知同样由兜底轮询兜住
 
 use crate::messaging::{self, BoxFuture, CrossProcessSignal};
-use redis::aio::MultiplexedConnection;
 use redis::AsyncCommands;
+use redis::aio::MultiplexedConnection;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -111,7 +111,7 @@ async fn run_once(url: &str, channel: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
     /// 扇出的核心语义：收到 serial → 唤醒对应设备的等待者。
     /// 用真实 Redis 验证；没有 Redis 时跳过（集成脚本会启动）。

@@ -66,7 +66,10 @@ impl RateLimiter {
             count: 0,
         });
         if now.duration_since(win.start) >= WINDOW {
-            *win = Window { start: now, count: 0 };
+            *win = Window {
+                start: now,
+                count: 0,
+            };
         }
         win.count += 1;
 

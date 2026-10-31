@@ -8,15 +8,15 @@
 //! 为什么必须是两个 listener：rustls 在握手阶段就要确定是否需要客户端证书，
 //! 运行时切换会让状态机很难维护。
 
-use crate::ca::{pem_to_cert_chain, pem_to_private_key, Ca};
+use crate::ca::{Ca, pem_to_cert_chain, pem_to_private_key};
 use crate::cert_status::CertStatusCache;
-use x509_parser::prelude::FromDer;
 use crate::error::{Error, Result};
 use axum::extract::FromRequestParts;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
 use std::sync::Arc;
+use x509_parser::prelude::FromDer;
 
 /// mTLS 握手后注入请求扩展的对端身份。
 #[derive(Debug, Clone)]
@@ -35,10 +35,14 @@ impl PeerCert {
         let mut cn = None;
         let mut serial = None;
         if let Ok((_, cert)) = x509_parser::prelude::X509Certificate::from_der(&der) {
-            cn = cert.subject().iter_common_name().next().and_then(|a| {
-                a.as_str().ok().map(|s| s.to_owned())
-            });
-            serial = Some(crate::ca::canonical_serial_hex(cert.tbs_certificate.raw_serial()));
+            cn = cert
+                .subject()
+                .iter_common_name()
+                .next()
+                .and_then(|a| a.as_str().ok().map(|s| s.to_owned()));
+            serial = Some(crate::ca::canonical_serial_hex(
+                cert.tbs_certificate.raw_serial(),
+            ));
         }
         Self {
             der,
@@ -87,8 +91,7 @@ pub fn server_config_mtls(
     let verifier = Arc::new(DeviceCertVerifier {
         ca,
         cert_status,
-        supported: rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms,
+        supported: rustls::crypto::ring::default_provider().signature_verification_algorithms,
     });
     let mut cfg = ServerConfig::builder()
         .with_client_cert_verifier(verifier)
@@ -150,9 +153,9 @@ impl ClientCertVerifier for DeviceCertVerifier {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        if !leaf.validity().is_valid_at(ASN1Time::from_timestamp(now).unwrap_or_else(|_| {
-            ASN1Time::from_timestamp(0).unwrap()
-        })) {
+        if !leaf.validity().is_valid_at(
+            ASN1Time::from_timestamp(now).unwrap_or_else(|_| ASN1Time::from_timestamp(0).unwrap()),
+        ) {
             return Err(rustls::Error::General("client cert expired".into()));
         }
 
@@ -182,8 +185,7 @@ impl ClientCertVerifier for DeviceCertVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
     }
 
@@ -192,8 +194,7 @@ impl ClientCertVerifier for DeviceCertVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
     }
 
@@ -266,13 +267,9 @@ mod tests {
 
     /// 极简阻塞执行器，仅用于测试里驱动一次就绪的 future。
     fn futures_lite_block<F: std::future::Future>(fut: F) -> F::Output {
-        use std::task::{Context, Poll, Wake, Waker};
-        struct Noop;
-        impl Wake for Noop {
-            fn wake(self: Arc<Self>) {}
-        }
-        let waker = Waker::from(Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
+        use std::task::{Context, Poll, Waker};
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
         let mut fut = std::pin::pin!(fut);
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(v) => v,

@@ -53,11 +53,10 @@ impl CertStatusCache {
 
     /// 一次性载入全量状态（锁外构建，再一次原子替换）。
     pub async fn reload(&self, db: &PgPool) -> Result<usize, sqlx::Error> {
-        let revoked_rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT serial FROM device_enrollment WHERE revoked_at IS NOT NULL",
-        )
-        .fetch_all(db)
-        .await?;
+        let revoked_rows: Vec<(String,)> =
+            sqlx::query_as("SELECT serial FROM device_enrollment WHERE revoked_at IS NOT NULL")
+                .fetch_all(db)
+                .await?;
         let live_rows: Vec<(String,)> = sqlx::query_as(
             "SELECT serial FROM device_enrollment WHERE status IN ('issued','active')",
         )
@@ -68,10 +67,7 @@ impl CertStatusCache {
         let live: HashSet<String> = live_rows.into_iter().map(|(s,)| s).collect();
         let count = revoked.len();
 
-        *self
-            .revoked
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = revoked;
+        *self.revoked.write().unwrap_or_else(|e| e.into_inner()) = revoked;
         *self.live.write().unwrap_or_else(|e| e.into_inner()) = live;
         self.loaded.store(true, Ordering::Release);
         Ok(count)
@@ -154,10 +150,7 @@ mod tests {
         let c = CertStatusCache::new();
         // 先模拟一次成功刷新（loaded=true）
         c.loaded.store(true, Ordering::Release);
-        c.live
-            .write()
-            .unwrap()
-            .insert("deadbeef".to_owned());
+        c.live.write().unwrap().insert("deadbeef".to_owned());
         assert!(c.is_live("deadbeef"));
 
         c.mark_revoked("deadbeef");
@@ -184,17 +177,10 @@ mod tests {
             Ok(p) => p,
             Err(_) => return, // 连接串无效时跳过
         };
-        let handle = spawn_refresher(
-            Arc::clone(&cache),
-            db,
-            Duration::from_millis(20),
-        );
+        let handle = spawn_refresher(Arc::clone(&cache), db, Duration::from_millis(20));
         tokio::time::sleep(Duration::from_millis(80)).await;
         handle.abort();
         // 刷新失败必须保留旧快照
-        assert!(
-            cache.is_revoked("keepme"),
-            "刷新失败不应清空已有吊销集合"
-        );
+        assert!(cache.is_revoked("keepme"), "刷新失败不应清空已有吊销集合");
     }
 }

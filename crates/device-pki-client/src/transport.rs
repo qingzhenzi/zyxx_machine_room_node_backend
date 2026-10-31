@@ -192,9 +192,7 @@ pub fn build_mtls_client(cfg: &TransportConfig) -> Result<reqwest::Client> {
             .map_err(|e| Error::Crypto(format!("build ca root: {e}")))?;
         builder = builder.add_root_certificate(cert);
     }
-    builder
-        .build()
-        .map_err(|e| Error::Transport(e.to_string()))
+    builder.build().map_err(|e| Error::Transport(e.to_string()))
 }
 
 /// `POST /enroll/confirm` —— 用正式证书完成一次 mTLS 往返。
@@ -211,10 +209,7 @@ pub async fn confirm(cfg: &TransportConfig) -> Result<ConfirmReply> {
         .map_err(|e| Error::Transport(format!("confirm 请求失败（mTLS 未打通）: {e}")))?;
 
     if !resp.status().is_success() {
-        return Err(Error::Unexpected(format!(
-            "confirm 返回 {}",
-            resp.status()
-        )));
+        return Err(Error::Unexpected(format!("confirm 返回 {}", resp.status())));
     }
     resp.json()
         .await
@@ -498,7 +493,10 @@ mod tests {
             .unwrap();
         }
         let pending = q.pending().unwrap();
-        assert_eq!(pending.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(
+            pending.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
         assert_eq!(q.len(), 3);
     }
 

@@ -1,7 +1,9 @@
 //! 生成测试用 CA 与服务端 TLS 证书（仅本地联调用，勿用于生产）。
 
 use anyhow::Result;
-use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, SanType};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, SanType,
+};
 use std::net::IpAddr;
 
 fn main() -> Result<()> {

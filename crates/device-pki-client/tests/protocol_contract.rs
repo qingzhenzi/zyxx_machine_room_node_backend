@@ -42,8 +42,13 @@ fn client_pop_verifies_on_server() {
 
     // 服务端验签用的公钥来自 CSR（完整 SPKI）
     let spki = extract_spki(&csr_der);
-    pop::verify(&spki, SignatureAlgorithm::EcdsaP256Sha256, &server_transcript, &sig)
-        .expect("服务端必须能验证客户端 PoP");
+    pop::verify(
+        &spki,
+        SignatureAlgorithm::EcdsaP256Sha256,
+        &server_transcript,
+        &sig,
+    )
+    .expect("服务端必须能验证客户端 PoP");
 }
 
 #[test]
@@ -53,11 +58,18 @@ fn server_rejects_signature_from_other_transcript() {
     let csr_der = build_csr(slot, &key);
     let spki = extract_spki(&csr_der);
 
-    let good = pop::canonical_transcript(&[1; 32], &[2; 32], slot, &pop::sha256(&csr_der), &[3; 32]);
+    let good =
+        pop::canonical_transcript(&[1; 32], &[2; 32], slot, &pop::sha256(&csr_der), &[3; 32]);
     let sig = key.sign(&good).unwrap();
 
     // 换了 slot 的 transcript 必须验签失败
-    let bad = pop::canonical_transcript(&[1; 32], &[2; 32], "slot-3", &pop::sha256(&csr_der), &[3; 32]);
+    let bad = pop::canonical_transcript(
+        &[1; 32],
+        &[2; 32],
+        "slot-3",
+        &pop::sha256(&csr_der),
+        &[3; 32],
+    );
     assert!(
         pop::verify(&spki, SignatureAlgorithm::EcdsaP256Sha256, &bad, &sig).is_err(),
         "跨 slot 重放必须被拒绝"
@@ -82,12 +94,15 @@ fn ca_signs_client_key_and_chain_verifies() {
     // 2. CN 由服务端决定
     assert_eq!(leaf.subject().to_string(), "CN=slot-integration-2");
     // 3. clientAuth EKU
-    assert!(leaf.extended_key_usage().unwrap().unwrap().value.client_auth);
-    // 4. 证书公钥 = 客户端私钥对应公钥（关键：不能签错钥匙）
-    assert_eq!(
-        leaf.tbs_certificate.subject_pki.raw,
-        extract_spki(&csr_der)
+    assert!(
+        leaf.extended_key_usage()
+            .unwrap()
+            .unwrap()
+            .value
+            .client_auth
     );
+    // 4. 证书公钥 = 客户端私钥对应公钥（关键：不能签错钥匙）
+    assert_eq!(leaf.tbs_certificate.subject_pki.raw, extract_spki(&csr_der));
     // 5. 有效期按请求设置（约 365 天）
     let span = leaf.validity().not_after.timestamp() - leaf.validity().not_before.timestamp();
     assert!(span > 360 * 86400 && span < 370 * 86400, "span={span}");
@@ -166,10 +181,7 @@ fn extract_spki(csr_der: &[u8]) -> Vec<u8> {
 /// CRL 用 `X509 CRL` 标签，rustls_pemfile 不认，直接解 base64 主体。
 fn pem_to_first_der(pem: &str) -> Vec<u8> {
     use base64::Engine;
-    let b64: String = pem
-        .lines()
-        .filter(|l| !l.starts_with("-----"))
-        .collect();
+    let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
     base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .expect("valid base64 body")

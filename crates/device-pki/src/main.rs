@@ -38,7 +38,10 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(ratelimit::DEFAULT_LIMIT);
-    tracing::info!(admin_rate_limit = admin_rate_limit_per_min, "管理端限速预算（/分钟/IP）");
+    tracing::info!(
+        admin_rate_limit = admin_rate_limit_per_min,
+        "管理端限速预算（/分钟/IP）"
+    );
     // 对外公布的 mTLS 地址（客户端拿到证书后连这个，不是注册地址）
     let public_mtls = std::env::var("PUBLIC_MTLS_ENDPOINT")
         .unwrap_or_else(|_| format!("https://{}", reachable_addr(&mtls_addr)));
@@ -60,10 +63,9 @@ async fn main() -> Result<()> {
         std::env::var("CA_KEY").unwrap_or_else(|_| "certs/ca-key.pem".into()),
     )
     .context("read CA key")?;
-    let ca_cert_pem = std::fs::read_to_string(
-        std::env::var("CA_CERT").unwrap_or_else(|_| "certs/ca.pem".into()),
-    )
-    .context("read CA cert")?;
+    let ca_cert_pem =
+        std::fs::read_to_string(std::env::var("CA_CERT").unwrap_or_else(|_| "certs/ca.pem".into()))
+            .context("read CA cert")?;
     let ca = Arc::new(Ca::load(&ca_key_pem, &ca_cert_pem)?);
 
     let db = PgPoolOptions::new()
@@ -101,22 +103,16 @@ async fn main() -> Result<()> {
 
     // 恢复上次运行留下的会话水位：重启后 (serial, seq) 去重立刻生效，
     // 不必等设备重新上线（契约 §6 的"重启可恢复"）。
-    let restored: Vec<(String, String, i64, String)> = sqlx::query_as(
-        "SELECT serial, device_slot, last_seen_seq, state FROM device_session",
-    )
-    .fetch_all(&db)
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "恢复会话水位失败，去重将从 0 开始");
-        Vec::new()
-    });
+    let restored: Vec<(String, String, i64, String)> =
+        sqlx::query_as("SELECT serial, device_slot, last_seen_seq, state FROM device_session")
+            .fetch_all(&db)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "恢复会话水位失败，去重将从 0 开始");
+                Vec::new()
+            });
     for (serial, slot, seq, state) in &restored {
-        sessions.upsert(
-            serial,
-            slot,
-            SessionState::parse(state),
-            *seq,
-        );
+        sessions.upsert(serial, slot, SessionState::parse(state), *seq);
     }
     if !restored.is_empty() {
         tracing::info!(sessions = restored.len(), "已恢复会话水位");
@@ -156,9 +152,9 @@ async fn main() -> Result<()> {
     // 通配订阅一条"落日志"处理器，让 ping 联调时看得见消息；
     // 真实业务方（例如将来的 crates/api）依赖本 crate 后，
     // 自己 `dispatcher.subscribe("telemetry", ...)` 换成真正的处理逻辑。
-    let dispatcher = Arc::new(messaging::Dispatcher::new(
-        std::time::Duration::from_secs(10),
-    ));
+    let dispatcher = Arc::new(messaging::Dispatcher::new(std::time::Duration::from_secs(
+        10,
+    )));
     dispatcher.subscribe_all(|m: messaging::Message| async move {
         tracing::info!(
             serial = %m.serial,
@@ -173,10 +169,8 @@ async fn main() -> Result<()> {
 
     // 离线判定：没有这个定时器，heartbeat_miss 永远没人调用 ——
     // 设备只会被"消息到达时翻回 online"，永远不会被判 offline（契约 §6）
-    let _offline_detector = messaging::spawn_offline_detector(
-        Arc::clone(&sessions),
-        messaging::OFFLINE_TICK_INTERVAL,
-    );
+    let _offline_detector =
+        messaging::spawn_offline_detector(Arc::clone(&sessions), messaging::OFFLINE_TICK_INTERVAL);
 
     // 跨进程下行通知（可选特性 redis-notify）：多实例部署时让"某设备有新消息"
     // 的通知跨进程到达，延迟与单实例一致；不启用则退化为 2s 兜底轮询。
@@ -211,12 +205,7 @@ async fn main() -> Result<()> {
     };
 
     let enroll_cfg = tls::server_config_enroll(&enroll_cert, &enroll_key)?;
-    let mtls_cfg = tls::server_config_mtls(
-        &mtls_cert,
-        &mtls_key,
-        Arc::clone(&ca),
-        cert_status,
-    )?;
+    let mtls_cfg = tls::server_config_mtls(&mtls_cert, &mtls_key, Arc::clone(&ca), cert_status)?;
 
     let enroll_app = routes::enroll_router(state.clone());
     let mtls_app = routes::mtls_router(state);
@@ -271,16 +260,15 @@ async fn axum_server_with_tls(
             };
 
             // 提取客户端证书（mTLS listener 才有）
-            let peer_cert = tls_stream
-                .get_ref()
-                .1
-                .peer_certificates()
-                .and_then(|c| c.first().map(|d| qe_device_pki::tls::PeerCert::from_der(d.to_vec())));
+            let peer_cert = tls_stream.get_ref().1.peer_certificates().and_then(|c| {
+                c.first()
+                    .map(|d| qe_device_pki::tls::PeerCert::from_der(d.to_vec()))
+            });
 
             let svc = app.clone();
             let io = hyper_util::rt::TokioIo::new(tls_stream);
-            let svc = hyper_util::service::TowerToHyperService::new(
-                svc.layer(axum::middleware::from_fn(
+            let svc = hyper_util::service::TowerToHyperService::new(svc.layer(
+                axum::middleware::from_fn(
                     move |mut req: axum::extract::Request, next: axum::middleware::Next| {
                         let pc = peer_cert.clone();
                         let addr = peer_addr;
@@ -293,13 +281,12 @@ async fn axum_server_with_tls(
                             next.run(req).await
                         }
                     },
-                )),
-            );
-            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .serve_connection_with_upgrades(io, svc)
-            .await
+                ),
+            ));
+            if let Err(e) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, svc)
+                    .await
             {
                 tracing::debug!("connection error from {peer_addr}: {e}");
             }

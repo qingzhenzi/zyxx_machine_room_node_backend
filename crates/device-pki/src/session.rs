@@ -173,7 +173,8 @@ impl SessionManager {
             (entry.device_slot.clone(), hit)
         };
         if should_offline {
-            self.schedule_flip(serial, &slot, SessionState::Offline).await;
+            self.schedule_flip(serial, &slot, SessionState::Offline)
+                .await;
         }
     }
 
@@ -190,7 +191,8 @@ impl SessionManager {
             (entry.device_slot.clone(), hit)
         };
         if should_online {
-            self.schedule_flip(serial, &slot, SessionState::Online).await;
+            self.schedule_flip(serial, &slot, SessionState::Online)
+                .await;
         }
     }
 
@@ -284,7 +286,7 @@ impl Backoff {
         let jitter = if jitter_range == 0 {
             0
         } else {
-            (fastrand_u64() % jitter_range) as u64
+            fastrand_u64() % jitter_range
         };
         capped + Duration::from_millis(jitter)
     }
@@ -327,8 +329,10 @@ mod tests {
         mgr.upsert("s1", "slot-1", SessionState::Online, 0);
 
         // 连续排入 offline → online，窗口到期只应提交最后一个
-        mgr.schedule_flip("s1", "slot-1", SessionState::Offline).await;
-        mgr.schedule_flip("s1", "slot-1", SessionState::Online).await;
+        mgr.schedule_flip("s1", "slot-1", SessionState::Offline)
+            .await;
+        mgr.schedule_flip("s1", "slot-1", SessionState::Online)
+            .await;
 
         // online == confirmed，所以不应产生事件
         let got = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
@@ -344,7 +348,8 @@ mod tests {
         };
         let (mgr, mut rx) = SessionManager::new(cfg);
         mgr.upsert("s1", "slot-1", SessionState::Online, 7);
-        mgr.schedule_flip("s1", "slot-1", SessionState::Offline).await;
+        mgr.schedule_flip("s1", "slot-1", SessionState::Offline)
+            .await;
         let ev = tokio::time::timeout(Duration::from_millis(300), rx.recv())
             .await
             .expect("event within window")
@@ -363,7 +368,8 @@ mod tests {
         let (mgr, mut rx) = SessionManager::new(cfg);
         mgr.upsert("s1", "slot-1", SessionState::Offline, 1);
         for _ in 0..5 {
-            mgr.schedule_flip("s1", "slot-1", SessionState::Online).await;
+            mgr.schedule_flip("s1", "slot-1", SessionState::Online)
+                .await;
         }
         let first = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
         assert!(first.is_ok(), "should emit one flip");
@@ -387,7 +393,10 @@ mod tests {
         assert!(d2 >= d1);
         for _ in 0..20 {
             let d = b.next_delay();
-            assert!(d <= Duration::from_millis(1200), "capped with jitter: {d:?}");
+            assert!(
+                d <= Duration::from_millis(1200),
+                "capped with jitter: {d:?}"
+            );
         }
         b.reset();
         assert!(b.next_delay() >= Duration::from_millis(100));
@@ -395,7 +404,13 @@ mod tests {
 
     #[test]
     fn state_string_roundtrip() {
-        assert_eq!(SessionState::parse(SessionState::Online.as_str()), SessionState::Online);
-        assert_eq!(SessionState::parse(SessionState::Offline.as_str()), SessionState::Offline);
+        assert_eq!(
+            SessionState::parse(SessionState::Online.as_str()),
+            SessionState::Online
+        );
+        assert_eq!(
+            SessionState::parse(SessionState::Offline.as_str()),
+            SessionState::Offline
+        );
     }
 }

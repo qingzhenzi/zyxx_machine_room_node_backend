@@ -259,7 +259,12 @@ async fn auto_enrollment_end_to_end() {
     .await;
     assert_eq!(status, StatusCode::OK, "enroll: {body}");
     assert_eq!(body["status"], "issued");
-    assert!(body["cert_pem"].as_str().unwrap().contains("BEGIN CERTIFICATE"));
+    assert!(
+        body["cert_pem"]
+            .as_str()
+            .unwrap()
+            .contains("BEGIN CERTIFICATE")
+    );
     // approval 之外的路径也必须给出 mTLS 端点，否则客户端 confirm 无从下手
     assert_eq!(body["mtls_endpoint"], "https://mtls.integration.test:4441");
     let serial = body["serial"].as_str().unwrap().to_owned();
@@ -267,10 +272,7 @@ async fn auto_enrollment_end_to_end() {
     // 5. token 一次性：再来一次必须失败
     let (status, _) = call(
         &enroll_app,
-        post_json(
-            "/enroll/challenge",
-            json!({"token": token, "slot": slot}),
-        ),
+        post_json("/enroll/challenge", json!({"token": token, "slot": slot})),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "token 应已被消费");
@@ -288,10 +290,7 @@ async fn auto_enrollment_end_to_end() {
     let token2 = body["token"].as_str().unwrap().to_owned();
     let (status, _) = call(
         &enroll_app,
-        post_json(
-            "/enroll/challenge",
-            json!({"token": token2, "slot": slot}),
-        ),
+        post_json("/enroll/challenge", json!({"token": token2, "slot": slot})),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "slot 已有 issued 证书");
@@ -341,7 +340,10 @@ async fn approval_flow_survives_retries_and_delivers_mtls_endpoint() {
     assert_eq!(status, StatusCode::OK, "challenge: {body}");
     let challenge_id = body["challenge_id"].as_str().unwrap().to_owned();
     let challenge = body["challenge"].as_str().unwrap().to_owned();
-    let enroll_id = body["enroll_id"].as_str().expect("challenge 应返回 enroll_id").to_owned();
+    let enroll_id = body["enroll_id"]
+        .as_str()
+        .expect("challenge 应返回 enroll_id")
+        .to_owned();
 
     // 关键：客户端在 challenge 之后、enroll 之前掉线并重试 challenge，
     // 不能被自己刚创建的 pending 单挡成 409（否则这台设备永久注册不上）
@@ -374,7 +376,14 @@ async fn approval_flow_survives_retries_and_delivers_mtls_endpoint() {
     assert_eq!(body["enroll_id"].as_str().unwrap(), enroll_id);
 
     // 未审批：轮询只能看到 pending
-    let (status, body) = call(&enroll_app, Request::builder().uri(format!("/enroll/{enroll_id}")).body(Body::empty()).unwrap()).await;
+    let (status, body) = call(
+        &enroll_app,
+        Request::builder()
+            .uri(format!("/enroll/{enroll_id}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "pending");
     assert!(body["cert_pem"].is_null());
@@ -399,7 +408,9 @@ async fn approval_flow_survives_retries_and_delivers_mtls_endpoint() {
                 .method("POST")
                 .uri(format!("/admin/enroll/{enroll_id}/decide"))
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({"approve": true, "note": "ok"}).to_string()))
+                .body(Body::from(
+                    json!({"approve": true, "note": "ok"}).to_string(),
+                ))
                 .unwrap(),
         ),
     )
@@ -410,7 +421,10 @@ async fn approval_flow_survives_retries_and_delivers_mtls_endpoint() {
     // 批准后必须能拿到证书，**并且带上 mTLS 端点**（否则 confirm 必然 404）
     let (status, body) = call(
         &enroll_app,
-        Request::builder().uri(format!("/enroll/{enroll_id}")).body(Body::empty()).unwrap(),
+        Request::builder()
+            .uri(format!("/enroll/{enroll_id}"))
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "download: {body}");
@@ -425,7 +439,10 @@ async fn approval_flow_survives_retries_and_delivers_mtls_endpoint() {
     // 激活前允许重复下载（响应在路上丢了还能再取）
     let (status, body) = call(
         &enroll_app,
-        Request::builder().uri(format!("/enroll/{enroll_id}")).body(Body::empty()).unwrap(),
+        Request::builder()
+            .uri(format!("/enroll/{enroll_id}"))
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "issued 期间应可重取: {body}");
@@ -460,7 +477,10 @@ async fn approval_flow_survives_retries_and_delivers_mtls_endpoint() {
     assert!(pem_in_db.is_empty(), "激活后 DB 不应再持有证书 PEM");
     let (status, _) = call(
         &enroll_app,
-        Request::builder().uri(format!("/enroll/{enroll_id}")).body(Body::empty()).unwrap(),
+        Request::builder()
+            .uri(format!("/enroll/{enroll_id}"))
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::GONE, "激活后再取应为 410");
@@ -520,7 +540,9 @@ async fn rejecting_an_enrollment_revokes_the_signed_certificate() {
                 .method("POST")
                 .uri(format!("/admin/enroll/{enroll_id}/decide"))
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json!({"approve": false, "note": "unknown device"}).to_string()))
+                .body(Body::from(
+                    json!({"approve": false, "note": "unknown device"}).to_string(),
+                ))
                 .unwrap(),
         ),
     )
@@ -537,13 +559,19 @@ async fn rejecting_an_enrollment_revokes_the_signed_certificate() {
         .expect("row");
     let revoked_at = revoked_at.expect("拒绝必须写 revoked_at");
     let age = (chrono::Utc::now() - revoked_at).num_seconds();
-    assert!(age.abs() < 30, "revoked_at 应该是刚刚写入的，实际 {age}s 前");
+    assert!(
+        age.abs() < 30,
+        "revoked_at 应该是刚刚写入的，实际 {age}s 前"
+    );
     assert_eq!(reason.as_deref(), Some("rejected"));
 
     // 轮询看到 rejected，且拿不到证书
     let (status, body) = call(
         &enroll_app,
-        Request::builder().uri(format!("/enroll/{enroll_id}")).body(Body::empty()).unwrap(),
+        Request::builder()
+            .uri(format!("/enroll/{enroll_id}"))
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "rejected 轮询: {body}");
@@ -655,8 +683,11 @@ async fn auto_enroll(state: &AppState, app: &Router, slot: &str) -> (String, Str
     )
     .await;
     let token = body["token"].as_str().unwrap().to_owned();
-    let (_, body) =
-        call(app, post_json("/enroll/challenge", json!({"token": token, "slot": slot}))).await;
+    let (_, body) = call(
+        app,
+        post_json("/enroll/challenge", json!({"token": token, "slot": slot})),
+    )
+    .await;
     let challenge_id = body["challenge_id"].as_str().unwrap().to_owned();
     let challenge = body["challenge"].as_str().unwrap().to_owned();
     let device = make_device(slot);
@@ -704,8 +735,15 @@ async fn admin_endpoints_are_rate_limited_per_ip() {
         .oneshot(with_ip(ip_a, list_req()))
         .await
         .expect("route");
-    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "第 3 次应被限");
-    let retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).is_some();
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "第 3 次应被限"
+    );
+    let retry_after = resp
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .is_some();
     assert!(retry_after, "429 应带 Retry-After");
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&bytes).unwrap();
@@ -747,7 +785,11 @@ async fn messages_are_deduped_by_serial_and_seq() {
     assert_eq!(body["duplicate"], false);
 
     let (status, body) = call(&mtls_app, build(1, "{}".into())).await;
-    assert_eq!(status, StatusCode::OK, "重放仍应是 2xx，客户端才敢重试: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "重放仍应是 2xx，客户端才敢重试: {body}"
+    );
     assert_eq!(body["duplicate"], true, "同一 seq 必须被判为重复");
 
     let (status, body) = call(&mtls_app, build(2, "{}".into())).await;

@@ -1,6 +1,6 @@
 //! HTTP 端点（契约第 4 节）。
 
-use crate::ca::{parse_reason, Ca};
+use crate::ca::{Ca, parse_reason};
 use crate::challenge;
 use crate::error::{Error, Result};
 use crate::pop::{self, SignatureAlgorithm};
@@ -101,7 +101,8 @@ pub async fn enroll_challenge(
     .bind(&req.slot)
     .fetch_optional(&st.db)
     .await?;
-    let reusable_pending = matches!(&live, Some((_, status)) if status == "pending" && kind == TokenKind::Approval);
+    let reusable_pending =
+        matches!(&live, Some((_, status)) if status == "pending" && kind == TokenKind::Approval);
     if live.is_some() && !reusable_pending {
         return Err(Error::SlotConflict);
     }
@@ -203,13 +204,8 @@ pub async fn enroll(
     let alg = SignatureAlgorithm::from_label(&req.pop_algorithm)?;
 
     let (token_row, kind) = token::verify(&st.db, &req.token, &req.slot).await?;
-    let chal = challenge::verify(
-        &st.db,
-        req.challenge_id,
-        &token_row.token_hash,
-        &req.slot,
-    )
-    .await?;
+    let chal =
+        challenge::verify(&st.db, req.challenge_id, &token_row.token_hash, &req.slot).await?;
 
     // TOFU / pin 指纹对比：客户端看到的服务端证书必须与服务端自述一致。
     //
@@ -225,7 +221,10 @@ pub async fn enroll(
     {
         return Err(Error::FpMismatch);
     }
-    if !req.tls_cert_seen_fp.eq_ignore_ascii_case(&st.server_cert_fp_hex) {
+    if !req
+        .tls_cert_seen_fp
+        .eq_ignore_ascii_case(&st.server_cert_fp_hex)
+    {
         tracing::warn!(
             seen = %req.tls_cert_seen_fp,
             expected = %st.server_cert_fp_hex,
@@ -359,11 +358,7 @@ fn extract_csr_public_key(csr_der: &[u8]) -> Result<Vec<u8>> {
     use x509_parser::prelude::*;
     let (_, csr) = x509_parser::certification_request::X509CertificationRequest::from_der(csr_der)
         .map_err(|e| Error::BadRequest(format!("invalid CSR: {e}")))?;
-    Ok(csr
-        .certification_request_info
-        .subject_pki
-        .raw
-        .to_vec())
+    Ok(csr.certification_request_info.subject_pki.raw.to_vec())
 }
 
 // ---------------- 管理员审批 ----------------
@@ -487,7 +482,9 @@ pub async fn enroll_status(
         // 已激活：证书已交付并被使用，DB 侧已清空
         "active" => Err(Error::AlreadyDownloaded),
         "revoked" => Err(Error::ApprovalRejected),
-        _ => Err(Error::Internal(anyhow::anyhow!("unexpected status {status}"))),
+        _ => Err(Error::Internal(anyhow::anyhow!(
+            "unexpected status {status}"
+        ))),
     }
 }
 
@@ -596,7 +593,9 @@ pub async fn revoke(
     // 立即生效，不等后台刷新
     st.cert_status.mark_revoked(&req.serial);
     tracing::info!(serial = %req.serial, reason = %reason, "cert revoked");
-    Ok(Json(serde_json::json!({ "status": "revoked", "serial": req.serial })))
+    Ok(Json(
+        serde_json::json!({ "status": "revoked", "serial": req.serial }),
+    ))
 }
 
 // ---------------- 管理端：签发注册链接 / 注册单管理 ----------------
@@ -610,9 +609,7 @@ fn validate_slot(slot: &str) -> Result<()> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        return Err(Error::BadRequest(
-            "slot 只允许字母/数字/-/_/.".into(),
-        ));
+        return Err(Error::BadRequest("slot 只允许字母/数字/-/_/.".into()));
     }
     Ok(())
 }
@@ -652,7 +649,12 @@ pub async fn create_token(
     let created_by = req.created_by.unwrap_or_else(|| "admin".to_owned());
     let issued = token::issue(&st.db, kind, slot, &created_by, ttl).await?;
     let link = token::enroll_link(&st.enroll_endpoint, &issued.token, slot);
-    tracing::info!(slot, kind = kind.as_str(), created_by, "bootstrap token issued");
+    tracing::info!(
+        slot,
+        kind = kind.as_str(),
+        created_by,
+        "bootstrap token issued"
+    );
     Ok(Json(CreateTokenReply {
         token: issued.token,
         kind: kind.as_str().to_owned(),
@@ -706,31 +708,41 @@ pub async fn list_enrollments(
         Option<chrono::DateTime<chrono::Utc>>,
     );
     let rows: Vec<Row> = if let Some(status) = q.status {
-            sqlx::query_as(
-                "SELECT enroll_id, serial, device_slot, status, client_info,
+        sqlx::query_as(
+            "SELECT enroll_id, serial, device_slot, status, client_info,
                         downloaded_at IS NOT NULL, issued_at, activated_at, revoked_at
                  FROM device_enrollment WHERE status = $1
                  ORDER BY issued_at DESC NULLS LAST LIMIT $2",
-            )
-            .bind(status)
-            .bind(limit)
-            .fetch_all(&st.db)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT enroll_id, serial, device_slot, status, client_info,
+        )
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&st.db)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT enroll_id, serial, device_slot, status, client_info,
                         downloaded_at IS NOT NULL, issued_at, activated_at, revoked_at
                  FROM device_enrollment
                  ORDER BY issued_at DESC NULLS LAST LIMIT $1",
-            )
-            .bind(limit)
-            .fetch_all(&st.db)
-            .await?
-        };
+        )
+        .bind(limit)
+        .fetch_all(&st.db)
+        .await?
+    };
     Ok(Json(
         rows.into_iter()
             .map(
-                |(enroll_id, serial, device_slot, status, client_info, downloaded, issued_at, activated_at, revoked_at)| {
+                |(
+                    enroll_id,
+                    serial,
+                    device_slot,
+                    status,
+                    client_info,
+                    downloaded,
+                    issued_at,
+                    activated_at,
+                    revoked_at,
+                )| {
                     EnrollmentSummary {
                         enroll_id,
                         serial,
@@ -874,7 +886,8 @@ pub async fn process_incoming(
 
     // 2) 会话层：登记未知会话（还没 confirm 过 / 重启后），并记一次活动
     if st.sessions.last_seen_seq(&serial).is_none() {
-        st.sessions.upsert(&serial, &slot, SessionState::Online, seq - 1);
+        st.sessions
+            .upsert(&serial, &slot, SessionState::Online, seq - 1);
     }
     st.sessions.mark_seen(&serial).await;
 
@@ -983,9 +996,8 @@ pub async fn crl(State(st): State<AppState>) -> Result<axum::response::Response>
         .into_iter()
         .map(|(serial, at, reason)| crate::ca::RevokedEntry {
             serial_hex: serial,
-            revoked_at: OffsetDateTime::from_unix_timestamp(at.timestamp()).unwrap_or_else(|_| {
-                OffsetDateTime::now_utc()
-            }),
+            revoked_at: OffsetDateTime::from_unix_timestamp(at.timestamp())
+                .unwrap_or_else(|_| OffsetDateTime::now_utc()),
             reason: parse_reason(reason.as_deref().unwrap_or("unspecified")),
         })
         .collect();
@@ -1007,9 +1019,7 @@ fn require_admin(st: &AppState, headers: &axum::http::HeaderMap) -> Result<()> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .ok_or(Error::Unauthorized)?;
-    let token = value
-        .strip_prefix("Bearer ")
-        .ok_or(Error::Unauthorized)?;
+    let token = value.strip_prefix("Bearer ").ok_or(Error::Unauthorized)?;
     // 常量时间比较
     let a = Sha256::digest(token.as_bytes());
     let b = Sha256::digest(st.admin_token.as_bytes());
@@ -1113,7 +1123,9 @@ mod tests {
             server_cert_fp_hex: Arc::from(""),
             cert_status: Arc::new(crate::cert_status::CertStatusCache::new()),
             admin_limiter: Arc::new(crate::ratelimit::RateLimiter::new(0)),
-            dispatcher: Arc::new(crate::messaging::Dispatcher::new(std::time::Duration::from_secs(1))),
+            dispatcher: Arc::new(crate::messaging::Dispatcher::new(
+                std::time::Duration::from_secs(1),
+            )),
             mtls_endpoint: Arc::from("https://mtls.test:4441"),
             enroll_endpoint: Arc::from("https://enroll.test:4440"),
         };

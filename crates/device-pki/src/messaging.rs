@@ -288,12 +288,7 @@ pub async fn inbox_mark_processed(
 }
 
 /// 记一次**失败**：不推 processed_at，这样客户端的重发会走自愈重投。
-pub async fn inbox_mark_failed(
-    pool: &PgPool,
-    serial: &str,
-    seq: i64,
-    reason: &str,
-) -> Result<()> {
+pub async fn inbox_mark_failed(pool: &PgPool, serial: &str, seq: i64, reason: &str) -> Result<()> {
     sqlx::query(
         "UPDATE device_message_inbox
          SET attempts = attempts + 1,
@@ -310,12 +305,7 @@ pub async fn inbox_mark_failed(
 }
 
 /// 推进去重水位（只在**处理成功**后调用）。
-pub async fn bump_watermark(
-    pool: &PgPool,
-    serial: &str,
-    slot: &str,
-    seq: i64,
-) -> Result<()> {
+pub async fn bump_watermark(pool: &PgPool, serial: &str, slot: &str, seq: i64) -> Result<()> {
     sqlx::query(
         "INSERT INTO device_session (serial, device_slot, last_seen_seq, state, updated_at)
          VALUES ($1, $2, $3, 'online', now())
@@ -354,10 +344,7 @@ pub struct Notifier {
 impl Notifier {
     /// 取（或创建）某台设备的通知句柄。
     pub fn waiter(&self, serial: &str) -> std::sync::Arc<tokio::sync::Notify> {
-        self.waiters
-            .entry(serial.to_owned())
-            .or_default()
-            .clone()
+        self.waiters.entry(serial.to_owned()).or_default().clone()
     }
 
     /// 唤醒该设备当前正在等待的长连接。
@@ -368,8 +355,7 @@ impl Notifier {
     }
 }
 
-static GLOBAL_NOTIFIER: std::sync::LazyLock<Notifier> =
-    std::sync::LazyLock::new(Notifier::default);
+static GLOBAL_NOTIFIER: std::sync::LazyLock<Notifier> = std::sync::LazyLock::new(Notifier::default);
 
 /// 进程级通知器（`downlink_publish*` 投递成功后会自动用它唤醒长连接）。
 pub fn notifier() -> &'static Notifier {
@@ -388,8 +374,7 @@ pub trait CrossProcessSignal: Send + Sync + 'static {
     fn publish(&self, serial: String) -> BoxFuture<'static, ()>;
 }
 
-static CROSS_PROCESS: std::sync::OnceLock<Arc<dyn CrossProcessSignal>> =
-    std::sync::OnceLock::new();
+static CROSS_PROCESS: std::sync::OnceLock<Arc<dyn CrossProcessSignal>> = std::sync::OnceLock::new();
 
 /// 安装跨进程通知信号。**只能装一次**（进程级单例），装过返回 `false`。
 pub fn install_cross_process(signal: Arc<dyn CrossProcessSignal>) -> bool {
@@ -498,11 +483,9 @@ pub async fn downlink_publish_to_slot(
     .fetch_optional(pool)
     .await?;
     match row {
-        Some((serial, device_slot)) => {
-            downlink_publish(pool, &serial, &device_slot, kind, payload)
-                .await
-                .map(Some)
-        }
+        Some((serial, device_slot)) => downlink_publish(pool, &serial, &device_slot, kind, payload)
+            .await
+            .map(Some),
         None => Ok(None),
     }
 }
@@ -573,10 +556,7 @@ pub async fn offline_tick(sessions: &SessionManager) {
 ///
 /// 没有它，`SessionManager::heartbeat_miss` 永远没人调用 —— 设备只会被
 /// "消息到达时翻回 online"，永远不会被判 offline（契约 §6 的心跳判定落空）。
-pub fn spawn_offline_detector(
-    sessions: Arc<SessionManager>,
-    interval: Duration,
-) -> JoinHandle<()> {
+pub fn spawn_offline_detector(sessions: Arc<SessionManager>, interval: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -621,9 +601,15 @@ mod tests {
         });
 
         assert!(d.has_handler("telemetry"));
-        assert_eq!(d.dispatch(msg("telemetry")).await.unwrap(), Dispatch::Processed);
+        assert_eq!(
+            d.dispatch(msg("telemetry")).await.unwrap(),
+            Dispatch::Processed
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
-        assert_eq!(d.dispatch(msg("telemetry")).await.unwrap(), Dispatch::Processed);
+        assert_eq!(
+            d.dispatch(msg("telemetry")).await.unwrap(),
+            Dispatch::Processed
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
@@ -631,7 +617,10 @@ mod tests {
     async fn unknown_kind_is_nohandler_not_error() {
         let d = dispatcher();
         assert!(!d.has_handler("whatever"));
-        assert_eq!(d.dispatch(msg("whatever")).await.unwrap(), Dispatch::NoHandler);
+        assert_eq!(
+            d.dispatch(msg("whatever")).await.unwrap(),
+            Dispatch::NoHandler
+        );
     }
 
     #[tokio::test]
@@ -758,11 +747,7 @@ mod tests {
         gate.notify_one();
         let first = task.await.unwrap().expect("第一条应成功");
         assert_eq!(first, Dispatch::Processed);
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            1,
-            "handler 只应被执行一次"
-        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "handler 只应被执行一次");
         assert!(!d.is_in_flight("s1:1"), "处理完必须释放 in-flight");
     }
 }

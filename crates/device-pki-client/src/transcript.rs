@@ -51,11 +51,9 @@ pub struct DeviceKey {
 impl DeviceKey {
     pub fn generate() -> Result<Self> {
         let rng = SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-            &rng,
-        )
-        .map_err(|e| Error::Crypto(format!("generate key: {e}")))?;
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
+                .map_err(|e| Error::Crypto(format!("generate key: {e}")))?;
         let pkcs8 = pkcs8.as_ref().to_vec();
         let key_pair = Self::parse(&pkcs8)?;
         Ok(Self { pkcs8, key_pair })

@@ -36,9 +36,7 @@ impl SignatureAlgorithm {
 
     fn ring_alg(&self) -> &'static dyn signature::VerificationAlgorithm {
         match self {
-            SignatureAlgorithm::EcdsaP256Sha256 => {
-                &signature::ECDSA_P256_SHA256_ASN1
-            }
+            SignatureAlgorithm::EcdsaP256Sha256 => &signature::ECDSA_P256_SHA256_ASN1,
             SignatureAlgorithm::Ed25519 => &signature::ED25519,
         }
     }
@@ -52,8 +50,13 @@ pub fn canonical_transcript(
     csr_sha256: &[u8],
     tls_cert_seen_fp: &[u8],
 ) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity(challenge.len() + token_hash.len() + device_slot.len() + csr_sha256.len() + tls_cert_seen_fp.len());
+    let mut out = Vec::with_capacity(
+        challenge.len()
+            + token_hash.len()
+            + device_slot.len()
+            + csr_sha256.len()
+            + tls_cert_seen_fp.len(),
+    );
     out.extend_from_slice(challenge);
     out.extend_from_slice(token_hash);
     out.extend_from_slice(device_slot.as_bytes());
@@ -120,8 +123,8 @@ mod tests {
 
     fn fresh_key() -> (EcdsaKeyPair, Vec<u8>) {
         let rng = SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
-            .unwrap();
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
         let kp = EcdsaKeyPair::from_pkcs8(
             &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
             pkcs8.as_ref(),
@@ -156,11 +159,7 @@ mod tests {
         let (kp, pubkey) = fresh_key();
         let msg = canonical_transcript(b"chal", b"tok", "slot-1", b"csr", b"fp");
         let rng = SystemRandom::new();
-        let sig = kp
-            .sign(&rng, &msg)
-            .expect("sign")
-            .as_ref()
-            .to_vec();
+        let sig = kp.sign(&rng, &msg).expect("sign").as_ref().to_vec();
         verify(&pubkey, SignatureAlgorithm::EcdsaP256Sha256, &msg, &sig).unwrap();
     }
 
@@ -171,7 +170,15 @@ mod tests {
         let rng = SystemRandom::new();
         let sig = kp.sign(&rng, &msg).expect("sign").as_ref().to_vec();
         let tampered = canonical_transcript(b"chal", b"tok", "slot-2", b"csr", b"fp");
-        assert!(verify(&pubkey, SignatureAlgorithm::EcdsaP256Sha256, &tampered, &sig).is_err());
+        assert!(
+            verify(
+                &pubkey,
+                SignatureAlgorithm::EcdsaP256Sha256,
+                &tampered,
+                &sig
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -187,9 +194,10 @@ mod tests {
         verify(spki, SignatureAlgorithm::EcdsaP256Sha256, &msg, &sig).unwrap();
         // 而 CSR 给的完整 SPKI 也必须可验
         let mut wrapped = Vec::new();
-        wrapped.extend_from_slice(&[0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce,
-                                    0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d,
-                                    0x03, 0x01, 0x07, 0x03, 0x42, 0x00]);
+        wrapped.extend_from_slice(&[
+            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
+            0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+        ]);
         wrapped.extend_from_slice(spki);
         // 只有当它确实是可解析的 SPKI 时才继续
         if SubjectPublicKeyInfo::from_der(&wrapped).is_ok() {

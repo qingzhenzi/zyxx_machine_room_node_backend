@@ -155,11 +155,9 @@ impl CredIssue {
     /// 给运维看的修复建议。
     pub fn advice(&self) -> String {
         match self {
-            CredIssue::NotEnrolled => {
-                "该节点尚未注册。用管理端下发的注册链接执行：\n  \
+            CredIssue::NotEnrolled => "该节点尚未注册。用管理端下发的注册链接执行：\n  \
                  qe-device-pki-client enroll '<link>' --trust"
-                    .into()
-            }
+                .into(),
             CredIssue::MissingFiles(files) => format!(
                 "凭证不完整（缺少 {}）。重新注册：\n  \
                  qe-device-pki-client enroll '<link>' --trust",
@@ -169,9 +167,9 @@ impl CredIssue {
                 "凭证损坏（{why}）。删除凭证目录后重新注册：\n  \
                  rm -rf <creds-dir> && qe-device-pki-client enroll '<link>' --trust"
             ),
-            CredIssue::Expired { not_after } => format!(
-                "证书已于 {not_after} 过期。重新注册或延长有效期。"
-            ),
+            CredIssue::Expired { not_after } => {
+                format!("证书已于 {not_after} 过期。重新注册或延长有效期。")
+            }
         }
     }
 }
@@ -195,10 +193,10 @@ pub fn locate(slot: &str, explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = explicit {
         return Ok(dir.join("creds").join(sanitize(slot)));
     }
-    if let Ok(dir) = std::env::var("QE_DEVICE_PKI_DATA_DIR") {
-        if !dir.is_empty() {
-            return Ok(PathBuf::from(dir).join("creds").join(sanitize(slot)));
-        }
+    if let Ok(dir) = std::env::var("QE_DEVICE_PKI_DATA_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(PathBuf::from(dir).join("creds").join(sanitize(slot)));
     }
     Credentials::dir_for(slot)
 }
@@ -240,7 +238,10 @@ fn key_match(
 
 fn read_required(p: &Path) -> Result<String> {
     std::fs::read_to_string(p).map_err(|e| {
-        Error::Storage(format!("读取 {} 失败: {e}（是否已完成注册？）", p.display()))
+        Error::Storage(format!(
+            "读取 {} 失败: {e}（是否已完成注册？）",
+            p.display()
+        ))
     })
 }
 

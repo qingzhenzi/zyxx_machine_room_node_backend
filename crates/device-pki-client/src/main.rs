@@ -21,7 +21,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
-#[command(name = "qe-device-pki-client", version, about = "设备 PKI 注册与 mTLS 通讯客户端")]
+#[command(
+    name = "qe-device-pki-client",
+    version,
+    about = "设备 PKI 注册与 mTLS 通讯客户端"
+)]
 struct Cli {
     /// 覆盖数据目录（默认 ~/.local/share/qe-device-pki-client）
     #[arg(long, global = true)]
@@ -78,8 +82,7 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -128,7 +131,10 @@ async fn main() -> Result<()> {
                     let dir = enroll::creds_dir(&creds.device_slot, Some(&data_dir))?;
                     println!("  凭证   : {}", dir.display());
                     println!();
-                    println!("下一步：`qe-device-pki-client confirm --slot {}` 完成 mTLS 验证", creds.device_slot);
+                    println!(
+                        "下一步：`qe-device-pki-client confirm --slot {}` 完成 mTLS 验证",
+                        creds.device_slot
+                    );
                 }
                 EnrollOutcome::PendingApproval { enroll_id } => {
                     let slot = enroll::EnrollTarget::parse(&link)
@@ -154,7 +160,10 @@ async fn main() -> Result<()> {
             let outbox = Arc::new(OutboxQueue::open(&data_dir.join("outbox"))?);
             let dispatcher = Arc::new(downlink::Dispatcher::new());
             dispatcher.subscribe_all(|m: transport::DownlinkMessage| async move {
-                println!("▼ 收到下行消息 id={} kind={} payload={}", m.id, m.kind, m.payload);
+                println!(
+                    "▼ 收到下行消息 id={} kind={} payload={}",
+                    m.id, m.kind, m.payload
+                );
                 Ok(())
             });
             let state_file = data_dir.join(format!("downlink-{}.json", cfg.creds.device_slot));
@@ -191,8 +200,14 @@ async fn main() -> Result<()> {
             println!("✓ 注册成功（续跑）");
             println!("  slot   : {}", creds.device_slot);
             println!("  serial : {}", creds.serial);
-            println!("  凭证   : {}", enroll::creds_dir(&creds.device_slot, Some(&data_dir))?.display());
-            println!("下一步：`qe-device-pki-client confirm --slot {}` 完成 mTLS 验证", creds.device_slot);
+            println!(
+                "  凭证   : {}",
+                enroll::creds_dir(&creds.device_slot, Some(&data_dir))?.display()
+            );
+            println!(
+                "下一步：`qe-device-pki-client confirm --slot {}` 完成 mTLS 验证",
+                creds.device_slot
+            );
         }
         Cmd::Ping { count } => {
             let cfg = load_transport(&data_dir, cli.slot.as_deref())?;
@@ -252,11 +267,13 @@ async fn main() -> Result<()> {
             // 下行消费者：按心跳节奏拉一批、本地分发、处理成功才 ack。
             // 游标落 `<data-dir>/downlink-<slot>.json`，重启后从上次位置继续。
             let dl_cfg = Arc::clone(&cfg_all);
-            let dl_state = data_dir
-                .join(format!("downlink-{}.json", cfg_all.creds.device_slot));
+            let dl_state = data_dir.join(format!("downlink-{}.json", cfg_all.creds.device_slot));
             let dispatcher = Arc::new(downlink::Dispatcher::new());
             dispatcher.subscribe_all(|m: transport::DownlinkMessage| async move {
-                println!("▼ 收到下行消息 id={} kind={} payload={}", m.id, m.kind, m.payload);
+                println!(
+                    "▼ 收到下行消息 id={} kind={} payload={}",
+                    m.id, m.kind, m.payload
+                );
                 Ok(())
             });
             let downlink_task = tokio::spawn(async move {
@@ -362,9 +379,8 @@ fn load_transport(data_dir: &std::path::Path, slot: Option<&str>) -> Result<Tran
         Some(s) => qe_device_pki_client::creds::locate(s, Some(data_dir))?,
         None => find_any_creds(data_dir)?,
     };
-    let creds = Credentials::load(&creds_dir).with_context(|| {
-        format!("加载凭证失败（{}）", creds_dir.display())
-    })?;
+    let creds = Credentials::load(&creds_dir)
+        .with_context(|| format!("加载凭证失败（{}）", creds_dir.display()))?;
     // 用前自检：损坏的凭证必须在这里就报清楚，而不是等 mTLS 握手含糊失败
     if let Err(issue) = creds.verify() {
         anyhow::bail!("凭证不可用：{issue}\n\n{}", issue.advice());
@@ -380,7 +396,12 @@ fn find_any_pending(data_dir: &std::path::Path) -> Result<String> {
         for entry in rd.flatten() {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                found.push(p.file_stem().unwrap_or_default().to_string_lossy().into_owned());
+                found.push(
+                    p.file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
         }
     }
@@ -407,13 +428,20 @@ fn find_any_creds(data_dir: &std::path::Path) -> Result<PathBuf> {
         }
     }
     match found.len() {
-        0 => anyhow::bail!("未找到任何已注册凭证（{} 下为空），请先执行 enroll", base.display()),
+        0 => anyhow::bail!(
+            "未找到任何已注册凭证（{} 下为空），请先执行 enroll",
+            base.display()
+        ),
         1 => Ok(found.remove(0)),
         _ => anyhow::bail!(
             "发现多个凭证目录，请用 --slot 指定：{}",
             found
                 .iter()
-                .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
+                .map(|p| p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         ),

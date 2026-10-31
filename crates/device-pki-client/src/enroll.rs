@@ -18,7 +18,11 @@ use std::time::Duration;
 
 fn is_loopback_host(authority: &str) -> bool {
     let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.trim_start_matches('[').split(']').next().unwrap_or(host);
+    let host = host
+        .trim_start_matches('[')
+        .split(']')
+        .next()
+        .unwrap_or(host);
     let host = host.split(':').next().unwrap_or(host);
     host == "localhost" || host.starts_with("127.") || host == "::1"
 }
@@ -795,8 +799,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -810,8 +813,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-    {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -894,8 +896,8 @@ fn build_csr(slot: &str, key: &transcript::DeviceKey) -> Result<Vec<u8>> {
 
     // 把 PKCS#8 交给 rcgen
     let key_pem = key_to_pem(key)?;
-    let rc_key = KeyPair::from_pem(&key_pem)
-        .map_err(|e| Error::Crypto(format!("rcgen load key: {e}")))?;
+    let rc_key =
+        KeyPair::from_pem(&key_pem).map_err(|e| Error::Crypto(format!("rcgen load key: {e}")))?;
 
     let mut params = CertificateParams::default();
     let mut dn = DistinguishedName::new();

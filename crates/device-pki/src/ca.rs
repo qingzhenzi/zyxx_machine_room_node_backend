@@ -241,9 +241,9 @@ pub fn pem_to_private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::BasicConstraints as RcgenBasicConstraints;
     use rcgen::{CertificateParams as CsrParams, KeyPair as CsrKey};
     use x509_parser::prelude::{FromDer, X509Certificate};
-    use rcgen::BasicConstraints as RcgenBasicConstraints;
 
     fn make_csr(cn: &str) -> Vec<u8> {
         let key = CsrKey::generate().unwrap();

@@ -23,8 +23,8 @@ pub fn cert_fp_hex(der: &[u8]) -> String {
 /// 相比整证书指纹，SPKI 指纹在证书续期后仍然稳定，是 HPKP 式的常规做法。
 pub fn spki_fp_hex(der: &[u8]) -> Result<String> {
     use x509_parser::prelude::*;
-    let (_, cert) = X509Certificate::from_der(der)
-        .map_err(|e| Error::Crypto(format!("parse cert: {e}")))?;
+    let (_, cert) =
+        X509Certificate::from_der(der).map_err(|e| Error::Crypto(format!("parse cert: {e}")))?;
     Ok(hex::encode(Sha256::digest(
         cert.tbs_certificate.subject_pki.raw,
     )))
@@ -164,17 +164,17 @@ pub struct TrustOutcome {
 
 fn data_dir() -> Result<PathBuf> {
     // 手写平台目录逻辑，避免引入 dirs/directories 带来的多余传递依赖
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("qe-device-pki-client"));
-        }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
+        && !xdg.is_empty()
+    {
+        return Ok(PathBuf::from(xdg).join("qe-device-pki-client"));
     }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return Ok(PathBuf::from(home)
-                .join(".local/share")
-                .join("qe-device-pki-client"));
-        }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return Ok(PathBuf::from(home)
+            .join(".local/share")
+            .join("qe-device-pki-client"));
     }
     if let Ok(appdata) = std::env::var("APPDATA") {
         return Ok(PathBuf::from(appdata).join("qe-device-pki-client"));

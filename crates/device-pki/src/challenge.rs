@@ -47,16 +47,11 @@ pub struct ChallengeRow {
 }
 
 /// 签发挑战值，绑定 token 与 slot。
-pub async fn issue(
-    db: &PgPool,
-    token_hash: &[u8],
-    device_slot: &str,
-) -> Result<IssuedChallenge> {
+pub async fn issue(db: &PgPool, token_hash: &[u8], device_slot: &str) -> Result<IssuedChallenge> {
     let mut challenge = [0u8; 32];
     rand::rng().fill_bytes(&mut challenge);
     let challenge_id = Uuid::new_v4();
-    let expires_at =
-        chrono::Utc::now() + chrono::Duration::seconds(CHALLENGE_TTL_SECS as i64);
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(CHALLENGE_TTL_SECS as i64);
 
     sqlx::query(
         "INSERT INTO device_enroll_challenge
@@ -142,6 +137,8 @@ mod tests {
     #[test]
     fn ttl_is_short() {
         // 短 TTL 是安全属性的一部分，防止挑战值长时间可被利用
-        assert!(CHALLENGE_TTL_SECS <= 120);
+        const {
+            assert!(CHALLENGE_TTL_SECS <= 120);
+        }
     }
 }

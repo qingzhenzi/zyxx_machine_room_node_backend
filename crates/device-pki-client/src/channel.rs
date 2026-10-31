@@ -23,9 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::WebSocketStream;
 
 /// 隧道所用的 WebSocket 连接类型（mTLS 之上的 HTTP/1.1 升级）。
 pub type WsStream = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
@@ -46,14 +46,19 @@ pub enum ClientFrame {
         kind: String,
         payload: String,
     },
-    Ack { up_to: i64 },
+    Ack {
+        up_to: i64,
+    },
     Ping,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
-    Ready { status: String, serial: String },
+    Ready {
+        status: String,
+        serial: String,
+    },
     AckMsg {
         seq: u64,
         status: String,
@@ -65,7 +70,10 @@ pub enum ServerFrame {
         payload: String,
     },
     Pong,
-    Err { code: String, message: String },
+    Err {
+        code: String,
+        message: String,
+    },
 }
 
 // ---------------- 建连 ----------------
@@ -184,10 +192,8 @@ pub async fn run_on(
     dispatcher: &Dispatcher,
     state_file: &Path,
 ) -> Result<()> {
-    let mut heartbeat = tokio::time::interval_at(
-        tokio::time::Instant::now() + HEARTBEAT,
-        HEARTBEAT,
-    );
+    let mut heartbeat =
+        tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut cursor = downlink::load_state(state_file)?.last_id;
@@ -212,7 +218,11 @@ pub async fn run_on(
                 };
                 match frame {
                     ServerFrame::Ready { .. } => {}
-                    ServerFrame::AckMsg { seq, status, duplicate } => {
+                    ServerFrame::AckMsg {
+                        seq,
+                        status,
+                        duplicate,
+                    } => {
                         // 上行被服务端确认 → 从 outbox 删除
                         outbox.ack(seq)?;
                         tracing::debug!(seq, status = %status, duplicate, "上行已确认");
@@ -282,10 +292,7 @@ enum Tick {
 }
 
 /// 把 outbox 里未 ACK 的消息按 seq 逐条发出去（顺序不可乱）。
-async fn push_pending(
-    outbox: &OutboxQueue,
-    ws: &mut WsStream,
-) -> Result<()> {
+async fn push_pending(outbox: &OutboxQueue, ws: &mut WsStream) -> Result<()> {
     let pending = outbox.pending()?;
     for msg in pending {
         let frame = ClientFrame::Msg {
@@ -357,7 +364,10 @@ mod tests {
             r#"{"type":"msg","seq":3,"kind":"heartbeat","payload":"{}"}"#
         );
         let ack = ClientFrame::Ack { up_to: 9 };
-        assert_eq!(serde_json::to_string(&ack).unwrap(), r#"{"type":"ack","up_to":9}"#);
+        assert_eq!(
+            serde_json::to_string(&ack).unwrap(),
+            r#"{"type":"ack","up_to":9}"#
+        );
 
         let ready: ServerFrame =
             serde_json::from_str(r#"{"type":"ready","status":"active","serial":"abc"}"#).unwrap();

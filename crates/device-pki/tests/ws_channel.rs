@@ -25,7 +25,9 @@ const ADMIN_TOKEN: &str = "integration-admin-token";
 
 /// 生成一套 CA + 服务端证书（带 SAN，客户端要做主机名校验）。
 fn make_ca_and_server_cert() -> (rcgen::Certificate, rcgen::KeyPair, String, String) {
-    use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, SanType};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, SanType,
+    };
     use std::net::IpAddr;
 
     let ca_key = KeyPair::generate().unwrap();
@@ -55,7 +57,12 @@ fn make_ca_and_server_cert() -> (rcgen::Certificate, rcgen::KeyPair, String, Str
     sp.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let server_cert = sp.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
 
-    (ca_cert, ca_key, server_cert.pem(), server_key.serialize_pem())
+    (
+        ca_cert,
+        ca_key,
+        server_cert.pem(),
+        server_key.serialize_pem(),
+    )
 }
 
 /// 起一个真实的 mTLS listener（与 `main.rs` 的装配一致：注入 PeerCert + 对端地址）。
@@ -84,8 +91,8 @@ async fn spawn_mtls_listener(
                     .and_then(|c| c.first().map(|d| tls::PeerCert::from_der(d.to_vec())));
                 let svc = app.clone();
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
-                let svc = hyper_util::service::TowerToHyperService::new(
-                    svc.layer(axum::middleware::from_fn(
+                let svc = hyper_util::service::TowerToHyperService::new(svc.layer(
+                    axum::middleware::from_fn(
                         move |mut req: axum::extract::Request, next: axum::middleware::Next| {
                             let pc = peer_cert.clone();
                             async move {
@@ -96,8 +103,8 @@ async fn spawn_mtls_listener(
                                 next.run(req).await
                             }
                         },
-                    )),
-                );
+                    ),
+                ));
                 let _ = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
                 )
@@ -180,7 +187,10 @@ async fn ws_channel_connects_and_activates_enrollment() {
             return;
         }
     };
-    sqlx::migrate!("../../migrations").run(&db).await.expect("migrate");
+    sqlx::migrate!("../../migrations")
+        .run(&db)
+        .await
+        .expect("migrate");
 
     let slot = format!("ws-{}", uuid::Uuid::new_v4().simple());
     let cleanup = |db: sqlx::PgPool, slot: String| async move {
@@ -226,16 +236,21 @@ async fn ws_channel_connects_and_activates_enrollment() {
     // 业务方订阅：证明帧协议真的走到分发器（而不是只做去重）
     let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let seen_h = Arc::clone(&seen);
-    state.dispatcher.subscribe("heartbeat", move |m: qe_device_pki::messaging::Message| {
-        let seen_h = Arc::clone(&seen_h);
-        async move {
-            seen_h.lock().unwrap().push(m.payload.clone());
-            Ok(())
-        }
-    });
+    state
+        .dispatcher
+        .subscribe("heartbeat", move |m: qe_device_pki::messaging::Message| {
+            let seen_h = Arc::clone(&seen_h);
+            async move {
+                seen_h.lock().unwrap().push(m.payload.clone());
+                Ok(())
+            }
+        });
 
     // ---- 走真实注册流程拿到设备证书（auto 型）----
-    use axum::{body::Body, http::{header, Request, StatusCode}};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+    };
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -330,11 +345,12 @@ async fn ws_channel_connects_and_activates_enrollment() {
     assert_eq!(body["status"], "issued");
 
     // 注册单此刻必须还是 issued（还没激活）
-    let (before,): (String,) = sqlx::query_as("SELECT status FROM device_enrollment WHERE device_slot = $1")
-        .bind(&slot)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    let (before,): (String,) =
+        sqlx::query_as("SELECT status FROM device_enrollment WHERE device_slot = $1")
+            .bind(&slot)
+            .fetch_one(&db)
+            .await
+            .unwrap();
     assert_eq!(before, "issued");
 
     // fail-closed：握手前必须把证书可用性加载进来
@@ -356,7 +372,13 @@ async fn ws_channel_connects_and_activates_enrollment() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // ---- 设备连上来 ----
-    let mut ws = dial(listener_addr, &ca_pem, &device_cert_pem, &device_key.serialize_pem()).await;
+    let mut ws = dial(
+        listener_addr,
+        &ca_pem,
+        &device_cert_pem,
+        &device_key.serialize_pem(),
+    )
+    .await;
 
     // 首帧必须是 ready —— 它就是"注册已激活"的回执
     let ready = next_frame(&mut ws).await;
@@ -364,11 +386,12 @@ async fn ws_channel_connects_and_activates_enrollment() {
     assert_eq!(ready["status"], "active");
     assert_eq!(ready["serial"].as_str().unwrap().len(), 40);
 
-    let (after,): (String,) = sqlx::query_as("SELECT status FROM device_enrollment WHERE device_slot = $1")
-        .bind(&slot)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    let (after,): (String,) =
+        sqlx::query_as("SELECT status FROM device_enrollment WHERE device_slot = $1")
+            .bind(&slot)
+            .fetch_one(&db)
+            .await
+            .unwrap();
     assert_eq!(after, "active", "建连本身必须把 issued 推进到 active");
     let (cert_pem_after,): (String,) =
         sqlx::query_as("SELECT cert_pem FROM device_enrollment WHERE device_slot = $1")
@@ -418,7 +441,9 @@ async fn ws_channel_connects_and_activates_enrollment() {
 
     // 处理成功 → ack；服务端标记已投递
     ws.send(Message::Text(
-        serde_json::json!({"type":"ack","up_to": down_id}).to_string().into(),
+        serde_json::json!({"type":"ack","up_to": down_id})
+            .to_string()
+            .into(),
     ))
     .await
     .unwrap();

@@ -60,7 +60,9 @@ pub enum ClientFrame {
         payload: String,
     },
     /// 设备 → 服务端：确认已处理的下行游标（含）
-    Ack { up_to: i64 },
+    Ack {
+        up_to: i64,
+    },
     Ping,
 }
 
@@ -68,7 +70,10 @@ pub enum ClientFrame {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
     /// 建连成功，注册已激活
-    Ready { status: String, serial: String },
+    Ready {
+        status: String,
+        serial: String,
+    },
     /// 上行消息处理结果
     AckMsg {
         seq: i64,
@@ -82,7 +87,10 @@ pub enum ServerFrame {
         payload: String,
     },
     Pong,
-    Err { code: String, message: String },
+    Err {
+        code: String,
+        message: String,
+    },
 }
 
 /// `GET /channel` —— 建立 WebSocket 隧道（mTLS，客户端证书必需）。
@@ -161,7 +169,13 @@ async fn session(st: AppState, mut socket: WebSocket, peer: PeerCert, serial: St
                 let frame: ClientFrame = match serde_json::from_str(&text) {
                     Ok(f) => f,
                     Err(e) => {
-                        send_err(&mut socket, &serial, "bad_frame", &format!("无法解析帧: {e}")).await;
+                        send_err(
+                            &mut socket,
+                            &serial,
+                            "bad_frame",
+                            &format!("无法解析帧: {e}"),
+                        )
+                        .await;
                         continue;
                     }
                 };
@@ -194,7 +208,8 @@ async fn session(st: AppState, mut socket: WebSocket, peer: PeerCert, serial: St
                     ClientFrame::Ack { up_to } => {
                         missed = 0;
                         if up_to <= 0 {
-                            send_err(&mut socket, &serial, "bad_request", "up_to 必须为正整数").await;
+                            send_err(&mut socket, &serial, "bad_request", "up_to 必须为正整数")
+                                .await;
                         } else if let Err(e) =
                             crate::messaging::downlink_ack(&st.db, &serial, up_to).await
                         {
@@ -321,17 +336,17 @@ mod tests {
             payload: "{}".into(),
         };
         let json = serde_json::to_string(&down).unwrap();
-        assert_eq!(json, r#"{"type":"down","id":7,"kind":"config","payload":"{}"}"#);
+        assert_eq!(
+            json,
+            r#"{"type":"down","id":7,"kind":"config","payload":"{}"}"#
+        );
 
         let ack: ClientFrame = serde_json::from_str(r#"{"type":"ack","up_to":7}"#).unwrap();
         assert!(matches!(ack, ClientFrame::Ack { up_to: 7 }));
 
         let msg: ClientFrame =
             serde_json::from_str(r#"{"type":"msg","seq":1,"kind":"k","payload":"p"}"#).unwrap();
-        assert!(matches!(
-            msg,
-            ClientFrame::Msg { seq: 1, .. }
-        ));
+        assert!(matches!(msg, ClientFrame::Msg { seq: 1, .. }));
 
         let err = ServerFrame::Err {
             code: "token_invalid".into(),

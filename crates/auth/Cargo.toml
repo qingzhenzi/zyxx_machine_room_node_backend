@@ -13,6 +13,10 @@ argon2 = "0.5"
 chrono = "0.4"
 hex = "0.4"
 jsonwebtoken = "9"
+# `password_hash::rand_core::OsRng` 需要 rand_core 的 `getrandom` feature。
+# argon2 只以 default-features=false 引入 rand_core，单独构建本 crate 时会缺 feature，
+# 因此在 workspace 统一构建才能编译。这里显式开启，保证 `cargo check -p qe-auth` 也成立。
+rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"

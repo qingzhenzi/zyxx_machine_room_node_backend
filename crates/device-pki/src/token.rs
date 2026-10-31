@@ -97,11 +97,7 @@ pub async fn issue(
 
 /// 只读校验：token 是否存在、未用过、未过期、slot 是否匹配。
 /// 真正的"一次性"由 `consume` 在签发事务里用条件 UPDATE 仲裁。
-pub async fn verify(
-    db: &PgPool,
-    token: &str,
-    device_slot: &str,
-) -> Result<(TokenRow, TokenKind)> {
+pub async fn verify(db: &PgPool, token: &str, device_slot: &str) -> Result<(TokenRow, TokenKind)> {
     let token_hash = hash_token(token);
     let row: Option<TokenRow> = sqlx::query_as(
         "SELECT token_hash, kind, device_slot, used_at, expires_at

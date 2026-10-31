@@ -15,7 +15,7 @@
 //! ```
 
 use crate::error::{Error, Result};
-use crate::transport::{ack_downlink, fetch_downlink, DownlinkMessage, TransportConfig};
+use crate::transport::{DownlinkMessage, TransportConfig, ack_downlink, fetch_downlink};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -170,7 +170,12 @@ pub async fn poll_once(
     let acked = ack_downlink(cfg, max_id).await?;
     state.last_id = max_id;
     save_state(&state, state_file)?;
-    tracing::debug!(acked, last_id = max_id, processed = count, "下行消息已处理并 ack");
+    tracing::debug!(
+        acked,
+        last_id = max_id,
+        processed = count,
+        "下行消息已处理并 ack"
+    );
     Ok(count)
 }
 
@@ -212,7 +217,11 @@ mod tests {
 
         d.dispatch(msg(1, "config")).await.unwrap();
         d.dispatch(msg(2, "other")).await.unwrap();
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "只有 config 命中专用 handler");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "只有 config 命中专用 handler"
+        );
         assert_eq!(all.load(Ordering::SeqCst), 2, "通配收到全部");
     }
 

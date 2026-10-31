@@ -109,7 +109,8 @@ impl IntoResponse for Error {
         if let Some(retry_after) = self.retry_after()
             && let Ok(v) = axum::http::HeaderValue::from_str(&retry_after.to_string())
         {
-            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, v);
         }
         resp
     }
