@@ -1059,3 +1059,41 @@ async fn downlink_queue_is_pull_then_ack() {
 
     cleanup(&db, &slot).await;
 }
+
+/// HTTP 轮询模式：`GET /messages/downlink` 必须算作心跳，否则 agent 只拉下行
+/// 不上行时会被离线判定器误判成 offline（管理端看到假离线）。
+#[tokio::test]
+async fn downlink_pull_counts_as_heartbeat() {
+    use qe_device_pki::session::SessionState;
+
+    let Some((state, enroll_app, mtls_app)) = setup().await else {
+        return;
+    };
+    let slot = unique_slot("hb");
+    let (cert_pem, serial) = auto_enroll(&state, &enroll_app, &slot).await;
+    let cert_der = pem_first_der(&cert_pem);
+
+    // 先人工置为 offline，验证一次下行 pull 就能排一次 online 翻转。
+    state
+        .sessions
+        .upsert(&serial, &slot, SessionState::Offline, 0);
+
+    let mut req = Request::builder()
+        .uri("/messages/downlink?after=0")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(qe_device_pki::tls::PeerCert::from_der(cert_der));
+    let (status, _) = call(&mtls_app, req).await;
+    assert!(status.is_success(), "downlink pull 应成功：{status}");
+
+    // 250ms 防抖窗口之后再断言。
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        state.sessions.confirmed_state(&serial),
+        Some(SessionState::Online),
+        "下行 pull 后会话应恢复 online"
+    );
+
+    cleanup(&state.db, &slot).await;
+}

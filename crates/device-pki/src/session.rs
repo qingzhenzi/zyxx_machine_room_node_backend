@@ -141,6 +141,11 @@ impl SessionManager {
         Dedup::Fresh
     }
 
+    /// 会话对应的设备 slot（管理端/心跳落库用）。
+    pub fn device_slot(&self, serial: &str) -> Option<String> {
+        self.sessions.get(serial).map(|e| e.device_slot.clone())
+    }
+
     pub fn last_seen_seq(&self, serial: &str) -> Option<i64> {
         self.sessions.get(serial).map(|e| e.last_seen_seq)
     }

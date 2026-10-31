@@ -459,7 +459,11 @@ schedule:read    schedule:manage    schedule:event:read    schedule:event:manage
 
 - `serial = null`：槽位已分配但设备尚未注册；
 - `pending_token = true`：存在未使用且未过期的注册 token，等待设备注册；
-- `status` 来自 `device_enrollment.status`，`online` / `last_seen_at` 来自 `device_session`，主 API 只读。
+- `status` 来自 `device_enrollment.status`，`online` / `last_seen_at` 来自 `device_session`，主 API 只读；
+- **在线判定**：device-pki 每 5s 检查一次心跳，连续 3 次无活动（>5s 未活动算一次 miss）判 `offline`，
+  因此节点下线后管理端约 **15–20s** 才能看到 `offline`。HTTP 下行轮询（`GET /messages/downlink`）、
+  下行 ACK、上行消息与 WS 连接都算活动；`last_seen_at` 由心跳节流刷新（粒度约 15s）。
+  当前没有“离线主动通知/Webhook”，需要管理端轮询 `/devices` 或房间详情来发现。
 
 ### 添加设备（签发注册 token → 设备注册）
 

@@ -558,6 +558,7 @@ pub async fn activate_enrollment(st: &AppState, slot: &str) -> Result<ConfirmRep
     .await?;
 
     st.sessions.upsert(&serial, slot, SessionState::Online, 0);
+    persist_session_online(st, &serial, Some(slot)).await;
 
     Ok(ConfirmReply {
         status: "active".into(),
@@ -932,6 +933,76 @@ pub struct DownlinkReply {
     pub next_after: i64,
 }
 
+/// 记录一次设备活动：内存心跳 + 节流写 `device_session.updated_at`。
+///
+/// 管理端把 `device_session.updated_at` 当作 `last_seen_at` 展示；HTTP 轮询模式的
+/// agent 不会走上行消息，因此必须把下行 pull/ack 也算作活动，否则会被离线判定器
+/// 误判为 offline（WS 模式由 channel.rs 记活动）。
+async fn mark_device_activity(st: &AppState, serial: &str) {
+    // device-pki 重启后内存会话为空（confirm 不会重放）：用 DB 里的 enrollment
+    // 恢复内存会话，否则离线判定器永远遍历不到这个设备。
+    let mut slot = st.sessions.device_slot(serial);
+    if slot.is_none() {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT device_slot FROM device_enrollment
+             WHERE serial = $1 AND status IN ('issued','active')
+             ORDER BY issued_at DESC LIMIT 1",
+        )
+        .bind(serial)
+        .fetch_optional(&st.db)
+        .await
+        .unwrap_or(None);
+        if let Some((restored,)) = row {
+            st.sessions
+                .upsert(serial, &restored, SessionState::Online, 0);
+            slot = Some(restored);
+        }
+    }
+    st.sessions.mark_seen(serial).await;
+    persist_session_online(st, serial, slot.as_deref()).await;
+}
+
+/// 把会话的 online 状态落库，并节流刷新 `updated_at`（管理端的 `last_seen_at`）。
+///
+/// 之前只靠状态翻转事件写 `device_session`：设备长期 online 时表里可能没有任何行，
+/// 管理端看到 `online=null`。这里在 confirm 与每次活动时保证行存在。
+async fn persist_session_online(st: &AppState, serial: &str, slot: Option<&str>) {
+    let result =
+        match slot {
+            Some(slot) => sqlx::query(
+                "INSERT INTO device_session (serial, device_slot, last_seen_seq, state, updated_at)
+                 VALUES ($1, $2, 0, 'online', now())
+                 ON CONFLICT (serial) DO UPDATE SET
+                   device_slot = EXCLUDED.device_slot,
+                   state = 'online',
+                   updated_at = now()
+                 WHERE device_session.state <> 'online'
+                    OR device_session.updated_at < now() - interval '15 seconds'",
+            )
+            .bind(serial)
+            .bind(slot)
+            .execute(&st.db)
+            .await,
+            None => sqlx::query(
+                "INSERT INTO device_session (serial, device_slot, last_seen_seq, state, updated_at)
+                 SELECT $1, device_slot, 0, 'online', now() FROM device_enrollment
+                  WHERE serial = $1 AND status IN ('issued','active')
+                  ORDER BY issued_at DESC LIMIT 1
+                 ON CONFLICT (serial) DO UPDATE SET
+                   state = 'online',
+                   updated_at = now()
+                 WHERE device_session.state <> 'online'
+                    OR device_session.updated_at < now() - interval '15 seconds'",
+            )
+            .bind(serial)
+            .execute(&st.db)
+            .await,
+        };
+    if let Err(error) = result {
+        tracing::warn!(error = %error, serial, "刷新 device_session 失败");
+    }
+}
+
 /// `GET /messages/downlink` —— 设备拉取下行消息（mTLS listener）。
 ///
 /// **拉取不等于投递**：拿到消息后要处理，处理成功再 `POST .../ack`；
@@ -942,6 +1013,7 @@ pub async fn downlink_pull(
     axum::extract::Query(q): axum::extract::Query<DownlinkQuery>,
 ) -> Result<Json<DownlinkReply>> {
     let serial = peer.serial_hex.clone().ok_or(Error::Unauthorized)?;
+    mark_device_activity(&st, &serial).await;
     let after = q.after.unwrap_or(0).max(0);
     let limit = q.limit.unwrap_or(100);
 
@@ -978,6 +1050,7 @@ pub async fn downlink_ack(
     Json(req): Json<DownlinkAck>,
 ) -> Result<Json<serde_json::Value>> {
     let serial = peer.serial_hex.clone().ok_or(Error::Unauthorized)?;
+    mark_device_activity(&st, &serial).await;
     if req.up_to <= 0 {
         return Err(Error::BadRequest("up_to 必须为正整数".into()));
     }
