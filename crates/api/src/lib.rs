@@ -6,6 +6,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod email;
 pub mod error;
+pub mod scheduler;
 pub mod state;
 
 // qe-api 作为 HTTP/装配层依赖下层 crate，而不是反过来。
@@ -45,6 +46,15 @@ pub async fn run() -> anyhow::Result<()> {
     bootstrap::ensure_bootstrap_admin(&state)
         .await
         .context("初始化引导管理员失败")?;
+
+    // 课表事件引擎：后台任务，自身错误只记录日志，不影响 HTTP 服务。
+    if config.schedule_engine_enabled {
+        // JoinHandle detach：引擎生命周期跟随进程，随进程退出一起结束。
+        let _engine = scheduler::spawn(state.clone());
+        tracing::info!(tick_secs = config.schedule_tick_secs, "课表事件引擎已启动");
+    } else {
+        tracing::info!("课表事件引擎已禁用（SCHEDULE_ENGINE_ENABLED=false）");
+    }
 
     let listener = TcpListener::bind(config.bind_addr)
         .await

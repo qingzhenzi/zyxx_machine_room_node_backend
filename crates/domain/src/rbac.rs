@@ -14,6 +14,16 @@ pub mod permissions {
     pub const USER_MANAGE: &str = "user:manage";
     pub const ROLE_MANAGE: &str = "role:manage";
     pub const AUDIT_READ: &str = "audit:read";
+    pub const AREA_READ: &str = "area:read";
+    pub const AREA_MANAGE: &str = "area:manage";
+    pub const ROOM_READ: &str = "room:read";
+    pub const ROOM_MANAGE: &str = "room:manage";
+    pub const SCHEDULE_READ: &str = "schedule:read";
+    pub const SCHEDULE_MANAGE: &str = "schedule:manage";
+    pub const SCHEDULE_EVENT_READ: &str = "schedule:event:read";
+    pub const SCHEDULE_EVENT_MANAGE: &str = "schedule:event:manage";
+    pub const DEVICE_READ: &str = "device:read";
+    pub const DEVICE_MANAGE: &str = "device:manage";
 
     pub const ALL: &[&str] = &[
         ANNOUNCEMENT_READ,
@@ -23,6 +33,16 @@ pub mod permissions {
         USER_MANAGE,
         ROLE_MANAGE,
         AUDIT_READ,
+        AREA_READ,
+        AREA_MANAGE,
+        ROOM_READ,
+        ROOM_MANAGE,
+        SCHEDULE_READ,
+        SCHEDULE_MANAGE,
+        SCHEDULE_EVENT_READ,
+        SCHEDULE_EVENT_MANAGE,
+        DEVICE_READ,
+        DEVICE_MANAGE,
     ];
 }
 
@@ -46,5 +66,24 @@ mod tests {
         let roles = vec![roles::EDITOR.to_owned(), roles::ADMIN.to_owned()];
         assert!(is_admin(&roles));
         assert!(!is_admin(&[roles::VIEWER.to_owned()]));
+    }
+
+    #[test]
+    fn schedule_permissions_are_registered() {
+        for code in [
+            permissions::AREA_READ,
+            permissions::AREA_MANAGE,
+            permissions::ROOM_READ,
+            permissions::ROOM_MANAGE,
+            permissions::SCHEDULE_READ,
+            permissions::SCHEDULE_MANAGE,
+            permissions::SCHEDULE_EVENT_READ,
+            permissions::SCHEDULE_EVENT_MANAGE,
+            permissions::DEVICE_READ,
+            permissions::DEVICE_MANAGE,
+        ] {
+            assert!(permissions::ALL.contains(&code), "缺少权限：{code}");
+        }
+        assert_eq!(permissions::ALL.len(), 17);
     }
 }

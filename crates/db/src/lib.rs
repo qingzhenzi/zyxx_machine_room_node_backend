@@ -7,9 +7,11 @@ pub mod announcements;
 pub mod audit;
 pub mod auth_ports;
 mod db;
+pub mod device;
 pub mod error;
 pub mod roles;
 pub mod rows;
+pub mod schedule;
 pub mod security;
 pub mod users;
 

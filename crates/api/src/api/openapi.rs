@@ -47,6 +47,11 @@ pub async fn json_spec() -> Json<Value> {
             { "name": "Auth" },
             { "name": "Announcements" },
             { "name": "Admin" },
+            { "name": "Areas", "description": "区域：楼栋 / 楼层 / 片区（总管理节点预留 parent_id）" },
+            { "name": "Rooms", "description": "房间：调度最小单位，可绑定设备槽位" },
+            { "name": "Schedules", "description": "课表：周模板、单日覆盖与排课实例" },
+            { "name": "ScheduleEvents", "description": "触发规则、事件与投递重放/重试" },
+            { "name": "Devices", "description": "设备：注册状态、在线状态与区域/房间绑定（v3）" },
             { "name": "Health" }
         ],
         "components": {
@@ -256,6 +261,419 @@ pub async fn json_spec() -> Json<Value> {
                         "page": { "type": "integer" },
                         "page_size": { "type": "integer" }
                     }
+                },
+                "Area": {
+                    "type": "object",
+                    "required": ["id", "code", "name", "description", "is_active", "metadata", "timezone", "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "description": { "type": "string" },
+                        "parent_id": { "type": ["string", "null"], "format": "uuid", "description": "总管理节点 / 子管理节点预留，本版本不做节点间同步。" },
+                        "is_active": { "type": "boolean" },
+                        "metadata": { "type": "object" },
+                        "timezone": { "type": "string", "example": "Asia/Shanghai", "description": "IANA 时区；房间/课表继承该时区，所有时间点以 UTC 存储、按此时区展示本地时间。" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "AreaPage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Area" } },
+                        "total": { "type": "integer" },
+                        "page": { "type": "integer" },
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "CreateAreaRequest": {
+                    "type": "object",
+                    "required": ["code", "name"],
+                    "properties": {
+                        "code": { "type": "string", "description": "2-64 位，首字符字母，可含字母数字 - _ ." },
+                        "name": { "type": "string", "maxLength": 200 },
+                        "description": { "type": "string" },
+                        "parent_id": { "type": ["string", "null"], "format": "uuid" },
+                        "is_active": { "type": "boolean" },
+                        "metadata": { "type": "object" },
+                        "timezone": { "type": "string", "example": "Asia/Shanghai", "description": "IANA 时区名，缺省 Asia/Shanghai。" }
+                    }
+                },
+                "UpdateAreaRequest": {
+                    "type": "object",
+                    "properties": {
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "description": { "type": "string" },
+                        "parent_id": { "type": ["string", "null"], "format": "uuid", "description": "缺失 = 不修改；null = 清空。" },
+                        "is_active": { "type": "boolean" },
+                        "metadata": { "type": ["object", "null"] },
+                        "timezone": { "type": "string", "description": "修改后按新时区自动重建该区域下所有课表的未来排课实例。" }
+                    }
+                },
+                "Room": {
+                    "type": "object",
+                    "required": ["id", "area_id", "area_name", "code", "name", "capacity", "device", "timezone", "is_active", "metadata", "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "area_id": { "type": "string", "format": "uuid" },
+                        "area_name": { "type": "string" },
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "capacity": { "type": "integer", "minimum": 0 },
+                        "device_slot": { "type": ["string", "null"], "description": "绑定 device_enrollment.device_slot；唯一。" },
+                        "device": { "oneOf": [{ "$ref": "#/components/schemas/RoomDevice" }, { "type": "null" }], "description": "只读：房间绑定槽位后的设备注册/在线摘要；null = 未绑定。" },
+                        "webhook_url": { "type": ["string", "null"], "format": "uri" },
+                        "timezone": { "type": "string", "readOnly": true, "example": "Asia/Shanghai", "description": "只读：继承自所属区域。" },
+                        "is_active": { "type": "boolean" },
+                        "metadata": { "type": "object" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "RoomPage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Room" } },
+                        "total": { "type": "integer" },
+                        "page": { "type": "integer" },
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "DeviceStatus": {
+                    "type": "string",
+                    "enum": ["pending", "issued", "active", "rejected", "revoked"],
+                    "description": "设备注册状态（来自 device_enrollment.status）。"
+                },
+                "DeviceOnlineState": {
+                    "type": "string",
+                    "enum": ["online", "offline"],
+                    "description": "设备在线状态（来自 device_session.state）。"
+                },
+                "RoomDevice": {
+                    "type": "object",
+                    "required": ["device_slot", "serial", "status", "online", "last_seen_at", "pending_token"],
+                    "properties": {
+                        "device_slot": { "type": "string" },
+                        "serial": { "type": ["string", "null"], "description": "null = 已分配槽位但尚未注册。" },
+                        "status": { "type": ["string", "null"], "enum": ["pending", "issued", "active", "rejected", "revoked", null] },
+                        "online": { "type": ["string", "null"], "enum": ["online", "offline", null] },
+                        "last_seen_at": { "type": ["string", "null"], "format": "date-time" },
+                        "pending_token": { "type": "boolean", "description": "存在未使用且未过期的注册 token。" }
+                    }
+                },
+                "DeviceInfo": {
+                    "type": "object",
+                    "required": ["serial", "device_slot", "status", "online", "last_seen_at", "downloaded", "client_info", "issued_at", "activated_at", "revoked_at", "room_id", "room_code", "room_name", "area_id", "area_name"],
+                    "properties": {
+                        "serial": { "type": "string" },
+                        "device_slot": { "type": "string" },
+                        "status": { "$ref": "#/components/schemas/DeviceStatus" },
+                        "online": { "oneOf": [{ "$ref": "#/components/schemas/DeviceOnlineState" }, { "type": "null" }] },
+                        "last_seen_at": { "type": ["string", "null"], "format": "date-time" },
+                        "downloaded": { "type": "boolean" },
+                        "client_info": { "type": ["object", "null"], "description": "设备注册时上报的客户端信息。" },
+                        "issued_at": { "type": ["string", "null"], "format": "date-time" },
+                        "activated_at": { "type": ["string", "null"], "format": "date-time" },
+                        "revoked_at": { "type": ["string", "null"], "format": "date-time" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid", "description": "null = 未绑定房间。" },
+                        "room_code": { "type": ["string", "null"] },
+                        "room_name": { "type": ["string", "null"] },
+                        "area_id": { "type": ["string", "null"], "format": "uuid" },
+                        "area_name": { "type": ["string", "null"] }
+                    }
+                },
+                "DevicePage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/DeviceInfo" } },
+                        "total": { "type": "integer" },
+                        "page": { "type": "integer" },
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "DeviceTokenRequest": {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["auto", "approval"], "default": "auto", "description": "auto = 自动注册；approval = 需审批。" },
+                        "ttl_secs": { "type": "integer", "minimum": 60, "maximum": 86400, "default": 900 }
+                    }
+                },
+                "DeviceTokenReply": {
+                    "type": "object",
+                    "required": ["token", "kind", "device_slot", "expires_at", "link"],
+                    "properties": {
+                        "token": { "type": "string", "description": "64 位 hex 明文 token，只返回一次。" },
+                        "kind": { "type": "string", "enum": ["auto", "approval"] },
+                        "device_slot": { "type": "string" },
+                        "expires_at": { "type": "string", "format": "date-time" },
+                        "link": { "type": "string", "format": "uri", "description": "设备注册链接：{PUBLIC_ENROLL_ENDPOINT}/enroll?token=…&slot=…" }
+                    }
+                },
+                "CreateRoomRequest": {
+                    "type": "object",
+                    "required": ["area_id", "code", "name"],
+                    "properties": {
+                        "area_id": { "type": "string", "format": "uuid" },
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "capacity": { "type": "integer", "minimum": 0, "maximum": 100000 },
+                        "device_slot": { "type": ["string", "null"] },
+                        "webhook_url": { "type": ["string", "null"], "format": "uri" },
+                        "is_active": { "type": "boolean" },
+                        "metadata": { "type": "object" }
+                    }
+                },
+                "UpdateRoomRequest": {
+                    "type": "object",
+                    "properties": {
+                        "area_id": { "type": "string", "format": "uuid" },
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "capacity": { "type": "integer" },
+                        "device_slot": { "type": ["string", "null"], "description": "缺失 = 不修改；null = 清空。" },
+                        "webhook_url": { "type": ["string", "null"], "description": "缺失 = 不修改；null = 清空。" },
+                        "is_active": { "type": "boolean" },
+                        "metadata": { "type": ["object", "null"] }
+                    }
+                },
+                "Schedule": {
+                    "type": "object",
+                    "required": ["id", "room_id", "room_name", "name", "start_date", "end_date", "timezone", "is_active", "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "room_id": { "type": "string", "format": "uuid" },
+                        "room_name": { "type": "string" },
+                        "name": { "type": "string" },
+                        "start_date": { "type": "string", "format": "date" },
+                        "end_date": { "type": "string", "format": "date" },
+                        "timezone": { "type": "string", "readOnly": true, "example": "Asia/Shanghai", "description": "只读：继承自房间所属区域；周模板 TIME 按此时区解释。" },
+                        "is_active": { "type": "boolean" },
+                        "created_by": { "type": ["string", "null"], "format": "uuid" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "SchedulePage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Schedule" } },
+                        "total": { "type": "integer" },
+                        "page": { "type": "integer" },
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "CreateScheduleRequest": {
+                    "type": "object",
+                    "required": ["room_id", "name", "start_date", "end_date"],
+                    "properties": {
+                        "room_id": { "type": "string", "format": "uuid" },
+                        "name": { "type": "string", "maxLength": 200 },
+                        "start_date": { "type": "string", "format": "date" },
+                        "end_date": { "type": "string", "format": "date" },
+                        "is_active": { "type": "boolean" }
+                    }
+                },
+                "UpdateScheduleRequest": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "start_date": { "type": "string", "format": "date" },
+                        "end_date": { "type": "string", "format": "date" },
+                        "is_active": { "type": "boolean" }
+                    }
+                },
+                "NewWeeklySlot": {
+                    "type": "object",
+                    "required": ["day_of_week", "start_time", "end_time", "course_name"],
+                    "properties": {
+                        "day_of_week": { "type": "integer", "minimum": 1, "maximum": 7, "description": "ISO 星期：周一=1 .. 周日=7。" },
+                        "start_time": { "type": "string", "example": "08:00" },
+                        "end_time": { "type": "string", "example": "09:40" },
+                        "course_name": { "type": "string" },
+                        "teacher": { "type": "string" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid", "description": "调课到其他房间；空 = 课表所属房间。" },
+                        "note": { "type": "string" }
+                    }
+                },
+                "WeeklySlot": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "schedule_id": { "type": "string", "format": "uuid" },
+                        "day_of_week": { "type": "integer" },
+                        "start_time": { "type": "string" },
+                        "end_time": { "type": "string" },
+                        "course_name": { "type": "string" },
+                        "teacher": { "type": "string" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid" },
+                        "room_name": { "type": ["string", "null"] },
+                        "note": { "type": "string" },
+                        "created_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "ReplaceWeeklySlotsRequest": {
+                    "type": "object",
+                    "required": ["slots"],
+                    "properties": {
+                        "slots": { "type": "array", "items": { "$ref": "#/components/schemas/NewWeeklySlot" }, "maxItems": 200 }
+                    }
+                },
+                "NewExceptionSlot": {
+                    "type": "object",
+                    "required": ["start_time", "end_time", "course_name"],
+                    "properties": {
+                        "start_time": { "type": "string" },
+                        "end_time": { "type": "string" },
+                        "course_name": { "type": "string" },
+                        "teacher": { "type": "string" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid" },
+                        "note": { "type": "string" }
+                    }
+                },
+                "ScheduleExceptionSlot": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "exception_id": { "type": "string", "format": "uuid" },
+                        "start_time": { "type": "string" },
+                        "end_time": { "type": "string" },
+                        "course_name": { "type": "string" },
+                        "teacher": { "type": "string" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid" },
+                        "room_name": { "type": ["string", "null"] },
+                        "note": { "type": "string" }
+                    }
+                },
+                "ScheduleException": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "schedule_id": { "type": "string", "format": "uuid" },
+                        "exception_date": { "type": "string", "format": "date" },
+                        "kind": { "type": "string", "enum": ["cancel", "replace"] },
+                        "note": { "type": "string" },
+                        "slots": { "type": "array", "items": { "$ref": "#/components/schemas/ScheduleExceptionSlot" } },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "UpsertExceptionRequest": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["cancel", "replace"] },
+                        "note": { "type": "string" },
+                        "slots": { "type": "array", "items": { "$ref": "#/components/schemas/NewExceptionSlot" }, "maxItems": 100 }
+                    }
+                },
+                "Occurrence": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "schedule_id": { "type": "string", "format": "uuid" },
+                        "room_id": { "type": "string", "format": "uuid" },
+                        "occurrence_date": { "type": "string", "format": "date" },
+                        "start_at": { "type": "string", "format": "date-time", "description": "UTC 时间点。" },
+                        "end_at": { "type": "string", "format": "date-time", "description": "UTC 时间点。" },
+                        "timezone": { "type": "string", "example": "Asia/Shanghai", "description": "只读：来自课表→房间→区域。" },
+                        "start_local": { "type": "string", "example": "2026-11-02T08:00:00+08:00", "description": "按 timezone 格式化的本地开始时间。" },
+                        "end_local": { "type": "string", "example": "2026-11-02T09:40:00+08:00", "description": "按 timezone 格式化的本地结束时间。" },
+                        "course_name": { "type": "string" },
+                        "teacher": { "type": "string" },
+                        "source": { "type": "string", "enum": ["weekly", "custom"] },
+                        "source_slot_id": { "type": "string", "format": "uuid" },
+                        "note": { "type": "string" }
+                    }
+                },
+                "EventRule": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "room_id": { "type": "string", "format": "uuid" },
+                        "trigger_kind": { "type": "string", "enum": ["occurrence_start", "occurrence_end", "occurrence_start_before", "daily_time", "room_occupied", "room_idle"] },
+                        "offset_minutes": { "type": "integer", "minimum": 0, "maximum": 1440 },
+                        "at_time": { "type": ["string", "null"], "example": "07:30", "description": "仅 daily_time 使用且必填。" },
+                        "enabled": { "type": "boolean" },
+                        "config": { "type": "object", "description": "targets / webhook_url / downlink_kind / payload。" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "NewEventRule": {
+                    "type": "object",
+                    "required": ["trigger_kind"],
+                    "properties": {
+                        "trigger_kind": { "type": "string", "enum": ["occurrence_start", "occurrence_end", "occurrence_start_before", "daily_time", "room_occupied", "room_idle"] },
+                        "offset_minutes": { "type": "integer", "minimum": 0, "maximum": 1440 },
+                        "at_time": { "type": ["string", "null"] },
+                        "enabled": { "type": "boolean", "default": true },
+                        "config": { "type": "object" }
+                    }
+                },
+                "ReplaceEventRulesRequest": {
+                    "type": "object",
+                    "required": ["rules"],
+                    "properties": {
+                        "rules": { "type": "array", "items": { "$ref": "#/components/schemas/NewEventRule" }, "maxItems": 50 }
+                    }
+                },
+                "ScheduleEvent": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "event_key": { "type": "string" },
+                        "room_id": { "type": "string", "format": "uuid" },
+                        "schedule_id": { "type": ["string", "null"], "format": "uuid" },
+                        "occurrence_id": { "type": ["string", "null"], "format": "uuid" },
+                        "rule_id": { "type": ["string", "null"], "format": "uuid" },
+                        "event_kind": { "type": "string" },
+                        "title": { "type": "string" },
+                        "payload": { "type": "object" },
+                        "timezone": { "type": "string", "example": "Asia/Shanghai", "description": "事件生成时所属区域时区快照。" },
+                        "triggered_at": { "type": "string", "format": "date-time", "description": "UTC 时间点。" },
+                        "triggered_at_local": { "type": "string", "example": "2026-11-02T08:00:00+08:00", "description": "按 timezone 格式化的本地触发时间。" },
+                        "created_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "ScheduleEventPage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/ScheduleEvent" } },
+                        "total": { "type": "integer" },
+                        "page": { "type": "integer" },
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "ScheduleEventDelivery": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "event_id": { "type": "string", "format": "uuid" },
+                        "target": { "type": "string", "enum": ["pubsub", "downlink", "webhook"] },
+                        "status": { "type": "string", "enum": ["pending", "delivered", "failed", "skipped"] },
+                        "attempts": { "type": "integer" },
+                        "next_attempt_at": { "type": "string", "format": "date-time" },
+                        "last_error": { "type": ["string", "null"] },
+                        "delivered_at": { "type": ["string", "null"], "format": "date-time" },
+                        "created_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "ScheduleEventDetail": {
+                    "type": "object",
+                    "properties": {
+                        "event": { "$ref": "#/components/schemas/ScheduleEvent" },
+                        "deliveries": { "type": "array", "items": { "$ref": "#/components/schemas/ScheduleEventDelivery" } }
+                    }
+                },
+                "RebuildResult": {
+                    "type": "object",
+                    "properties": { "occurrences": { "type": "integer" } }
+                },
+                "ReplayResult": {
+                    "type": "object",
+                    "properties": { "reset": { "type": "integer" } }
                 }
             }
         },
@@ -504,6 +922,486 @@ pub async fn json_spec() -> Json<Value> {
                     ],
                     "responses": { "200": { "description": "审计分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuditLogPage" } } } }, "403": error_response("缺少 audit:read") }
                 }
+            },
+            "/admin/areas": {
+                "get": {
+                    "tags": ["Areas"],
+                    "summary": "区域分页",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } },
+                        { "name": "keyword", "in": "query", "schema": { "type": "string" } },
+                        { "name": "include_inactive", "in": "query", "schema": { "type": "boolean", "default": false } }
+                    ],
+                    "responses": {
+                        "200": { "description": "区域分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AreaPage" } } } },
+                        "403": error_response("缺少 area:read")
+                    }
+                },
+                "post": {
+                    "tags": ["Areas"],
+                    "summary": "创建区域（可选 IANA timezone，缺省 Asia/Shanghai）",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateAreaRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Area" } } } },
+                        "400": error_response("参数校验失败"),
+                        "403": error_response("缺少 area:manage"),
+                        "409": error_response("区域编码已存在")
+                    }
+                }
+            },
+            "/admin/areas/{id}": {
+                "get": {
+                    "tags": ["Areas"],
+                    "summary": "区域详情",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "区域", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Area" } } } },
+                        "404": error_response("区域不存在")
+                    }
+                },
+                "patch": {
+                    "tags": ["Areas"],
+                    "summary": "局部更新区域（parent_id / metadata 可传 null；timezone 变更后重建区域实例）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateAreaRequest" } } } },
+                    "responses": {
+                        "200": { "description": "已更新", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Area" } } } },
+                        "400": error_response("参数校验失败 / 没有需要更新的字段"),
+                        "404": error_response("区域不存在")
+                    }
+                },
+                "delete": {
+                    "tags": ["Areas"],
+                    "summary": "删除区域（仍有房间时 409）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "204": { "description": "已删除" },
+                        "404": error_response("区域不存在"),
+                        "409": error_response("区域下仍有房间")
+                    }
+                }
+            },
+            "/admin/rooms": {
+                "get": {
+                    "tags": ["Rooms"],
+                    "summary": "房间分页",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "area_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } },
+                        { "name": "keyword", "in": "query", "schema": { "type": "string" } },
+                        { "name": "include_inactive", "in": "query", "schema": { "type": "boolean", "default": false } }
+                    ],
+                    "responses": {
+                        "200": { "description": "房间分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RoomPage" } } } },
+                        "403": error_response("缺少 room:read")
+                    }
+                },
+                "post": {
+                    "tags": ["Rooms"],
+                    "summary": "创建房间",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateRoomRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Room" } } } },
+                        "400": error_response("参数校验失败"),
+                        "403": error_response("缺少 room:manage"),
+                        "409": error_response("房间编码或设备槽位已存在")
+                    }
+                }
+            },
+            "/admin/rooms/{id}": {
+                "get": {
+                    "tags": ["Rooms"],
+                    "summary": "房间详情",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "房间", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Room" } } } },
+                        "404": error_response("房间不存在")
+                    }
+                },
+                "patch": {
+                    "tags": ["Rooms"],
+                    "summary": "局部更新房间（device_slot / webhook_url 可传 null 清空）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateRoomRequest" } } } },
+                    "responses": {
+                        "200": { "description": "已更新", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Room" } } } },
+                        "400": error_response("参数校验失败 / 没有需要更新的字段"),
+                        "404": error_response("房间不存在")
+                    }
+                },
+                "delete": {
+                    "tags": ["Rooms"],
+                    "summary": "删除房间（级联删除课表与触发规则）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "204": { "description": "已删除" },
+                        "404": error_response("房间不存在")
+                    }
+                }
+            },
+            "/admin/devices": {
+                "get": {
+                    "tags": ["Devices"],
+                    "summary": "设备分页（含房间/区域、注册状态与在线状态）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "area_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "room_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "status", "in": "query", "schema": { "$ref": "#/components/schemas/DeviceStatus" } },
+                        { "name": "assigned", "in": "query", "schema": { "type": "boolean" }, "description": "true = 只看已绑定房间；false = 只看未绑定。" },
+                        { "name": "keyword", "in": "query", "schema": { "type": "string" }, "description": "模糊匹配 serial / device_slot / 房间编码 / 房间名称。" },
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "设备分页（按 issued_at 倒序）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DevicePage" } } } },
+                        "400": error_response("设备状态或分页参数不合法"),
+                        "403": error_response("缺少 device:read")
+                    }
+                }
+            },
+            "/admin/devices/{serial}": {
+                "get": {
+                    "tags": ["Devices"],
+                    "summary": "设备详情",
+                    "security": secured(),
+                    "parameters": [{ "name": "serial", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "responses": {
+                        "200": { "description": "设备详情", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeviceInfo" } } } },
+                        "403": error_response("缺少 device:read"),
+                        "404": error_response("设备不存在")
+                    }
+                }
+            },
+            "/admin/rooms/{id}/device": {
+                "get": {
+                    "tags": ["Devices"],
+                    "summary": "房间设备摘要（未绑定槽位返回 null）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "设备摘要或 null", "content": { "application/json": { "schema": { "oneOf": [{ "$ref": "#/components/schemas/RoomDevice" }, { "type": "null" }] } } } },
+                        "403": error_response("缺少 device:read"),
+                        "404": error_response("房间不存在")
+                    }
+                },
+                "put": {
+                    "tags": ["Devices"],
+                    "summary": "绑定 / 迁移 / 解绑房间设备槽位（同一槽位自动从旧房间迁移）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": {
+                            "type": "object",
+                            "required": ["device_slot"],
+                            "properties": { "device_slot": { "type": ["string", "null"], "description": "字符串 = 绑定/迁移；null = 解绑（缺失该字段为非法请求）。" } }
+                        } } }
+                    },
+                    "responses": {
+                        "200": { "description": "绑定后的房间（含 device 摘要）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Room" } } } },
+                        "400": error_response("设备槽位不合法 / 请求体缺少 device_slot"),
+                        "403": error_response("缺少 device:manage"),
+                        "404": error_response("房间不存在"),
+                        "409": error_response("槽位并发绑定冲突")
+                    }
+                }
+            },
+            "/admin/rooms/{id}/device-token": {
+                "post": {
+                    "tags": ["Devices"],
+                    "summary": "签发设备注册 token（房间无槽位时自动分配；明文 token 只返回一次）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeviceTokenRequest" } } } },
+                    "responses": {
+                        "200": { "description": "注册 token 与注册链接", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeviceTokenReply" } } } },
+                        "400": error_response("token 类型或 ttl_secs 不合法"),
+                        "403": error_response("缺少 device:manage"),
+                        "404": error_response("房间不存在")
+                    }
+                }
+            },
+            "/admin/rooms/{id}/occurrences": {
+                "get": {
+                    "tags": ["Schedules"],
+                    "summary": "房间维度排课实例（UTC + 区域时区本地时间；默认按房间时区今天起 7 天）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "from", "in": "query", "schema": { "type": "string", "format": "date" } },
+                        { "name": "to", "in": "query", "schema": { "type": "string", "format": "date" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "排课实例", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Occurrence" } } } } },
+                        "400": error_response("日期区间不合法"),
+                        "404": error_response("房间不存在")
+                    }
+                }
+            },
+            "/admin/rooms/{id}/event-rules": {
+                "get": {
+                    "tags": ["ScheduleEvents"],
+                    "summary": "房间触发规则",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "触发规则", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/EventRule" } } } } },
+                        "404": error_response("房间不存在")
+                    }
+                },
+                "put": {
+                    "tags": ["ScheduleEvents"],
+                    "summary": "全量替换房间触发规则",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReplaceEventRulesRequest" } } } },
+                    "responses": {
+                        "200": { "description": "已替换", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/EventRule" } } } } },
+                        "400": error_response("规则校验失败"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("房间不存在")
+                    }
+                }
+            },
+            "/admin/schedules": {
+                "get": {
+                    "tags": ["Schedules"],
+                    "summary": "课表分页",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "room_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "课表分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SchedulePage" } } } },
+                        "403": error_response("缺少 schedule:read")
+                    }
+                },
+                "post": {
+                    "tags": ["Schedules"],
+                    "summary": "创建课表",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateScheduleRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Schedule" } } } },
+                        "400": error_response("参数校验失败"),
+                        "403": error_response("缺少 schedule:manage")
+                    }
+                }
+            },
+            "/admin/schedules/{id}": {
+                "get": {
+                    "tags": ["Schedules"],
+                    "summary": "课表详情",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "课表", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Schedule" } } } },
+                        "404": error_response("课表不存在")
+                    }
+                },
+                "patch": {
+                    "tags": ["Schedules"],
+                    "summary": "局部更新课表；成功后重建未来排课实例",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateScheduleRequest" } } } },
+                    "responses": {
+                        "200": { "description": "已更新", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Schedule" } } } },
+                        "400": error_response("参数校验失败 / 没有需要更新的字段"),
+                        "404": error_response("课表不存在"),
+                        "500": error_response("课表已更新但重建排课实例失败；可调用 rebuild 接口重试")
+                    }
+                },
+                "delete": {
+                    "tags": ["Schedules"],
+                    "summary": "删除课表并级联删除实例",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "204": { "description": "已删除" },
+                        "404": error_response("课表不存在")
+                    }
+                }
+            },
+            "/admin/schedules/{id}/weekly-slots": {
+                "get": {
+                    "tags": ["Schedules"],
+                    "summary": "周模板",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "周模板", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/WeeklySlot" } } } } },
+                        "404": error_response("课表不存在")
+                    }
+                },
+                "put": {
+                    "tags": ["Schedules"],
+                    "summary": "全量替换周模板；成功后重建未来排课实例",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReplaceWeeklySlotsRequest" } } } },
+                    "responses": {
+                        "200": { "description": "替换后的周模板", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/WeeklySlot" } } } } },
+                        "400": error_response("时段校验失败"),
+                        "404": error_response("课表不存在"),
+                        "500": error_response("已写入但重建排课实例失败")
+                    }
+                }
+            },
+            "/admin/schedules/{id}/exceptions": {
+                "get": {
+                    "tags": ["Schedules"],
+                    "summary": "单日覆盖列表",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "from", "in": "query", "schema": { "type": "string", "format": "date" } },
+                        { "name": "to", "in": "query", "schema": { "type": "string", "format": "date" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "单日覆盖", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/ScheduleException" } } } } },
+                        "404": error_response("课表不存在")
+                    }
+                }
+            },
+            "/admin/schedules/{id}/exceptions/{date}": {
+                "put": {
+                    "tags": ["Schedules"],
+                    "summary": "upsert 单日覆盖（cancel / replace）；成功后重建未来排课实例",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "date", "in": "path", "required": true, "schema": { "type": "string", "format": "date" } }
+                    ],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpsertExceptionRequest" } } } },
+                    "responses": {
+                        "200": { "description": "覆盖已保存", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScheduleException" } } } },
+                        "400": error_response("时段校验失败"),
+                        "404": error_response("课表不存在"),
+                        "500": error_response("已写入但重建排课实例失败")
+                    }
+                },
+                "delete": {
+                    "tags": ["Schedules"],
+                    "summary": "删除单日覆盖并重建未来排课实例",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "date", "in": "path", "required": true, "schema": { "type": "string", "format": "date" } }
+                    ],
+                    "responses": {
+                        "204": { "description": "已删除" },
+                        "404": error_response("单日覆盖不存在"),
+                        "500": error_response("已删除但重建排课实例失败")
+                    }
+                }
+            },
+            "/admin/schedules/{id}/occurrences": {
+                "get": {
+                    "tags": ["Schedules"],
+                    "summary": "排课实例（UTC start_at/end_at + 区域时区 start_local/end_local；默认按区域时区今天起 7 天）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "from", "in": "query", "schema": { "type": "string", "format": "date" } },
+                        { "name": "to", "in": "query", "schema": { "type": "string", "format": "date" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "排课实例", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Occurrence" } } } } },
+                        "400": error_response("日期区间不合法"),
+                        "404": error_response("课表不存在")
+                    }
+                }
+            },
+            "/admin/schedules/{id}/rebuild": {
+                "post": {
+                    "tags": ["Schedules"],
+                    "summary": "手动重建未来排课实例",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "重建结果", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RebuildResult" } } } },
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("课表不存在"),
+                        "500": error_response("重建失败")
+                    }
+                }
+            },
+            "/admin/schedule-events": {
+                "get": {
+                    "tags": ["ScheduleEvents"],
+                    "summary": "事件分页（triggered_at 倒序；含 timezone / triggered_at_local）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "room_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "kind", "in": "query", "schema": { "type": "string", "enum": ["occurrence_start", "occurrence_end", "occurrence_start_before", "daily_time", "room_occupied", "room_idle"] } },
+                        { "name": "from", "in": "query", "schema": { "type": "string", "format": "date-time" } },
+                        { "name": "to", "in": "query", "schema": { "type": "string", "format": "date-time" } },
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "事件分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScheduleEventPage" } } } },
+                        "400": error_response("事件类型或分页参数不合法"),
+                        "403": error_response("缺少 schedule:event:read")
+                    }
+                }
+            },
+            "/admin/schedule-events/{id}": {
+                "get": {
+                    "tags": ["ScheduleEvents"],
+                    "summary": "事件 + 投递明细",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "事件与投递", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScheduleEventDetail" } } } },
+                        "404": error_response("事件不存在")
+                    }
+                }
+            },
+            "/admin/schedule-events/{id}/replay": {
+                "post": {
+                    "tags": ["ScheduleEvents"],
+                    "summary": "把事件全部投递重置为 pending",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "重放结果", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReplayResult" } } } },
+                        "403": error_response("缺少 schedule:event:manage"),
+                        "404": error_response("事件不存在")
+                    }
+                }
+            },
+            "/admin/schedule-events/{id}/deliveries/{delivery_id}/retry": {
+                "post": {
+                    "tags": ["ScheduleEvents"],
+                    "summary": "单条投递立即重试",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "delivery_id", "in": "path", "required": true, "schema": { "type": "integer" } }
+                    ],
+                    "responses": {
+                        "204": { "description": "已重置为待投递" },
+                        "403": error_response("缺少 schedule:event:manage"),
+                        "404": error_response("事件或投递记录不存在")
+                    }
+                }
             }
         }
     }))
@@ -525,6 +1423,29 @@ mod tests {
         assert!(paths.contains_key("/auth/sessions"));
         assert!(paths.contains_key("/admin/audit-logs"));
         assert!(paths.contains_key("/announcements"));
+        assert!(paths.contains_key("/admin/areas"));
+        assert!(paths.contains_key("/admin/rooms/{id}/event-rules"));
+        assert!(paths.contains_key("/admin/schedules/{id}/weekly-slots"));
+        assert!(paths.contains_key("/admin/schedules/{id}/occurrences"));
+        assert!(paths.contains_key("/admin/schedule-events/{id}/deliveries/{delivery_id}/retry"));
+        assert!(paths.contains_key("/admin/devices"));
+        assert!(paths.contains_key("/admin/devices/{serial}"));
+        assert!(paths.contains_key("/admin/rooms/{id}/device"));
+        assert!(paths.contains_key("/admin/rooms/{id}/device-token"));
+        assert!(
+            spec["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .any(|tag| tag["name"] == "Schedules")
+        );
+        assert!(
+            spec["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .any(|tag| tag["name"] == "Devices")
+        );
         assert_eq!(
             spec["components"]["securitySchemes"]["bearerAuth"]["scheme"],
             "bearer"

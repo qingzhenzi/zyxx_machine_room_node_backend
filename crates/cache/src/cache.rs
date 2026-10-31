@@ -213,6 +213,46 @@ impl Cache {
         let _: i64 = connection.del(session_key(session_id)).await?;
         Ok(())
     }
+
+    /// 抢占一把带 TTL 的分布式锁（`SET key value NX EX ttl`）。
+    ///
+    /// 返回 `true` 表示抢到锁；`false` 表示别的副本正持有。锁到期后由 Redis
+    /// 自动释放，因此进程崩溃也不会造成永久死锁（这也是引擎选它的原因）。
+    pub async fn try_lock(&self, key: &str, ttl_secs: u64) -> CacheResult<bool> {
+        let mut connection = self.connection.clone();
+        let acquired: Option<String> = redis::cmd("SET")
+            .arg(key)
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_secs.max(1))
+            .query_async(&mut connection)
+            .await?;
+        Ok(acquired.is_some())
+    }
+
+    /// 主动释放 [`Cache::try_lock`] 抢到的锁。
+    ///
+    /// 这是普通的 `DEL`：持锁方应当在 TTL 到期前调用；若锁已过期并被其它副本
+    /// 抢到，`DEL` 会误删别人的锁，所以只用于「TTL 明显长于临界区」的场景。
+    pub async fn unlock(&self, key: &str) -> CacheResult<()> {
+        let mut connection = self.connection.clone();
+        let _: i64 = connection.del(key).await?;
+        Ok(())
+    }
+
+    /// 向 Redis 频道发布一条消息（`PUBLISH`），用于事件/下行通知的跨进程广播。
+    ///
+    /// 没有订阅者时 Redis 返回 0，这不算错误：广播是尽力而为的。
+    pub async fn publish(&self, channel: &str, payload: &str) -> CacheResult<()> {
+        let mut connection = self.connection.clone();
+        let _: i64 = redis::cmd("PUBLISH")
+            .arg(channel)
+            .arg(payload)
+            .query_async(&mut connection)
+            .await?;
+        Ok(())
+    }
 }
 
 fn login_fail_key(username: &str) -> String {

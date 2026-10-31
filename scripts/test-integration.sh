@@ -38,6 +38,12 @@ export TEST_REDIS_URL="${TEST_REDIS_URL:-redis://127.0.0.1:6379}"
 echo "Running integration tests against $TEST_DATABASE_URL"
 cargo test -p qe-api --test integration -- --ignored --nocapture
 
+echo "Running schedule (timetable) integration tests against $TEST_DATABASE_URL"
+cargo test -p qe-api --test schedule -- --ignored --nocapture
+
+echo "Running device-room integration tests against $TEST_DATABASE_URL"
+cargo test -p qe-api --test device_room -- --ignored --nocapture
+
 echo "Running device-PKI enrollment flow tests against $TEST_DATABASE_URL"
 cargo test -p qe-device-pki --test enroll_flow -- --ignored --nocapture
 

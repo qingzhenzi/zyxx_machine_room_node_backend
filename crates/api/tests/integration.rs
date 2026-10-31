@@ -268,6 +268,16 @@ fn test_config() -> Config {
         bootstrap_admin_password: None,
         bootstrap_admin_display_name: "Administrator".to_owned(),
         log_format_json: false,
+        schedule_engine_enabled: false,
+        schedule_tick_secs: 15,
+        schedule_horizon_days: 30,
+        schedule_rebuild_interval_secs: 3600,
+        schedule_pubsub_channel: "qe-schedule:events".to_owned(),
+        schedule_downlink_notify_channel: "qe-device-pki:downlink".to_owned(),
+        schedule_webhook_timeout_secs: 5,
+        schedule_webhook_max_attempts: 5,
+        schedule_delivery_batch: 50,
+        public_enroll_endpoint: "https://localhost:4440".to_owned(),
     }
 }
 

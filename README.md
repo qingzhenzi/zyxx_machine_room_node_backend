@@ -285,6 +285,233 @@ audit:read
 - OpenAPI 3.1 JSON：`/api-docs/openapi.json`
 - 文档是手写维护的规范，避免构建时从 GitHub 下载 Swagger UI；如需自动生成可替换为 utoipa 注解 + 离线资产
 
+## 课表与事件
+
+课表能力按「区域 → 房间 → 课表 → 排课实例 → 触发规则 → 事件/投递」组织，当前只实现**房间节点**。
+设计契约见 [`docs/schedule-design.md`](docs/schedule-design.md)，数据库迁移为 `migrations/0009_schedule.sql`。
+
+时间约定：所有具体时间点（实例 `start_at` / `end_at`、事件 `triggered_at`）一律以 **UTC** 存储并返回 RFC3339；
+展示时按**区域（area）的 IANA 时区**转换成本地时间。房间/课表继承区域时区，周模板与单日覆盖的 `TIME`
+是本地钟面时间（由所属区域时区解释）。
+
+### 数据模型
+
+```
+areas ──< rooms ──< schedules ──< schedule_weekly_slots（周模板）
+                  │           ├──< schedule_exceptions ──< schedule_exception_slots（单日覆盖）
+                  │           └──< schedule_occurrences（展开后的排课实例）
+                  └──< schedule_event_rules（触发规则，按房间）
+
+schedule_events（事件，event_key 唯一保证幂等）──< schedule_event_deliveries（每个投递目标一行）
+```
+
+- **区域（area）**：楼栋 / 楼层 / 片区的两级组织；`parent_id` 与 `metadata` 为总管理节点 / 子管理节点预留。
+  `timezone` 是该地区的 IANA 时区（缺省 `Asia/Shanghai`），也是整个课表链路唯一的时区来源。
+- **房间（room）**：调度最小单位，可绑定一个设备槽位 `device_slot`（对应 `device_enrollment.device_slot`，
+  唯一），并可为 webhook 投递配置默认 `webhook_url`；时区只读继承自所属区域（响应字段 `timezone`）。
+- **课表（schedule）**：挂在房间上，包含生效日期范围、默认周循环与单日覆盖；同一房间可有多份课表
+  （通常按学期/周期区分）；时区同样只读继承自区域。
+- **周模板（weekly slot）**：ISO 星期（周一=1..周日=7）+ 本地时段 `"HH:MM"`；`room_id` 非空时表示调课到其他房间。
+- **单日覆盖（exception）**：某天 `cancel`（停课）或用 `replace` 时段替换当天周模板。
+- **排课实例（occurrence）**：周模板 × 日期（或单日覆盖）展开后的具体一节课，落库物化，供事件引擎与查询使用。
+  `start_at` / `end_at` 存 UTC，响应同时给出 `timezone`、`start_local`、`end_local` 便于直接展示。
+  只重写**未来**（`start_at > now()`）的实例，已过去的实例与事件引用保持不变。
+- **触发规则（event rule）**：按房间配置，支持 `occurrence_start`、`occurrence_end`、`occurrence_start_before`、
+  `daily_time`、`room_occupied`、`room_idle`；`config` 指定投递目标与 webhook/下行参数。
+- **事件与投递（event / delivery）**：事件插入幂等（`event_key` 唯一），同事务写入 `pubsub` / `downlink` /
+  `webhook` 三类投递行；投递失败按 `next_attempt_at` 退避重试。事件保存生成时的区域时区快照 `timezone`，
+  响应另给出 `triggered_at_local`。
+
+### 时区与本地时间
+
+- `areas.timezone` 是唯一的时区来源，取值为 IANA 时区名（如 `Asia/Shanghai`、`Europe/Berlin`），
+  创建时缺省 `Asia/Shanghai`；房间与课表不再单独保存 UTC 偏移，响应中的 `timezone` 为只读继承值。
+- 所有时间点以 UTC 存储（PostgreSQL `TIMESTAMPTZ`），API 返回的 `start_at` / `end_at` / `triggered_at`
+  是 UTC RFC3339（`Z` 结尾）。便于展示的本地时间由后端一并返回：
+  - 排课实例：`timezone` + `start_local` / `end_local`（如 `2026-11-02T08:00:00+08:00`）；
+  - 事件：`timezone`（区域时区快照）+ `triggered_at_local`。
+- 周模板 / 单日覆盖的 `start_time` / `end_time` 与触发规则的 `at_time` 是本地钟面时间 `"HH:MM"`，
+  按所属区域时区解释；DST 跳变中不存在的时段返回 400，重复时段取较早的一次。
+- 修改区域 `timezone` 成功后，服务端会按新时区重建该区域下所有课表的未来排课实例；
+  重建失败时区域已更新、接口返回 500 并记录日志，可稍后手动触发重建。
+- `GET /schedules/{id}/occurrences`、`GET /rooms/{id}/occurrences` 的默认日期区间按课表/房间所属区域时区计算“今天”。
+
+### 课表 API
+
+全部挂在 `/api/v1/admin` 下，需要 Bearer 认证与对应权限；分页参数为 `page` / `page_size`（`1..=100`）。
+
+| 方法 | 路径 | 所需权限 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/areas?page=&page_size=&keyword=&include_inactive=` | `area:read` | 区域分页 |
+| POST | `/areas` | `area:manage` | 创建区域（可选 `timezone`，缺省 `Asia/Shanghai`） |
+| GET | `/areas/{id}` | `area:read` | 区域详情 |
+| PATCH | `/areas/{id}` | `area:manage` | 局部更新；`parent_id` / `metadata` 可传 `null`；`timezone` 变更后重建区域实例 |
+| DELETE | `/areas/{id}` | `area:manage` | 删除区域；仍有房间时 409 |
+| GET | `/rooms?area_id=&page=&page_size=&keyword=&include_inactive=` | `room:read` | 房间分页 |
+| POST | `/rooms` | `room:manage` | 创建房间 |
+| GET | `/rooms/{id}` | `room:read` | 房间详情 |
+| PATCH | `/rooms/{id}` | `room:manage` | 局部更新；`device_slot` / `webhook_url` 可传 `null` 清空 |
+| DELETE | `/rooms/{id}` | `room:manage` | 删除房间，级联课表、覆盖、实例与触发规则 |
+| GET | `/schedules?room_id=&page=&page_size=` | `schedule:read` | 课表分页 |
+| POST | `/schedules` | `schedule:manage` | 创建课表 |
+| GET | `/schedules/{id}` | `schedule:read` | 课表详情 |
+| PATCH | `/schedules/{id}` | `schedule:manage` | 局部更新；成功后自动重建未来实例 |
+| DELETE | `/schedules/{id}` | `schedule:manage` | 删除课表并级联实例 |
+| GET | `/schedules/{id}/weekly-slots` | `schedule:read` | 周模板 |
+| PUT | `/schedules/{id}/weekly-slots` | `schedule:manage` | 全量替换周模板（body `{slots:[...]}`）；成功后重建 |
+| GET | `/schedules/{id}/exceptions?from=&to=` | `schedule:read` | 单日覆盖列表 |
+| PUT | `/schedules/{id}/exceptions/{date}` | `schedule:manage` | upsert 覆盖（body `{kind:"cancel"\|"replace",note?,slots?:[...]}`）；成功后重建 |
+| DELETE | `/schedules/{id}/exceptions/{date}` | `schedule:manage` | 删除覆盖并重建 |
+| GET | `/schedules/{id}/occurrences?from=&to=` | `schedule:read` | 排课实例（UTC + `timezone` / `start_local` / `end_local`；默认按区域时区今天起 7 天，跨度 ≤366 天） |
+| GET | `/rooms/{id}/occurrences?from=&to=` | `schedule:read` | 房间维度排课实例（同上，按房间继承时区计算默认区间） |
+| POST | `/schedules/{id}/rebuild` | `schedule:manage` | 手动重建未来实例，返回 `{"occurrences":n}` |
+| GET | `/rooms/{id}/event-rules` | `schedule:read` | 房间触发规则 |
+| PUT | `/rooms/{id}/event-rules` | `schedule:manage` | 全量替换触发规则（body `{rules:[...]}`） |
+| GET | `/schedule-events?room_id=&kind=&from=&to=&page=&page_size=` | `schedule:event:read` | 事件分页（`triggered_at` 倒序；含 `timezone` / `triggered_at_local`） |
+| GET | `/schedule-events/{id}` | `schedule:event:read` | 事件 + 投递明细 `{event,deliveries}` |
+| POST | `/schedule-events/{id}/replay` | `schedule:event:manage` | 全部投递重置为 `pending`，返回 `{"reset":n}` |
+| POST | `/schedule-events/{id}/deliveries/{delivery_id}/retry` | `schedule:event:manage` | 单条投递立即重试，204 |
+
+请求体可选字段语义：**缺失 = 不修改**；对可空字段（`parent_id`、`device_slot`、`webhook_url`、`metadata`）
+传 `null` 表示清空。创建/更新区域可传 `timezone`（IANA 时区名）；房间、课表请求体不再接受 UTC 偏移，
+时区由所属区域继承。`TIME` 字段统一为 `"HH:MM"`（也接受 `"HH:MM:SS"`），日期为 `"YYYY-MM-DD"`。
+
+写操作成功后写审计日志，动作名：`area.create/update/delete`、`room.create/update/delete`、
+`schedule.create/update/delete`、`schedule.set_weekly_slots`、`schedule.set_exception`、
+`schedule.delete_exception`、`room.set_event_rules`、`schedule_event.replay`、`schedule_event.retry`。
+
+`PATCH /schedules/{id}`、`PUT weekly-slots`、`PUT exception`、`DELETE exception` 在写成功后调用
+`rebuild_occurrences` 重建未来实例；重建在事务外进行，失败时写操作已提交、接口返回 500 并记录日志，
+可稍后用 `POST /schedules/{id}/rebuild` 或后台重建任务补齐。
+
+### 权限点
+
+```
+area:read    area:manage    room:read    room:manage
+schedule:read    schedule:manage    schedule:event:read    schedule:event:manage
+```
+
+- `admin` 角色自动拥有全部权限（迁移与 bootstrap 都会补齐）；
+- `viewer` / `editor` 默认获得 4 个只读权限（`area:read`、`room:read`、`schedule:read`、`schedule:event:read`）；
+- 触发规则的读权限为 `schedule:read`，写权限为 `schedule:manage`（规则挂在房间下）。
+
+### 触发与投递语义
+
+- 引擎默认每 `SCHEDULE_TICK_SECONDS` 秒扫描一次；窗口为 `[now - lookback, now]`，
+  `lookback = max(60s, tick × 4)`。事件 `event_key` 唯一，重叠窗口天然幂等。
+- 触发条件：
+  - `occurrence_start` / `occurrence_end`：实例开始 / 结束时刻落在窗口内；
+  - `occurrence_start_before`：`start_at - offset_minutes` 落在窗口内（`offset_minutes > 0`）；
+  - `daily_time`：按房间所属区域时区（IANA），本地 `at_time` 落在窗口内（跨午夜时两天都判断，DST 正确）；
+  - `room_occupied` / `room_idle`：实例开始 / 结束命中窗口，且房间此刻没有更早开始仍未结束的其他实例。
+- 事件 payload 中 `start_at` / `end_at` / `triggered_at` 保持 UTC，另含 `timezone`、`start_local`、
+  `end_local`、`triggered_at_local` 便于下游直接展示。
+- 投递目标由规则 `config` 决定：`targets` 默认三种全投，`webhook_url` 优先取 `config`，其次房间 `webhook_url`；
+  `downlink_kind` 默认 `schedule.event`，`payload` 会浅合并进事件 payload。
+- `pubsub` 总是可投递；`downlink` 在房间未绑定设备槽位时标记 `skipped`；`webhook` 在都没有 URL 时 `skipped`。
+- Webhook 重试退避 `next_attempt_at = now + min(5 × 2^attempts, 300)` 秒，
+  `attempts >= SCHEDULE_WEBHOOK_MAX_ATTEMPTS` 后置为 `failed`。
+- 多副本通过 Redis 锁（`schedule:engine:tick` / `schedule:engine:deliver` / `schedule:engine:rebuild`）保证
+  同一轮只有一个副本执行；事件与投递状态在 PostgreSQL 中共享。
+
+### 配置
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `SCHEDULE_ENGINE_ENABLED` | `true` | 是否启动课表事件引擎 |
+| `SCHEDULE_TICK_SECONDS` | `15` | 触发扫描 / 投递周期，5..=300 |
+| `SCHEDULE_HORIZON_DAYS` | `30` | 排课实例物化天数，1..=366；写接口重建也用它 |
+| `SCHEDULE_REBUILD_INTERVAL_SECONDS` | `3600` | 全量重建周期，60..=86400 |
+| `SCHEDULE_PUBSUB_CHANNEL` | `qe-schedule:events` | 事件 Redis Pub/Sub 频道 |
+| `SCHEDULE_DOWNLINK_NOTIFY_CHANNEL` | `qe-device-pki:downlink` | 设备下行通知频道（与 device-pki 一致） |
+| `SCHEDULE_WEBHOOK_TIMEOUT_SECONDS` | `5` | 单次 webhook 超时，1..=60 |
+| `SCHEDULE_WEBHOOK_MAX_ATTEMPTS` | `5` | 最大投递尝试次数，1..=20 |
+| `SCHEDULE_DELIVERY_BATCH` | `50` | 每轮最多处理的到期投递数，1..=500 |
+
+### 总管理节点（未来）
+
+`areas.parent_id`、`rooms.metadata` 与事件 payload 均为将来**总管理节点 / 子管理节点**预留：
+多个房间节点可由总管理节点统一下发区域/房间/课表，并汇总事件与投递状态。
+本版本不实现节点间同步、学期管理、教师/课程独立实体、调课审批流与事件归档。
+
+## 设备与区域/房间
+
+设备接入把 `device-pki` 管理的设备纳入区域/房间：房间列表直接展示设备注册/在线状态，负责人可以在房间里
+**添加、迁移、解绑设备**，并直接从房间生成设备注册 token/链接。
+设备注册记录仍由 `device_enrollment` / `device-pki` 管理；**绑定的唯一事实来源是
+`rooms.device_slot` ↔ `device_enrollment.device_slot`**（同一 slot 只允许一个非终态证书）。
+设计契约见 [`docs/schedule-design.md`](docs/schedule-design.md) §11，权限迁移为 `migrations/0010_device_room.sql`。
+
+### 房间列表里看设备
+
+`Room` 响应（列表 / 详情 / 创建 / 更新）自动带只读 `device` 摘要；房间未绑定槽位时为 `null`：
+
+```json
+{
+  "device_slot": "node-101",
+  "serial": "3f2a9c…",
+  "status": "active",
+  "online": "online",
+  "last_seen_at": "2026-11-02T08:00:00Z",
+  "pending_token": false
+}
+```
+
+- `serial = null`：槽位已分配但设备尚未注册；
+- `pending_token = true`：存在未使用且未过期的注册 token，等待设备注册；
+- `status` 来自 `device_enrollment.status`，`online` / `last_seen_at` 来自 `device_session`，主 API 只读。
+
+### 添加设备（签发注册 token → 设备注册）
+
+1. 负责人对房间调用 `POST /rooms/{id}/device-token`（房间尚无槽位时自动用房间 code 分配，冲突追加 8 位 id 片段）；
+2. 响应返回一次性明文 `token`（库中只存 SHA-256）与注册链接 `link`：
+
+   ```json
+   {
+     "token": "…64 位 hex…",
+     "kind": "auto",
+     "device_slot": "node-101",
+     "expires_at": "2026-11-02T08:15:00Z",
+     "link": "https://<enroll-endpoint>/enroll?token=…&slot=node-101"
+   }
+   ```
+
+   `kind` 可选 `auto`（自动注册）/ `approval`（需审批），缺省 `auto`；`ttl_secs` 缺省 `900`（60..=86400）；
+3. 设备端使用该链接完成注册后，房间 `device` 自动从「等待注册」变为对应注册/在线状态，无需额外操作。
+
+### API 与迁移 / 解绑
+
+| 方法 | 路径（`/api/v1/admin` 下） | 权限 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/devices?area_id=&room_id=&status=&assigned=&keyword=&page=&page_size=` | `device:read` | 设备分页（含房间/区域与在线状态，按 `issued_at` 倒序） |
+| GET | `/devices/{serial}` | `device:read` | 设备详情；不存在 404 |
+| GET | `/rooms/{id}/device` | `device:read` | 房间设备摘要；未绑定返回 `null`，房间不存在 404 |
+| PUT | `/rooms/{id}/device` | `device:manage` | `{"device_slot": "node-101"}` 绑定/迁移；`{"device_slot": null}` 解绑；房间不存在 404 |
+| POST | `/rooms/{id}/device-token` | `device:manage` | 确保房间有槽位后签发注册 token |
+
+- **迁移**：`PUT /rooms/{new}/device` 绑定已属于其它房间的槽位时，仓储层在事务内先清空旧房间再绑定；
+  审计动作为 `room.bind_device`；
+- **解绑**：`PUT /rooms/{id}/device` 传 `{"device_slot": null}`；设备注册记录不删除，`/devices` 仍能看到，
+  但 `room_id = null`（未绑定）；审计动作为 `room.unbind_device`；
+- **槽位唯一**：沿用 `rooms_device_slot_key` 部分唯一索引，并发绑定冲突返回 409；
+- 签发 token 的审计动作为 `room.issue_device_token`。
+
+### 权限
+
+```
+device:read    device:manage
+```
+
+- `device:read`：查看设备列表/详情与房间设备摘要；
+- `device:manage`：绑定/迁移/解绑设备槽位、签发设备注册 token；
+- `admin` 角色自动拥有全部权限；`viewer` / `editor` 默认只有 `device:read`。
+
+### 配置
+
+| 环境变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `PUBLIC_ENROLL_ENDPOINT` | `https://localhost:4440` | 设备注册服务对外地址，用于拼装 token 响应里的 `link`（自动去掉末尾 `/`） |
+
 ## 请求追踪与日志
 
 ### trace_id / request_id

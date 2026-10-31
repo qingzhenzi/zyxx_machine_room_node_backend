@@ -51,6 +51,19 @@ pub struct Config {
     pub bootstrap_admin_password: Option<String>,
     pub bootstrap_admin_display_name: String,
     pub log_format_json: bool,
+    // ---- 课表事件引擎 ----
+    pub schedule_engine_enabled: bool,
+    pub schedule_tick_secs: u64,
+    pub schedule_horizon_days: i64,
+    pub schedule_rebuild_interval_secs: u64,
+    pub schedule_pubsub_channel: String,
+    pub schedule_downlink_notify_channel: String,
+    pub schedule_webhook_timeout_secs: u64,
+    pub schedule_webhook_max_attempts: u32,
+    pub schedule_delivery_batch: i64,
+    // ---- 设备 ----
+    /// 设备注册服务对外地址，用于拼装注册链接（如 `https://node:4440`）。
+    pub public_enroll_endpoint: String,
 }
 
 impl Config {
@@ -128,6 +141,32 @@ impl Config {
             bail!("EMAIL_RATE_LIMIT_MAX / EMAIL_RATE_LIMIT_WINDOW_SECONDS 必须大于 0");
         }
 
+        let schedule_tick_secs = env_parse("SCHEDULE_TICK_SECONDS", 15_u64)?;
+        if !(5..=300).contains(&schedule_tick_secs) {
+            bail!("SCHEDULE_TICK_SECONDS 需在 5-300 秒之间");
+        }
+        let schedule_horizon_days = env_parse("SCHEDULE_HORIZON_DAYS", 30_i64)?;
+        if !(1..=366).contains(&schedule_horizon_days) {
+            bail!("SCHEDULE_HORIZON_DAYS 需在 1-366 天之间");
+        }
+        let schedule_rebuild_interval_secs =
+            env_parse("SCHEDULE_REBUILD_INTERVAL_SECONDS", 3600_u64)?;
+        if !(60..=86_400).contains(&schedule_rebuild_interval_secs) {
+            bail!("SCHEDULE_REBUILD_INTERVAL_SECONDS 需在 60-86400 秒之间");
+        }
+        let schedule_webhook_timeout_secs = env_parse("SCHEDULE_WEBHOOK_TIMEOUT_SECONDS", 5_u64)?;
+        if !(1..=60).contains(&schedule_webhook_timeout_secs) {
+            bail!("SCHEDULE_WEBHOOK_TIMEOUT_SECONDS 需在 1-60 秒之间");
+        }
+        let schedule_webhook_max_attempts = env_parse("SCHEDULE_WEBHOOK_MAX_ATTEMPTS", 5_u32)?;
+        if !(1..=20).contains(&schedule_webhook_max_attempts) {
+            bail!("SCHEDULE_WEBHOOK_MAX_ATTEMPTS 需在 1-20 之间");
+        }
+        let schedule_delivery_batch = env_parse("SCHEDULE_DELIVERY_BATCH", 50_i64)?;
+        if !(1..=500).contains(&schedule_delivery_batch) {
+            bail!("SCHEDULE_DELIVERY_BATCH 需在 1-500 之间");
+        }
+
         reject_insecure_production_defaults(
             environment,
             &jwt_secret,
@@ -169,6 +208,21 @@ impl Config {
                 .unwrap_or_else(|| "Administrator".to_owned()),
             log_format_json: env_optional("LOG_FORMAT")
                 .is_some_and(|value| value.eq_ignore_ascii_case("json")),
+            schedule_engine_enabled: env_parse_bool("SCHEDULE_ENGINE_ENABLED", true)?,
+            schedule_tick_secs,
+            schedule_horizon_days,
+            schedule_rebuild_interval_secs,
+            schedule_pubsub_channel: env_optional("SCHEDULE_PUBSUB_CHANNEL")
+                .unwrap_or_else(|| "qe-schedule:events".to_owned()),
+            schedule_downlink_notify_channel: env_optional("SCHEDULE_DOWNLINK_NOTIFY_CHANNEL")
+                .unwrap_or_else(|| "qe-device-pki:downlink".to_owned()),
+            schedule_webhook_timeout_secs,
+            schedule_webhook_max_attempts,
+            schedule_delivery_batch,
+            public_enroll_endpoint: env_optional("PUBLIC_ENROLL_ENDPOINT")
+                .unwrap_or_else(|| "https://localhost:4440".to_owned())
+                .trim_end_matches('/')
+                .to_owned(),
         })
     }
 
