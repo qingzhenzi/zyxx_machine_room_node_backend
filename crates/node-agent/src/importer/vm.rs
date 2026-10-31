@@ -7,7 +7,7 @@
 //! pool 名与 `virsh` 路径由 [`VmImporter::new`] 注入（默认来自 `LIBVIRT_POOL` / `VIRSH_BIN`），
 //! 便于测试时指向 fake 脚本。
 
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -24,16 +24,36 @@ const MAX_ERROR_OUTPUT: usize = 2048;
 #[derive(Debug, Clone)]
 pub struct VmImporter {
     virsh_bin: String,
+    uri: String,
     pool: String,
 }
 
 impl VmImporter {
-    /// `virsh_bin` 默认 `virsh`；`pool` 默认 `default`。
+    /// `virsh_bin` 默认 `virsh`；`pool` 默认 `default`；不显式传 `--connect`。
     pub fn new(virsh_bin: impl AsRef<str>, pool: impl AsRef<str>) -> Self {
+        Self::with_uri(virsh_bin, pool, "")
+    }
+
+    /// 显式指定 libvirt 连接 URI（推荐 `qemu:///system`，否则非 root 默认走 session 连接）。
+    pub fn with_uri(
+        virsh_bin: impl AsRef<str>,
+        pool: impl AsRef<str>,
+        uri: impl AsRef<str>,
+    ) -> Self {
         Self {
             virsh_bin: virsh_bin.as_ref().trim().to_owned(),
+            uri: uri.as_ref().trim().to_owned(),
             pool: pool.as_ref().trim().to_owned(),
         }
+    }
+
+    fn base_args(&self) -> Vec<OsString> {
+        let mut args = Vec::new();
+        if !self.uri.is_empty() {
+            args.push(OsString::from("--connect"));
+            args.push(OsString::from(self.uri.as_str()));
+        }
+        args
     }
 
     async fn import_inner(&self, request: &ImportRequest) -> Result<ImportResult> {
@@ -70,25 +90,27 @@ impl VmImporter {
         }
         let size = size.to_string();
 
-        let create_args: [&OsStr; 6] = [
-            OsStr::new("vol-create-as"),
-            OsStr::new(pool),
-            OsStr::new(volume.as_str()),
-            OsStr::new(&size),
-            OsStr::new("--format"),
-            OsStr::new(format.as_str()),
-        ];
+        let mut create_args = self.base_args();
+        create_args.extend([
+            OsString::from("vol-create-as"),
+            OsString::from(pool),
+            OsString::from(volume.as_str()),
+            OsString::from(&size),
+            OsString::from("--format"),
+            OsString::from(format.as_str()),
+        ]);
         run(bin, &create_args)
             .await
             .with_context(|| format!("创建 libvirt 卷 {pool}/{volume} 失败"))?;
 
-        let upload_args: [&OsStr; 5] = [
-            OsStr::new("vol-upload"),
-            OsStr::new(volume.as_str()),
-            request.artifact_path.as_os_str(),
-            OsStr::new("--pool"),
-            OsStr::new(pool),
-        ];
+        let mut upload_args = self.base_args();
+        upload_args.extend([
+            OsString::from("vol-upload"),
+            OsString::from(volume.as_str()),
+            request.artifact_path.as_os_str().to_owned(),
+            OsString::from("--pool"),
+            OsString::from(pool),
+        ]);
         run(bin, &upload_args)
             .await
             .with_context(|| format!("上传 libvirt 卷 {pool}/{volume} 失败"))?;
@@ -139,7 +161,7 @@ fn validate_volume_name(volume: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run(bin: &str, args: &[&OsStr]) -> Result<()> {
+async fn run(bin: &str, args: &[OsString]) -> Result<()> {
     let output = Command::new(bin)
         .args(args)
         .stdin(Stdio::null())
@@ -385,5 +407,22 @@ mod tests {
         assert!(message.contains("退出码 4"), "{message}");
         assert!(message.contains("上传 libvirt 卷"), "{message}");
         assert_eq!(read_calls(&script).len(), 2);
+    }
+    #[tokio::test]
+    async fn with_uri_prepends_connect_flag() {
+        let temp = TempDir::new().unwrap();
+        let script = fake_script(temp.path(), "virsh", RECORD_ARGS);
+        let artifact = temp.path().join("disk.raw");
+        std_fs::write(&artifact, b"raw bytes").unwrap();
+
+        let importer = VmImporter::with_uri(script.to_str().unwrap(), "default", "qemu:///system");
+        import_with_retry(&importer, &request(&artifact, "raw"))
+            .await
+            .unwrap();
+
+        let calls = read_calls(&script);
+        assert_eq!(calls[0][0], "--connect");
+        assert_eq!(calls[0][1], "qemu:///system");
+        assert_eq!(calls[0][2], "vol-create-as");
     }
 }

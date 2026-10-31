@@ -71,7 +71,11 @@ impl ImporterSet {
                 &config.incus_bin,
                 &config.lxc_rootfs_dir,
             )),
-            Arc::new(VmImporter::new(&config.virsh_bin, &config.libvirt_pool)),
+            Arc::new(VmImporter::with_uri(
+                &config.virsh_bin,
+                &config.libvirt_pool,
+                &config.libvirt_uri,
+            )),
         ])
     }
 
@@ -153,6 +157,7 @@ mod tests {
             ctr_bin: "ctr".into(),
             incus_bin: "incus".into(),
             virsh_bin: "virsh".into(),
+            libvirt_uri: "qemu:///system".into(),
             libvirt_pool: "default".into(),
             lxc_rootfs_dir: PathBuf::from("/var/lib/lxc"),
         }

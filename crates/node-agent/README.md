@@ -27,6 +27,7 @@ device-pki 消息只承载控制信令与状态。设计契约见
 | `CACHE_MAX_BYTES` | `10737418240` | 缓存上限（LRU） |
 | `DOWNLOAD_CONCURRENCY` | `4` | 并发分片数 |
 | `DOCKER_BIN` / `CTR_BIN` / `INCUS_BIN` / `VIRSH_BIN` | 同名命令 | 可指向 mock 脚本 |
+| `LIBVIRT_URI` | `qemu:///system` | libvirt 连接 URI（非 root 必须显式，否则默认 session 连接找不到 pool） |
 | `LIBVIRT_POOL` | `default` | libvirt storage pool |
 | `LXC_ROOTFS_DIR` | `/var/lib/lxc` | plain LXC rootfs 目录 |
 

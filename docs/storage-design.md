@@ -767,6 +767,7 @@ pub trait TopologyImporter: Send + Sync {
 | `CACHE_MAX_BYTES` | `10737418240` | 缓存上限 |
 | `DOWNLOAD_CONCURRENCY` | `4` | 并发分片 |
 | `DOCKER_BIN` / `CTR_BIN` / `INCUS_BIN` / `VIRSH_BIN` | 对应命令名 | 可指向 mock 脚本 |
+| `LIBVIRT_URI` | `qemu:///system` | libvirt 连接 URI |
 | `LIBVIRT_POOL` | `default` | libvirt storage pool |
 | `LXC_ROOTFS_DIR` | `/var/lib/lxc` | plain LXC 根目录 |
 

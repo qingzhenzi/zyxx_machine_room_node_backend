@@ -118,3 +118,27 @@ psql "$DATABASE_URL" -c "SELECT image_id,room_id,rollout_state FROM image_assign
 | docker load 失败 | `DOCKER_BIN` 权限/socket；镜像 tar 是否完整（sha256/size 校验先过） |
 | Incus 未安装 | `INCUS_BIN` 置空触发 plain LXC 解包（需 root 写 `LXC_ROOTFS_DIR`） |
 | virsh 失败 | `LIBVIRT_POOL` 是否存在、libvirt 权限、磁盘空间 |
+
+## 6. 本机真机联调结果（2026-10-31）
+
+在同一台 Linux 机器上跑通了除 Incus 外的完整 P1 主链路：
+
+| 检查 | 结果 |
+| --- | --- |
+| 真实 RustFS（9000） | ✅ 预签名 PUT/GET、分片上传、manifest/签名读写 |
+| device-pki 真实 mTLS 注册 | ✅ 签发证书 → `confirm` → `active`（serial `4f40ccef…`） |
+| `/resources/presign`（证书身份授权） | ✅ 返回 manifest/分片预签名 URL + 公钥 |
+| qe-api 分配 → `image.pull` 下行 | ✅ `device_downlink` 产生 3 条消息 |
+| agent 拉取/验签/校验 | ✅ 从真实 RustFS 下载、Ed25519 验签、sha256/size/magic 通过 |
+| Docker 导入 | ✅ `docker load` 成功（`qe-smoke:1`） |
+| plain LXC（Incus 未安装） | ✅ 自动退回 rootfs tar 解包，目录结构正确 |
+| VM / libvirt | ✅ `vol-create-as` + `vol-upload` 到 pool `default` |
+| 状态回写 | ✅ `transfers.status=completed`（progress 100）、`image_assignments.rollout_state=deployed` |
+| Incus 真实导入 | ❌ 本机未安装 Incus（已验证 plain LXC 兜底分支） |
+| 跨机网络 / systemd 部署 | ❌ 本机同机 127.0.0.1，未覆盖防火墙/证书域名/服务权限 |
+
+联调中发现并修复：非 root 的 `virsh` 默认连接是 session 而非 `qemu:///system`，
+默认连接找不到 pool。已新增 agent 配置 **`LIBVIRT_URI`（默认 `qemu:///system`）**，
+`VirtualImporter` 会为 `vol-create-as`/`vol-upload` 前置 `--connect <uri>`。
+
+结论：**P1 主链路可以在本地完整验证通过**；Incus 与跨机部署需到现场验证。

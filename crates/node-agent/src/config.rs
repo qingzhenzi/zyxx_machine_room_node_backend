@@ -37,6 +37,8 @@ pub struct AgentConfig {
     pub incus_bin: String,
     /// `virsh` 可执行文件路径。
     pub virsh_bin: String,
+    /// libvirt 连接 URI（如 `qemu:///system`）。
+    pub libvirt_uri: String,
     /// libvirt storage pool 名。
     pub libvirt_pool: String,
     /// plain LXC 根目录。
@@ -100,6 +102,7 @@ impl AgentConfig {
             ctr_bin: string_or(&get, "CTR_BIN", "ctr"),
             incus_bin,
             virsh_bin: string_or(&get, "VIRSH_BIN", "virsh"),
+            libvirt_uri: string_or(&get, "LIBVIRT_URI", "qemu:///system"),
             libvirt_pool: string_or(&get, "LIBVIRT_POOL", "default"),
             lxc_rootfs_dir: path_or(&get, "LXC_ROOTFS_DIR", "/var/lib/lxc"),
         })
@@ -165,6 +168,7 @@ mod tests {
         assert_eq!(config.ctr_bin, "ctr");
         assert_eq!(config.incus_bin, "incus");
         assert_eq!(config.virsh_bin, "virsh");
+        assert_eq!(config.libvirt_uri, "qemu:///system");
         assert_eq!(config.libvirt_pool, "default");
         assert_eq!(config.lxc_rootfs_dir, PathBuf::from("/var/lib/lxc"));
     }
