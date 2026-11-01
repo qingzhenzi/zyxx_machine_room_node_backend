@@ -73,7 +73,12 @@ sudo usermod -aG qe-agent "$USER"
 ```bash
 sudo install -m 0755 target/release/qe-agent /usr/local/bin/
 sudo qe-agent enroll "<子机注册链接>" --trust
-# 单元同样用 qe-agent.service，但 ExecStart 改成 --role machine（或用一份 override）：
+子机注册 token 由管理端房间页「添加子机」或
+`POST /api/v1/admin/rooms/{id}/devices/token` 签发，槽位自动为 `{room_code}-m{n}`；
+注册后先等 5s 再首启，避免 device-pki 证书状态缓存尚未刷新导致一次握手失败。
+
+```bash
+# 子机单元同样用 qe-agent.service，但 ExecStart 改成 --role machine（或用一份 override）：
 sudo systemctl edit qe-agent
 # [Service]
 # ExecStart=
@@ -106,3 +111,4 @@ sudo systemctl start qe-agent
 | 机器总览没有新快照 | `journalctl -u qe-agent`；`DEVICE_PKI_MTLS_URL` 可达；`REPORT_MODE` 是否 mtls |
 | 频率不生效 | 管理端 `GET /admin/agent-configs/effective?device_slot=…`；agent 日志里的"已应用远端遥测间隔" |
 | 注册后角色仍用旧证书 | 已知限制：enroll 后需 `systemctl restart qe-agent`（P4 计划热加载） |
+| 刚注册就上报报 `HandshakeFailure` | device-pki 的证书状态缓存每 5s 全量刷新一次，新注册证书最多要等 5s 才可通过 mTLS 校验；等 5s 让 agent 重试即可（`--once` 可手动重跑）。持续失败则检查证书 CN 是否等于 `DEVICE_SLOT`、enrollment 是否 `issued`/`active` |
