@@ -68,6 +68,8 @@ fn test_config() -> Config {
         schedule_webhook_timeout_secs: 5,
         schedule_webhook_max_attempts: 5,
         schedule_delivery_batch: 50,
+        machine_agent_token: None,
+        machine_snapshot_keep: 100,
         device_presence_enabled: false,
         device_presence_tick_secs: 5,
         device_presence_webhook_timeout_secs: 5,
@@ -464,7 +466,346 @@ async fn agent_config_scope_merge_and_dispatch() {
     .await;
     assert_eq!(status, 404, "effective missing room = {status} {body}");
 
-    // 9. 审计：至少 4 次成功写入
+    // 9. device 作用域：一个设备槽位一行，覆盖 room 层；effective?device_slot 合并
+    let (status, device_config) = send_json(
+        &app,
+        "PUT",
+        "/api/v1/admin/agent-configs",
+        Some(&admin_token),
+        Some(json!({
+            "scope_type": "device",
+            "device_slot": device_slot,
+            "policy": { "telemetry_fast_interval_secs": 20, "telemetry_full_interval_secs": 900 }
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "{device_config}");
+    assert_eq!(
+        device_config["config"]["scope_type"], "device",
+        "{device_config}"
+    );
+    assert_eq!(
+        device_config["config"]["scope_id"],
+        Value::Null,
+        "{device_config}"
+    );
+    assert_eq!(
+        device_config["config"]["scope_key"], device_slot,
+        "{device_config}"
+    );
+    assert_eq!(device_config["pushed_rooms"], 1, "{device_config}");
+    assert_eq!(device_config["pushed_slots"], 1, "{device_config}");
+    let device_revision = device_config["config"]["revision"]
+        .as_i64()
+        .expect("device revision");
+    created_config_ids.push(
+        device_config["config"]["id"]
+            .as_str()
+            .expect("device config id")
+            .parse()
+            .expect("device config uuid"),
+    );
+
+    // device 变更直接下发到该槽位，payload 含 room 层 + device 层合并结果。
+    let (downlink_kind, downlink_payload): (String, String) = sqlx::query_as(
+        "SELECT kind, payload FROM device_downlink
+         WHERE serial = $1
+         ORDER BY id DESC
+         LIMIT 1",
+    )
+    .bind(&device_serial)
+    .fetch_one(state.db.pool())
+    .await
+    .expect("device config.update downlink");
+    assert_eq!(downlink_kind, "config.update");
+    let payload: Value = serde_json::from_str(&downlink_payload).expect("device payload");
+    // 下发的是**合并后**策略：revision 取已应用行的最大值（可能高于 device 行自身 revision）。
+    let expected_effective_revision = device_revision.max(room_revision);
+    assert_eq!(
+        payload["revision"], expected_effective_revision,
+        "{payload}"
+    );
+    assert_eq!(
+        payload["policy"]["telemetry_fast_interval_secs"], 20,
+        "{payload}"
+    );
+    assert_eq!(
+        payload["policy"]["telemetry_full_interval_secs"], 900,
+        "{payload}"
+    );
+    assert_eq!(payload["policy"]["poll_interval_secs"], 7, "{payload}");
+    assert_eq!(payload["policy"]["cache_max_bytes"], 123456789, "{payload}");
+
+    let (status, device_effective) = send_json(
+        &app,
+        "GET",
+        &format!("/api/v1/admin/agent-configs/effective?device_slot={device_slot}"),
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{device_effective}");
+    assert_eq!(
+        device_effective["device_slot"], device_slot,
+        "{device_effective}"
+    );
+    assert_eq!(
+        device_effective["room_id"],
+        Value::Null,
+        "{device_effective}"
+    );
+    assert_eq!(
+        device_effective["policy"]["telemetry_fast_interval_secs"], 20,
+        "{device_effective}"
+    );
+    assert_eq!(
+        device_effective["revision"]
+            .as_i64()
+            .expect("effective revision"),
+        expected_effective_revision,
+        "{device_effective}"
+    );
+    // 房间级 effective 不受 device 行影响（契约保持）
+    let (status, room_effective) = send_json(
+        &app,
+        "GET",
+        &format!("/api/v1/admin/agent-configs/effective?room_id={room_id}"),
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{room_effective}");
+    assert_eq!(
+        room_effective["policy"]["telemetry_fast_interval_secs"], 10,
+        "{room_effective}"
+    );
+    assert!(
+        room_effective["policy"]["telemetry_fast_interval_secs"] != 20,
+        "{room_effective}"
+    );
+
+    // GET 列表包含 device 行
+    let (status, list) = send_json(
+        &app,
+        "GET",
+        "/api/v1/admin/agent-configs",
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{list}");
+    let items = list["items"].as_array().expect("list items");
+    let device_item = items
+        .iter()
+        .find(|item| item["scope_type"] == "device" && item["scope_key"] == device_slot)
+        .unwrap_or_else(|| panic!("device config missing: {list}"));
+    assert_eq!(device_item["scope_key"], device_slot, "{list}");
+
+    // 10. device 作用域参数校验
+    let (status, body) = send_json(
+        &app,
+        "PUT",
+        "/api/v1/admin/agent-configs",
+        Some(&admin_token),
+        Some(json!({
+            "scope_type": "device",
+            "policy": { "telemetry_fast_interval_secs": 20, "telemetry_full_interval_secs": 300 }
+        })),
+    )
+    .await;
+    assert_eq!(status, 400, "device without slot = {status} {body}");
+
+    let (status, body) = send_json(
+        &app,
+        "PUT",
+        "/api/v1/admin/agent-configs",
+        Some(&admin_token),
+        Some(json!({
+            "scope_type": "device",
+            "scope_id": room_id,
+            "device_slot": device_slot,
+            "policy": {}
+        })),
+    )
+    .await;
+    assert_eq!(status, 400, "device with scope_id = {status} {body}");
+
+    let (status, body) = send_json(
+        &app,
+        "PUT",
+        "/api/v1/admin/agent-configs",
+        Some(&admin_token),
+        Some(json!({
+            "scope_type": "device",
+            "device_slot": "missing-slot",
+            "policy": {}
+        })),
+    )
+    .await;
+    assert_eq!(status, 404, "missing device = {status} {body}");
+
+    let (status, body) = send_json(
+        &app,
+        "PUT",
+        "/api/v1/admin/agent-configs",
+        Some(&admin_token),
+        Some(json!({
+            "scope_type": "device",
+            "device_slot": device_slot,
+            "policy": { "telemetry_fast_interval_secs": 4 }
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "out-of-range device interval = {status} {body}"
+    );
+
+    let (status, body) = send_json(
+        &app,
+        "GET",
+        "/api/v1/admin/agent-configs/effective",
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 400, "effective without params = {status} {body}");
+
+    let (status, body) = send_json(
+        &app,
+        "GET",
+        &format!(
+            "/api/v1/admin/agent-configs/effective?room_id={room_id}&device_slot={device_slot}"
+        ),
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 400, "effective with both params = {status} {body}");
+
+    let (status, body) = send_json(
+        &app,
+        "GET",
+        "/api/v1/admin/agent-configs/effective?device_slot=missing-slot",
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "effective missing device = {status} {body}");
+
+    // 11. 子机（room_devices）：room 变更时主设备 + 子机都要各推一条 config.update
+    let child_slot = format!("ac-child-{suffix}");
+    let child_serial = format!("ac-child-serial-{suffix}");
+    sqlx::query("INSERT INTO room_devices (device_slot, room_id, label) VALUES ($1, $2, $3)")
+        .bind(&child_slot)
+        .bind(Uuid::parse_str(&room_id).expect("room uuid"))
+        .bind("child")
+        .execute(state.db.pool())
+        .await
+        .expect("insert room_devices child");
+    sqlx::query(
+        "INSERT INTO device_enrollment
+            (serial, device_slot, subject_cn, csr_sha256, cert_pem, status, activated_at)
+         VALUES ($1, $2, $3, $4, $5, 'active', now())",
+    )
+    .bind(&child_serial)
+    .bind(&child_slot)
+    .bind(format!("cn-{child_slot}"))
+    .bind(vec![0u8; 32])
+    .bind("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----")
+    .execute(state.db.pool())
+    .await
+    .expect("insert child enrollment");
+
+    // 给子机也加一条 device 覆盖
+    let (status, child_device) = send_json(
+        &app,
+        "PUT",
+        "/api/v1/admin/agent-configs",
+        Some(&admin_token),
+        Some(json!({
+            "scope_type": "device",
+            "device_slot": child_slot,
+            "policy": { "telemetry_fast_interval_secs": 30 }
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "{child_device}");
+    created_config_ids.push(
+        child_device["config"]["id"]
+            .as_str()
+            .expect("child device config id")
+            .parse()
+            .expect("child device config uuid"),
+    );
+
+    let (status, pushed) = send_json(
+        &app,
+        "PUT",
+        "/api/v1/admin/agent-configs",
+        Some(&admin_token),
+        Some(json!({
+            "scope_type": "room",
+            "scope_id": room_id,
+            "policy": { "poll_interval_secs": 8 }
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "{pushed}");
+    assert_eq!(pushed["pushed_rooms"], 2, "{pushed}");
+    assert_eq!(pushed["pushed_slots"], 2, "{pushed}");
+
+    // 子机收到的 payload 含自己的 device 覆盖（30s），主设备不含（默认 10s）。
+    let child_payload: String = sqlx::query_scalar(
+        "SELECT payload FROM device_downlink
+         WHERE serial = $1
+         ORDER BY id DESC
+         LIMIT 1",
+    )
+    .bind(&child_serial)
+    .fetch_one(state.db.pool())
+    .await
+    .expect("child downlink");
+    let child_payload: Value = serde_json::from_str(&child_payload).expect("child payload");
+    assert_eq!(
+        child_payload["policy"]["telemetry_fast_interval_secs"], 30,
+        "{child_payload}"
+    );
+    let primary_payload: String = sqlx::query_scalar(
+        "SELECT payload FROM device_downlink
+         WHERE serial = $1
+         ORDER BY id DESC
+         LIMIT 1",
+    )
+    .bind(&device_serial)
+    .fetch_one(state.db.pool())
+    .await
+    .expect("primary downlink");
+    let primary_payload: Value = serde_json::from_str(&primary_payload).expect("primary payload");
+    assert_eq!(
+        primary_payload["policy"]["telemetry_fast_interval_secs"], 20,
+        "{primary_payload}"
+    );
+
+    sqlx::query("DELETE FROM room_devices WHERE device_slot = $1")
+        .bind(&child_slot)
+        .execute(state.db.pool())
+        .await
+        .expect("cleanup room_devices");
+    for statement in [
+        "DELETE FROM device_downlink WHERE serial = $1",
+        "DELETE FROM device_session WHERE serial = $1",
+        "DELETE FROM device_enrollment WHERE serial = $1",
+    ] {
+        sqlx::query(statement)
+            .bind(&child_serial)
+            .execute(state.db.pool())
+            .await
+            .expect("cleanup child device rows");
+    }
+
+    // 12. 审计：至少 4 次成功写入
+
     let audit_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM audit_logs WHERE actor_id = $1 AND action = 'agent_config.update'",
     )

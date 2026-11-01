@@ -83,6 +83,8 @@ fn test_config() -> Config {
         schedule_webhook_timeout_secs: 5,
         schedule_webhook_max_attempts: 5,
         schedule_delivery_batch: 50,
+        machine_agent_token: None,
+        machine_snapshot_keep: 100,
         device_presence_enabled: false,
         device_presence_tick_secs: 5,
         device_presence_webhook_timeout_secs: 5,
@@ -356,15 +358,14 @@ async fn engine_triggers_events_and_webhook_delivery() {
         .await
         .expect("create room");
 
-    // 以当前本地时间之后 5 分钟作为上课时间，保证实例落在未来、可被 rebuild 物化。
-    let mut start_local = local_of(Utc::now(), 480) + Duration::minutes(5);
-    let mut start_time = start_local.time();
-    let mut end_time = start_time + Duration::minutes(45);
-    while end_time <= start_time {
-        start_local += Duration::hours(1);
-        start_time = start_local.time();
-        end_time = start_time + Duration::minutes(45);
-    }
+    // 固定用「次日 10:00（本地）」作为上课时间：既在未来、可被 rebuild 物化，
+    // 又保证本地日期与 UTC 日期一致（本地 00:00-08:00 的实例会落在 UTC 前一天，
+    // 用 utc_date(start_date) 作查询下界会漏查，测试会在临近午夜时随机失败）。
+    let next_day = local_of(Utc::now(), 480).date_naive() + Duration::days(1);
+    let start_local =
+        Utc.from_utc_datetime(&next_day.and_hms_opt(10, 0, 0).expect("10:00 是合法时间"));
+    let start_time = start_local.time();
+    let end_time = start_time + Duration::minutes(45);
     let start_date = start_local.date_naive();
     let end_date = start_date + Duration::days(2);
     let schedule = schedules

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use qe_device_pki_client::transport::{TransportConfig, build_mtls_client};
-use qe_domain::agent_config::{AgentPolicy, AgentPolicyPatch, validate_policy_patch};
+use qe_domain::agent_config::{AgentPolicy, AgentPolicyPatch};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -168,12 +168,15 @@ pub fn complete_policy_patch(policy: &AgentPolicy) -> AgentPolicyPatch {
         poll_interval_secs: Some(policy.poll_interval_secs),
         download_concurrency: Some(policy.download_concurrency),
         cache_max_bytes: Some(policy.cache_max_bytes),
+        telemetry_fast_interval_secs: Some(policy.telemetry_fast_interval_secs),
+        telemetry_full_interval_secs: Some(policy.telemetry_full_interval_secs),
     }
 }
 
-/// 校验一份完整策略（复用 domain 的 patch 范围校验）。
+/// 校验一份完整策略（复用 domain 的完整策略校验：范围 + fast/full 顺序）。
 pub fn validate_complete_policy(policy: &AgentPolicy) -> Result<()> {
-    validate_policy_patch(&complete_policy_patch(policy))
+    policy
+        .validate()
         .map_err(|error| anyhow!("策略超出允许范围: {error}"))
 }
 

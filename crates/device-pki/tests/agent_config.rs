@@ -179,7 +179,7 @@ async fn put_global(db: &PgPool, policy: Value, revision: i64) {
     sqlx::query(
         "INSERT INTO agent_configs (scope_type, scope_id, policy, revision)
          VALUES ('global', NULL, $1, $2)
-         ON CONFLICT (scope_type) WHERE scope_id IS NULL DO UPDATE
+         ON CONFLICT (scope_type) WHERE scope_id IS NULL AND scope_key IS NULL DO UPDATE
          SET policy = EXCLUDED.policy,
              revision = EXCLUDED.revision,
              updated_at = now()",
@@ -207,6 +207,24 @@ async fn put_scoped(db: &PgPool, scope_type: &str, scope_id: Uuid, policy: Value
     .execute(db)
     .await
     .expect("put scoped config");
+}
+
+/// 直接落一行 device 作用域配置（0017 的 `agent_configs_device_uniq`）。
+async fn put_device(db: &PgPool, slot: &str, policy: Value, revision: i64) {
+    sqlx::query(
+        "INSERT INTO agent_configs (scope_type, scope_id, scope_key, policy, revision)
+         VALUES ('device', NULL, $1, $2, $3)
+         ON CONFLICT (scope_key) WHERE scope_type = 'device' DO UPDATE
+         SET policy = EXCLUDED.policy,
+             revision = EXCLUDED.revision,
+             updated_at = now()",
+    )
+    .bind(slot)
+    .bind(policy)
+    .bind(revision)
+    .execute(db)
+    .await
+    .expect("put device config");
 }
 
 async fn get_config(router: &Router, serial: &str, slot: &str) -> (StatusCode, Value) {
@@ -241,6 +259,9 @@ async fn no_config_returns_defaults() {
     assert_eq!(body["policy"]["poll_interval_secs"], 2);
     assert_eq!(body["policy"]["download_concurrency"], 4);
     assert_eq!(body["policy"]["cache_max_bytes"], 10_737_418_240u64);
+    // v1.1：两档遥测间隔默认 fast 10s / full 300s
+    assert_eq!(body["policy"]["telemetry_fast_interval_secs"], 10);
+    assert_eq!(body["policy"]["telemetry_full_interval_secs"], 300);
 
     cleanup(&f).await;
 }
@@ -338,4 +359,134 @@ async fn missing_or_revoked_enrollment_is_unauthorized() {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
     cleanup(&f).await;
+}
+
+/// v1.1：device 作用域覆盖 room 层（证书 CN = device_slot）。
+#[tokio::test]
+async fn device_patch_overrides_room_layer() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(f) = setup().await else { return };
+
+    put_global(
+        &f.db,
+        json!({ "poll_interval_secs": 10, "cache_max_bytes": 4_096 }),
+        2,
+    )
+    .await;
+    put_scoped(
+        &f.db,
+        "room",
+        f.room_id,
+        json!({ "lxc_auto_start": false, "poll_interval_secs": 3 }),
+        7,
+    )
+    .await;
+    put_device(
+        &f.db,
+        &f.bound_slot,
+        json!({
+            "lxc_auto_start": true,
+            "telemetry_fast_interval_secs": 20,
+            "telemetry_full_interval_secs": 900
+        }),
+        9,
+    )
+    .await;
+
+    let (status, body) = get_config(&f.router, &f.bound_serial, &f.bound_slot).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], 9, "{body}");
+    // device 覆盖 room
+    assert_eq!(body["policy"]["lxc_auto_start"], true, "{body}");
+    assert_eq!(body["policy"]["telemetry_fast_interval_secs"], 20, "{body}");
+    assert_eq!(
+        body["policy"]["telemetry_full_interval_secs"], 900,
+        "{body}"
+    );
+    // room 层仍生效，global 未被 room 覆盖的字段保留
+    assert_eq!(body["policy"]["poll_interval_secs"], 3, "{body}");
+    assert_eq!(body["policy"]["cache_max_bytes"], 4_096, "{body}");
+
+    // 同房间外的槽位（无房间）只应用 global，不受该 device 行影响
+    let (status, body) = get_config(&f.router, &f.unbound_serial, &f.unbound_slot).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], 2, "{body}");
+    assert_eq!(body["policy"]["lxc_auto_start"], false, "{body}");
+    assert_eq!(body["policy"]["poll_interval_secs"], 10, "{body}");
+
+    cleanup(&f).await;
+}
+
+/// P1：子机（`room_devices`）也能解析到房间层 + device 层。
+#[tokio::test]
+async fn child_device_resolves_room_via_room_devices() {
+    let _guard = DB_LOCK.lock().await;
+    let Some(f) = setup().await else { return };
+
+    let child_slot = format!(
+        "agent-config-child-{}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    );
+    let child_serial = new_serial();
+    sqlx::query("INSERT INTO room_devices (device_slot, room_id, label) VALUES ($1, $2, $3)")
+        .bind(&child_slot)
+        .bind(f.room_id)
+        .bind("child")
+        .execute(&f.db)
+        .await
+        .expect("insert room_devices");
+    sqlx::query(
+        "INSERT INTO device_enrollment
+           (serial, device_slot, subject_cn, csr_sha256, cert_pem, status, issued_at, activated_at)
+         VALUES ($1, $2, $2, $3, '', 'active', now(), now())",
+    )
+    .bind(&child_serial)
+    .bind(&child_slot)
+    .bind(Vec::<u8>::new())
+    .execute(&f.db)
+    .await
+    .expect("insert child enrollment");
+
+    put_global(&f.db, json!({ "poll_interval_secs": 10 }), 1).await;
+    put_scoped(
+        &f.db,
+        "area",
+        f.area_id,
+        json!({ "download_concurrency": 16 }),
+        2,
+    )
+    .await;
+    put_scoped(
+        &f.db,
+        "room",
+        f.room_id,
+        json!({ "cache_max_bytes": 2_048 }),
+        3,
+    )
+    .await;
+    put_device(
+        &f.db,
+        &child_slot,
+        json!({ "telemetry_fast_interval_secs": 30 }),
+        4,
+    )
+    .await;
+
+    let (status, body) = get_config(&f.router, &child_serial, &child_slot).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], 4, "{body}");
+    assert_eq!(body["policy"]["poll_interval_secs"], 10, "{body}");
+    assert_eq!(body["policy"]["download_concurrency"], 16, "{body}");
+    assert_eq!(body["policy"]["cache_max_bytes"], 2_048, "{body}");
+    assert_eq!(body["policy"]["telemetry_fast_interval_secs"], 30, "{body}");
+
+    cleanup(&f).await;
+    let _ = sqlx::query("DELETE FROM room_devices WHERE device_slot = $1")
+        .bind(&child_slot)
+        .execute(&f.db)
+        .await;
+    let _ = sqlx::query("DELETE FROM device_enrollment WHERE serial = $1")
+        .bind(&child_serial)
+        .execute(&f.db)
+        .await;
 }

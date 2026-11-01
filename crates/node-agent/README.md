@@ -1,3 +1,6 @@
+> **已并入统一入口（P4 退场）**：新部署请用 [`qe-agent`](../agent/README.md) 的
+> `qe-agent run --role node`；本 crate 作为库实现继续维护。
+
 # qe-node-agent（房间节点 agent，P2）
 
 经 **device-pki mTLS** 拉取、校验并导入镜像/资源；大文件走 S3 预签名直连，

@@ -29,6 +29,7 @@ pub mod policy;
 pub mod presign;
 pub mod pull;
 pub mod report;
+pub mod run;
 
 pub use cache::ObjectCache;
 pub use config::AgentConfig;
@@ -41,3 +42,4 @@ pub use presign::{
 };
 pub use pull::{HttpObjectFetcher, ObjectFetcher, PullRequest, PulledImage, Puller};
 pub use report::{CompletedPayload, MtlsReporter, Phase, ProgressEvent, ProgressPayload, Reporter};
+pub use run::{run, run_with_config};

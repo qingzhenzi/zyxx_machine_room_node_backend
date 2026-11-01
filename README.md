@@ -47,7 +47,7 @@
 | 可观测性 | trace_id + JSON 日志；可选 Alloy/Loki/Grafana | 默认轻量，需要时用 profile 启用采集 |
 | 部署 | Docker Compose + nginx | 2 个 API 副本，`least_conn` + Docker DNS 动态发现 |
 
-### 工作区结构：5 个 crate
+### 工作区结构：多个 crate
 
 根目录是 **virtual workspace**，只放 workspace 配置、迁移和部署文件；HTTP 层也独立成 `qe-api`。
 
@@ -69,8 +69,13 @@
 │   ├── domain/                # qe-domain：纯实体、RBAC 常量、校验、DomainError
 │   ├── db/                    # qe-db：PostgreSQL 连接池/迁移/FromRow 行模型/仓储
 │   │   └── src/auth_ports.rs  # 实现 PermissionSource（UserRepo）
-│   └── cache/                 # qe-cache：Redis 刷新令牌与权限缓存
-│       └── src/auth_ports.rs  # 实现 TokenStore / PermissionCache（Cache）
+│   ├── cache/                 # qe-cache：Redis 刷新令牌与权限缓存
+│   │   └── src/auth_ports.rs  # 实现 TokenStore / PermissionCache（Cache）
+│   ├── device-pki/            # qe-device-pki：设备注册、证书与 mTLS 通讯服务
+│   ├── device-pki-client/     # qe-device-pki-client：设备侧注册/凭证/传输
+│   ├── agent/                 # qe-agent：统一 agent 入口（enroll / run --role node|machine / status）
+│   ├── node-agent/            # qe-node-agent：镜像拉取/校验/导入库（统一入口的 node 角色）
+│   └── room-agent/            # qe-room-agent：机器遥测库（统一入口的 machine 角色）
 ├── migrations/
 ├── deploy/
 └── compose*.yaml / Dockerfile
@@ -107,6 +112,36 @@ qe-api ──► qe-db ──► qe-domain ──► qe-auth
 
 - **Axum**：Tower 中间件（超时、CORS、trace、body limit）直接复用；`FromRequestParts` 写 `AuthUser` 干净；utoipa/OpenAPI 生态更统一。Actix 性能基准略高，但业务 API 的瓶颈通常在数据库，不构成理由。
 - **SQLx**：RBAC 的多表 join、公告过滤用 SQL 写更透明；迁移内嵌到二进制。代价是没有 SeaORM 的实体关系便利。SQL 在 `qe-db`、缓存访问在 `qe-cache`，真要换 ORM 只改 `qe-db`。
+
+## 管理控制台（frontend/）
+
+仓库内的 `frontend/` 是配套的管理控制台（Vue 3 + Vite + Tailwind CSS 4 + Pinia），
+沿用 QEStudio 前端模板的视觉与交互，覆盖本服务的全部管理 API：
+
+- 工作台总览：设备在线、房间、今日课表事件、镜像、最近事件/审计、系统健康
+- 区域 / 房间 / 设备：区域总览与房间总览、CRUD、设备槽位绑定与迁移、设备注册 token、在线状态
+- 机器总览：room-agent 上报的主机清单、健康评分、诊断结论、容器/虚拟机/安全核查与历史快照
+- 课表：周模板、单日覆盖、排课实例、手动重建；触发事件、投递重放/重试、房间触发规则
+- 镜像：manifest、验证、发布通道、房间分配；存储：对象预签名/登记、分发任务、收集登记
+- 节点配置（global → area → room）、用户/角色/权限、审计日志、公告、账户会话
+
+```bash
+# 1) 启动后端（默认 127.0.0.1:8080）
+./target/debug/qe-api        # 或 cargo run -p qe-api
+
+# 2) 启动控制台（Vite 会把 /api、/healthz、/readyz、/docs 代理到后端）
+cd frontend
+./node_modules/.bin/vite --host 127.0.0.1 --port 5174
+# 打开 http://127.0.0.1:5174 ，用 .env 里的 BOOTSTRAP_ADMIN_* 登录
+```
+
+登录、令牌刷新、401 重放与 RBAC 入口收敛在 `frontend/src/api/` 和路由守卫里；
+页面按权限点隐藏入口，最终授权仍由后端接口校验。独立部署时用 `VITE_API_BASE_URL`
+指向 API 前缀（如 `https://api.example.com/api/v1`），并配置 `CORS_ALLOWED_ORIGINS`。
+
+接口类型由 `frontend/docs/openapi.json` 生成：后端启动后执行
+`curl -s http://127.0.0.1:8080/api-docs/openapi.json -o frontend/docs/openapi.json && python3 frontend/docs/openapi-types.py`。
+更多说明见 [`frontend/README.md`](frontend/README.md) 与 [`frontend/docs/CONVENTIONS.md`](frontend/docs/CONVENTIONS.md)。
 
 ## 快速开始（Docker）
 
@@ -459,7 +494,7 @@ schedule:read    schedule:manage    schedule:event:read    schedule:event:manage
 
 - `serial = null`：槽位已分配但设备尚未注册；
 - `pending_token = true`：存在未使用且未过期的注册 token，等待设备注册；
-- `status` 来自 `device_enrollment.status`，`online` / `last_seen_at` 来自 `device_session`，主 API 只读；
+- `status` 来自 `device_enrollment.status`；`online` 是综合状态 = device-pki mTLS 会话或最近 5 分钟内有 room-agent 快照，`last_seen_at` 取两者较新值；主 API 只读；
 - **在线判定**：device-pki 每 5s 检查一次心跳，连续 3 次无活动（>5s 未活动算一次 miss）判 `offline`，
   因此节点下线后管理端约 **15–20s** 才能看到 `offline`。HTTP 下行轮询（`GET /messages/downlink`）、
   下行 ACK、上行消息与 WS 连接都算活动；`last_seen_at` 由心跳节流刷新（粒度约 15s）。
@@ -499,6 +534,22 @@ schedule:read    schedule:manage    schedule:event:read    schedule:event:manage
   但 `room_id = null`（未绑定）；审计动作为 `room.unbind_device`；
 - **槽位唯一**：沿用 `rooms_device_slot_key` 部分唯一索引，并发绑定冲突返回 409；
 - 签发 token 的审计动作为 `room.issue_device_token`。
+
+### 一个房间多台机器（P1）
+
+一个房间可以有多台机器：主设备（`rooms.device_slot`）之外，子机登记在 `room_devices`。
+课表/镜像下发仍只针对主设备，子机用于机器总览/遥测。主设备与子机不会重复：
+槽位升格为主设备时自动从 `room_devices` 移除（数据库触发器兜底）。
+
+| 方法 | 路径（`/api/v1/admin` 下） | 权限 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/rooms/{id}/devices` | `device:read` | 房间机器列表（主设备在前 + 子机）；未注册槽位 `serial/status = null` |
+| POST | `/rooms/{id}/devices/token` | `device:manage` | 给房间新增子机并签发注册 token；槽位自动分配为 `{room_code}-m{n}`，body 可带 `label` |
+| DELETE | `/rooms/{id}/devices/{slot}` | `device:manage` | 解除子机绑定（不吊销证书，只删 `room_devices` 关系） |
+
+- `GET /devices`、`GET /admin/machines` 的房间/区域关联已改为 `rooms.device_slot` + `room_devices` 双来源；
+- 子机注册 token 的审计动作为 `room.issue_machine_token`，解除绑定为 `room.remove_machine`；
+- 迁移：`migrations/0015_room_devices.sql`（表 + 两个一致性触发器）。
 
 ### 权限
 
@@ -707,23 +758,33 @@ P2 待做：zstd/gzip 压缩与解压校验、chunk 复用/增量、S3 Event 兜
 房间节点 agent 的策略默认在节点本地（配置文件 + env），启动连上 device-pki 后通过
 `GET /agent/config` 拉取生效策略；管理端可随时修改策略，经 device-pki 下行 `config.update`
 二次下发。设计契约见 [`docs/storage-design.md`](docs/storage-design.md) §17，
-迁移为 `migrations/0012_agent_config.sql`。
+迁移为 `migrations/0012_agent_config.sql`、`migrations/0017_agent_config_device.sql`。
 
 ### API（`/api/v1/admin`）
 
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
-| GET | `/agent-configs` | `device:read` | 所有作用域配置 `{items,total}` |
-| PUT | `/agent-configs` | `device:manage` | body `{scope_type:"global"\|"area"\|"room", scope_id?, policy:{...patch}}`；upsert + 审计 + 二次下发，返回 `{config,pushed_rooms}` |
-| GET | `/agent-configs/effective?room_id=` | `device:read` | 房间合并后的生效策略 `{room_id,policy,revision}` |
+| GET | `/agent-configs` | `device:read` | 所有作用域配置 `{items,total}`（含 device 行） |
+| PUT | `/agent-configs` | `device:manage` | body `{scope_type:"global"\|"area"\|"room"\|"device", scope_id?, device_slot?, policy:{...patch}}`；upsert + 审计 + 二次下发，返回 `{config,pushed_rooms,pushed_slots}` |
+| GET | `/agent-configs/effective?room_id=` | `device:read` | 房间合并后的生效策略（不含 device 覆盖）`{room_id,policy,revision}` |
+| GET | `/agent-configs/effective?device_slot=` | `device:read` | 单台机器合并后的生效策略（含 device 覆盖）`{device_slot,policy,revision}` |
 
-`scope_type=global` 时 `scope_id` 必须为空；`area` / `room` 必须提供 `scope_id`，目标不存在返回 404。
+作用域四态（与 `agent_configs` 表一致）：
+
+- `global`：`scope_id` / `device_slot` 都为空；
+- `area` / `room`：必填 `scope_id`（UUID），目标不存在返回 404；
+- `device`：必填 `device_slot`（TEXT，内部存 `scope_key`）。槽位必须已存在
+  （`device_enrollment` / `rooms.device_slot` / `room_devices` 任一），否则 404。
+
 `policy` 是局部 patch，写入前校验范围（`poll_interval_secs` 1..=60、`download_concurrency` 1..=32、
-`cache_max_bytes` 0..=1 TiB）。
+`cache_max_bytes` 0..=1 TiB、`telemetry_fast_interval_secs` 5..=60、
+`telemetry_full_interval_secs` 60..=3600，且 full ≥ fast）。
 
 ### scope 继承
 
-策略按 **global → area（房间所属区域）→ room** 依次合并，后者覆盖前者；未出现的字段保持默认值：
+策略按 **global → area（房间所属区域）→ room → device（单机覆盖）** 依次合并，后者覆盖前者；
+device 层 key 是设备槽位：主设备用 `rooms.device_slot`，子机用 `room_devices`，因此同一房间的
+不同机器可以有不同的遥测频率。未出现的字段保持默认值：
 
 | 字段 | 默认 | 范围 |
 | --- | --- | --- |
@@ -731,6 +792,8 @@ P2 待做：zstd/gzip 压缩与解压校验、chunk 复用/增量、S3 Event 兜
 | `poll_interval_secs` | `2` | 1..=60 |
 | `download_concurrency` | `4` | 1..=32 |
 | `cache_max_bytes` | 10 GiB | 0..=1 TiB |
+| `telemetry_fast_interval_secs` | `10` | 5..=60 |
+| `telemetry_full_interval_secs` | `300` | 60..=3600（且 ≥ fast） |
 
 `revision` 取已应用配置行中的最大值（无配置为 0），每次 upsert 递增。
 同一作用域重复 PUT 会**整体替换**该作用域的 patch：未提交的字段回到继承值/默认值，
@@ -738,12 +801,19 @@ P2 待做：zstd/gzip 压缩与解压校验、chunk 复用/增量、S3 Event 兜
 
 ### 二次下发
 
-`PUT /agent-configs` 成功并写审计 `agent_config.update` 后，服务端用 `rooms_for_scope`
-找到受影响房间；对每个已绑定 `device_slot` 的房间取 `effective_for_room`，向该槽位入队
+`PUT /agent-configs` 成功并写审计 `agent_config.update` 后，服务端按作用域找到受影响的**每个槽位**：
+
+- `global` / `area` / `room`：受影响房间的主设备（`rooms.device_slot`）+ 全部子机（`room_devices`）；
+- `device`：只影响该槽位。
+
+对每个槽位取 `effective_for_slot`（含 device 覆盖，避免把单机覆盖推丢），向该槽位入队
 `config.update`（payload `{"policy":{...},"revision":n}`），有存活设备时再发 Redis 通知唤醒长连接。
-下发是尽力而为：无设备 / 入队或通知失败只记 `warn`，不回滚配置写入；`pushed_rooms` 是成功入队的房间数。
-agent 收到后应用策略：`lxc_auto_start` / `poll_interval_secs` 立即生效，
-`download_concurrency` / `cache_max_bytes` 需重启（只 warn）。
+下发是尽力而为：无设备 / 入队或通知失败只记 `warn`，不回滚配置写入；
+`pushed_rooms` 保留兼容字段名，值与 `pushed_slots` 相同（成功入队的设备槽位数）。
+
+agent 应用策略：`lxc_auto_start` / `poll_interval_secs` 立即生效；machine 角色的两档遥测间隔
+立即生效（运行期也会主动 `GET /agent/config` 刷新）；`download_concurrency` / `cache_max_bytes`
+需重启（只 warn）。
 
 ## 设备在线事件（P3：持久化 / 可靠投递 / SSE）
 
@@ -807,6 +877,63 @@ data: {}
 浏览器原生 `EventSource` 不能自定义 `Authorization` 头，前端应使用
 `fetch(..., { headers: { Authorization: "Bearer …" }, signal })` + `ReadableStream`
 读取；断线后带最后一条事件的 `id` 作为 `after_id` 重连即可补齐。
+
+## 机器总览与统一 agent（qe-agent machine 角色）
+
+房间内的机器由 `qe-agent run --role machine`（旧二进制 `qe-room-agent` 仍可用）周期采集，
+**默认经 device-pki mTLS** 上报；控制台「机器总览」展示每台机器的实时健康、诊断与历史快照。
+契约见 [`docs/machine-telemetry.md`](docs/machine-telemetry.md)，入口见
+[`crates/agent/README.md`](crates/agent/README.md)。
+
+```text
+qe-agent (machine) ──mTLS POST /machine/report──▶ device-pki ──▶ machine_snapshots (PG)
+        ↑ 内置 /proc + 可选外部工具                              │
+  platform-health / platform-diagnose / qeaudit / docker / virsh   ▼
+                                                    /api/v1/admin/machines（qe-api 只读）
+```
+
+- **认证**：默认 mTLS，证书由 device-pki 签发（每台机器一个设备身份）。
+  `REPORT_MODE=bearer` 只作过渡，保留 `MACHINE_API_BASE` + `MACHINE_AGENT_TOKEN` 旧路径；
+  服务端未配置 token 时 Bearer 端点仍返回 503。**退场计划**：v0.2 删除旧
+  `qe-node-agent`/`qe-room-agent` 二进制；设备全部迁 mTLS 后删除 Bearer 端点
+  （见 [`crates/agent/README.md`](crates/agent/README.md#退场时间表p4)）。
+- **两档采集**：`fast`（内置指标，默认 10s，5..=60s）/ `full`（含外部工具，默认 300s，
+  60..=3600s）。机器上报带 `tier`，落 `machine_snapshots.tier`；`--once` 发一份 full，
+  `--print` 只打印 JSON。
+- **频率配置**：默认值来自服务端「节点配置」——room 默认 + device（单机）覆盖：
+  `agent_configs.scope_type='device'`、`scope_key=device_slot`，合并顺序
+  global → area → room → device；agent 启动时 `GET /agent/config` 拉取，运行期定期刷新。
+  本机 `ROOM_AGENT_FAST_INTERVAL_SECS` / `ROOM_AGENT_FULL_INTERVAL_SECS` 可覆盖内置默认。
+- 上报幂等：`(serial, collected_at)` 唯一；每个 serial 保留最近 `MACHINE_SNAPSHOT_KEEP` 条。
+- 读取：`GET /api/v1/admin/machines`、`/admin/machines/{serial}`、`/admin/machines/{serial}/snapshots`，
+  需要 `device:read`；`GET /admin/machines/stream` 是 SSE 实时流（新快照约 2s 内推送）。
+- 在线口径：设备/房间/机器的 `online` = device-pki mTLS 心跳 **或** 最近 5 分钟内快照；
+  机器详情的 `session_online` 保留 device-pki 原始会话状态用于排障。
+- 外部采集工具缺失时 agent 仍能上报内置指标，缺失/跳过项记录在 `sections.agent.tools`。
+- **桌面客户端（agent-client）**：Tauri GUI 默认隐藏、托盘常驻，通过本机 Unix socket IPC
+  读取 daemon 的状态/日志/注册，协议见 [`docs/agent-ipc.md`](docs/agent-ipc.md)；
+  代码在独立仓库 `~/Projects/QEStudio/agent-client`（从 client-app 模板改造）。
+
+```bash
+# 构建统一入口
+cargo build -p qe-agent
+
+# 1) 用管理端房间页签发的注册链接注册（一次性，证书由 device-pki 签发）
+DEVICE_DATA_DIR=/var/lib/qe-agent ./target/debug/qe-agent enroll "<link>" --trust
+
+# 2) 只打印一份 full payload（不需要证书/token）
+DEVICE_SLOT=room-101 ./target/debug/qe-agent run --role machine --once --print | jq '.health'
+
+# 3) mTLS 上报一轮
+DEVICE_PKI_MTLS_URL=https://node:4441 DEVICE_SLOT=room-101 DEVICE_DATA_DIR=/var/lib/qe-agent \
+  ./target/debug/qe-agent run --role machine --once
+```
+
+systemd（`qe-agent.service`，`--role both` + IPC）与更多参数见
+[`crates/agent/README.md`](crates/agent/README.md) 与 [`crates/agent/deploy/`](crates/agent/deploy)；
+机器端完整部署（daemon + GUI + 子机 + 升级排障）见 [`docs/agent-deploy.md`](docs/agent-deploy.md)；
+旧 room-agent 部署说明见
+[`crates/room-agent/README.md`](crates/room-agent/README.md)。
 
 ## 请求追踪与日志
 

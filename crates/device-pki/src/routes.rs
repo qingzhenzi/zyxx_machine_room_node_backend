@@ -7,9 +7,11 @@ use crate::pop::{self, SignatureAlgorithm};
 use crate::session::{SessionManager, SessionState};
 use crate::token::{self, TokenKind};
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
+use qe_db::machine::{MachineRepo, NewMachineSnapshot};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -788,6 +790,97 @@ pub async fn delete_enrollment(
     Ok(Json(serde_json::json!({ "status": "deleted" })))
 }
 
+// ---------------- /machine/report（mTLS listener） ----------------
+
+/// `POST /machine/report` —— 机器遥测的**默认入口**（身份来自设备证书）。
+///
+/// 与 `qe-api` 的 Bearer 入口共用 `qe_domain::machine` 的请求体与校验；区别是：
+/// - `device_slot` / `serial` 来自证书，请求体可省略 `device_slot`；
+/// - 上报同时刷新 mTLS 会话活动，10s 级上报可以替代独立心跳，避免被离线判定误伤。
+pub async fn machine_report(
+    State(st): State<AppState>,
+    peer: crate::tls::PeerCert,
+    Json(request): Json<qe_domain::machine::MachineReportRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>)> {
+    let serial = peer.serial_hex.clone().ok_or(Error::Unauthorized)?;
+    let device_slot = peer.common_name().ok_or(Error::Unauthorized)?.to_owned();
+
+    let validated = request
+        .validate()
+        .map_err(|error| Error::BadRequest(error.to_string()))?;
+    if let Some(body_slot) = validated.device_slot.as_deref()
+        && body_slot != device_slot
+    {
+        return Err(Error::BadRequest(format!(
+            "device_slot（{body_slot}）与证书 CN（{device_slot}）不一致"
+        )));
+    }
+
+    // 上报也是心跳：不刷新会话活动的话，10s 上报会被 5s×3 的离线判定误伤。
+    if st.sessions.last_seen_seq(&serial).is_none() {
+        st.sessions
+            .upsert(&serial, &device_slot, SessionState::Online, 0);
+    }
+    st.sessions.mark_seen(&serial).await;
+
+    let mut payload = validated.payload;
+    payload["device_slot"] = serde_json::json!(device_slot);
+
+    let snapshot = NewMachineSnapshot {
+        serial: serial.clone(),
+        device_slot: device_slot.clone(),
+        tier: validated.tier,
+        collected_at: validated.collected_at,
+        agent_version: validated.agent_version,
+        hostname: validated.hostname,
+        os_name: validated.os_name,
+        kernel_version: validated.kernel_version,
+        health_status: validated.health_status,
+        health_score: validated.health_score,
+        cpu_usage_percent: validated.cpu_usage_percent,
+        memory_usage_percent: validated.memory_usage_percent,
+        disk_usage_percent: validated.disk_usage_percent,
+        uptime_secs: validated.uptime_secs,
+        payload,
+    };
+
+    let meta = MachineRepo::new(st.db.clone())
+        .record(&snapshot, machine_snapshot_keep())
+        .await
+        .map_err(|error| Error::Internal(anyhow::anyhow!("写入机器快照失败: {error}")))?;
+
+    tracing::info!(
+        serial = %meta.serial,
+        slot = %meta.device_slot,
+        tier = validated.tier.as_str(),
+        health = %meta.health_status,
+        "机器快照已上报（mTLS）"
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "snapshot_id": meta.id,
+            "serial": meta.serial,
+            "device_slot": meta.device_slot,
+            "received_at": meta.received_at,
+        })),
+    ))
+}
+
+/// 每个 serial 保留的历史条数；与 qe-api 的 `MACHINE_SNAPSHOT_KEEP` 同名同义。
+fn machine_snapshot_keep() -> i64 {
+    use std::sync::OnceLock;
+    static KEEP: OnceLock<i64> = OnceLock::new();
+    *KEEP.get_or_init(|| {
+        std::env::var("MACHINE_SNAPSHOT_KEEP")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .filter(|value| (10..=1000).contains(value))
+            .unwrap_or(100)
+    })
+}
+
 // ---------------- /messages（mTLS listener） ----------------
 
 /// 单条消息最大载荷（上行与下行共用，定义在 `messaging`）。
@@ -1159,6 +1252,8 @@ pub fn mtls_router(st: AppState) -> Router {
         .route("/enroll/confirm", post(confirm))
         .route("/channel", get(crate::channel::channel_upgrade))
         .route("/messages", post(receive_message))
+        // 机器遥测：与 qe-api 的 Bearer 入口共用校验；身份来自设备证书。
+        .route("/machine/report", post(machine_report))
         .route("/messages/downlink", get(downlink_pull))
         .route("/messages/downlink/ack", post(downlink_ack))
         // 节点配置：启动时按证书身份拉取 global → area → room 合并后的策略（§17.3）

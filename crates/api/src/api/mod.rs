@@ -2,6 +2,7 @@ pub mod admin;
 pub mod announcements;
 pub mod auth;
 pub mod extractors;
+pub mod machine_agent;
 pub mod openapi;
 pub mod trace;
 pub mod validation;
@@ -112,6 +113,8 @@ fn api_v1() -> Router<AppState> {
         .nest("/auth", auth_routes())
         .route("/announcements", get(announcements::list))
         .route("/announcements/{id}", get(announcements::get))
+        // 机器遥测上报（room-agent 的 fleet token 认证在 handler 内完成）
+        .route("/machine/report", post(machine_agent::report))
         // 管理接口可能包含用户/审计数据，禁止中间缓存。
         .nest(
             "/admin",

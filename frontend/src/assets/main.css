@@ -1,0 +1,122 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans:
+    'Inter', 'SF Pro Text', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  --font-mono:
+    'JetBrains Mono', 'SFMono-Regular', ui-monospace, Menlo, Consolas, 'Liberation Mono', monospace;
+
+  --color-canvas: #f5f6f8;
+  --color-surface: #ffffff;
+  --color-line: #e6e8ee;
+  --color-line-strong: #d3d8e2;
+  --color-ink: #15171c;
+  --color-ink-soft: #3d4450;
+  --color-muted: #6f7787;
+  --color-faint: #9aa1ae;
+  /* Brand palette */
+  --color-accent: #3a5bd9;
+  --color-accent-strong: #2f4bbd;
+  --color-accent-soft: #eef2ff;
+  --color-accent-line: #c9d4fb;
+}
+
+@layer base {
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
+
+  body {
+    min-width: 1280px;
+    background-color: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    font-feature-settings: 'cv11', 'ss01';
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  button,
+  a {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+
+  ::selection {
+    background-color: #dbe3ff;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #ccd2dc transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: #ccd2dc;
+    background-clip: content-box;
+    border: 2px solid transparent;
+    border-radius: 999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: #b3bbc8;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/*
+ * 共用表单/表格样式。页面里直接用 class="input"、class="table-th" 等，
+ * 避免每个业务页面重复一堆 Tailwind 原子类导致风格漂移。
+ */
+@layer components {
+  .input {
+    @apply h-9 w-full rounded-md border border-line bg-surface px-3 text-[12.5px] text-ink outline-none transition-colors placeholder:text-faint focus:border-accent focus:ring-2 focus:ring-accent/15;
+  }
+
+  .input-sm {
+    @apply h-8 w-full rounded-md border border-line bg-surface px-2.5 text-[12px] text-ink outline-none transition-colors placeholder:text-faint focus:border-accent focus:ring-2 focus:ring-accent/15;
+  }
+
+  .select {
+    @apply h-9 w-full appearance-none rounded-md border border-line bg-surface px-3 pr-8 text-[12.5px] text-ink outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-accent/15;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236f7787' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+  }
+
+  .textarea {
+    @apply min-h-[84px] w-full resize-y rounded-md border border-line bg-surface px-3 py-2 text-[12.5px] leading-5 text-ink outline-none transition-colors placeholder:text-faint focus:border-accent focus:ring-2 focus:ring-accent/15;
+  }
+
+  .field-label {
+    @apply mb-1.5 block text-[11.5px] font-medium text-ink-soft;
+  }
+
+  .table-th {
+    @apply px-3 py-2 text-left text-[10.5px] font-medium text-faint;
+  }
+
+  .table-td {
+    @apply px-3 py-2.5 text-[12px] text-ink-soft;
+  }
+
+  .link {
+    @apply text-accent transition-colors hover:text-accent-strong hover:underline;
+  }
+}

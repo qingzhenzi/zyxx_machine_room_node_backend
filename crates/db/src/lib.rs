@@ -10,6 +10,7 @@ pub mod auth_ports;
 mod db;
 pub mod device;
 pub mod error;
+pub mod machine;
 pub mod presence;
 pub mod roles;
 pub mod rows;

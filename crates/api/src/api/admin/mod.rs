@@ -5,6 +5,7 @@ pub mod audit;
 pub mod device_events;
 pub mod devices;
 pub mod images;
+pub mod machines;
 pub mod roles;
 pub mod rooms;
 pub mod schedule_events;
@@ -60,6 +61,16 @@ pub fn router() -> Router<AppState> {
             "/rooms/{id}/device-token",
             post(devices::issue_device_token),
         )
+        // ---- 一个房间多台机器（P1）：主设备之外再加子机 ----
+        .route("/rooms/{id}/devices", get(devices::list_room_machines))
+        .route(
+            "/rooms/{id}/devices/token",
+            post(devices::issue_machine_token),
+        )
+        .route(
+            "/rooms/{id}/devices/{slot}",
+            delete_route(devices::remove_room_machine),
+        )
         .route("/rooms/{id}/occurrences", get(schedules::room_occurrences))
         .route(
             "/rooms/{id}/event-rules",
@@ -112,6 +123,12 @@ pub fn router() -> Router<AppState> {
             "/rooms/{id}/images/{image_id}",
             put(images::assign_room).delete(images::unassign_room),
         )
+        // ---- 机器总览（room-agent 上报）----
+        .route("/machines", get(machines::list))
+        // 必须在 `/machines/{serial}` 之前注册静态路径，否则会被动态段吞掉。
+        .route("/machines/stream", get(machines::stream))
+        .route("/machines/{serial}", get(machines::get))
+        .route("/machines/{serial}/snapshots", get(machines::snapshots))
         // ---- 节点配置（P2）----
         .route(
             "/agent-configs",

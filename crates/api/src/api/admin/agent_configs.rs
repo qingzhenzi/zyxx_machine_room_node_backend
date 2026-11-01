@@ -1,8 +1,14 @@
 //! 节点配置管理 P2：作用域策略 CRUD 与二次下发。
 //!
-//! 契约见 `docs/storage-design.md` §17.4。策略按 **global → area → room** 合并；
-//! 管理端写入后对该作用域下所有已绑定设备槽位的房间做 `config.update` 二次下发。
-//! 下发是尽力而为：无设备 / 入队失败 / Redis 通知失败都只记 `warn!`，不影响写入结果。
+//! 契约见 `docs/storage-design.md` §17.4 与 `docs/machine-telemetry.md` v1.1。策略按
+//! **global → area → room → device** 合并：
+//! - `area` / `room` 用 `scope_id`（UUID）定位；
+//! - `device` 用 `device_slot`（TEXT，`device_enrollment` / `rooms.device_slot` /
+//!   `room_devices` 任一存在即可）定位，一个槽位一行；
+//! - 管理端写入后对作用域内**每台设备槽位**（房间主设备 + `room_devices` 子机）
+//!   各做一次 `config.update` 二次下发，payload 用 `effective_for_slot` 合并，
+//!   保证 device 覆盖不会被 room 级下发冲掉；
+//! - 下发是尽力而为：无设备 / 入队失败 / Redis 通知失败都只记 `warn!`，不影响写入结果。
 
 use axum::{
     Json,
@@ -15,12 +21,10 @@ use uuid::Uuid;
 use crate::{
     api::extractors::{ApiJson, AuthUser, ClientIp},
     auth::authorization,
-    domain::{
-        agent_config::{
-            AgentConfig, AgentPolicy, AgentPolicyPatch, ConfigScopeType, validate_policy_patch,
-        },
-        rbac::permissions,
+    domain::agent_config::{
+        AgentConfig, AgentPolicy, AgentPolicyPatch, ConfigScopeType, validate_policy_patch,
     },
+    domain::rbac::permissions,
     error::{AppError, AppResult},
     state::AppState,
 };
@@ -29,8 +33,12 @@ use crate::{
 #[derive(Debug, Deserialize)]
 pub struct UpdateAgentConfigRequest {
     pub scope_type: ConfigScopeType,
+    /// `area` / `room` 作用域的目标 UUID。
     #[serde(default)]
     pub scope_id: Option<Uuid>,
+    /// `device` 作用域的目标设备槽位（其余作用域必须省略）。
+    #[serde(default)]
+    pub device_slot: Option<String>,
     #[serde(default)]
     pub policy: AgentPolicyPatch,
 }
@@ -42,25 +50,36 @@ pub struct AgentConfigListReply {
     pub total: i64,
 }
 
-/// `GET /admin/agent-configs/effective` 查询参数。
+/// `GET /admin/agent-configs/effective` 查询参数：`room_id` 与 `device_slot` 二选一。
 #[derive(Debug, Deserialize)]
 pub struct EffectiveAgentConfigQuery {
-    pub room_id: Uuid,
+    #[serde(default)]
+    pub room_id: Option<Uuid>,
+    #[serde(default)]
+    pub device_slot: Option<String>,
 }
 
 /// `GET /admin/agent-configs/effective` 响应：合并后的完整策略。
 #[derive(Debug, Serialize)]
 pub struct EffectiveAgentPolicyReply {
-    pub room_id: Uuid,
+    /// 按房间查询时返回房间 id。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<Uuid>,
+    /// 按设备查询时返回设备槽位。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_slot: Option<String>,
     pub policy: AgentPolicy,
     pub revision: i64,
 }
 
-/// `PUT /admin/agent-configs` 响应：写入后的配置 + 成功下发到设备槽位的房间数。
+/// `PUT /admin/agent-configs` 响应：写入后的配置 + 成功下发到设备槽位的数量。
 #[derive(Debug, Serialize)]
 pub struct UpdateAgentConfigReply {
     pub config: AgentConfig,
+    /// 成功入队的设备槽位数。字段名为兼容旧契约保留（早期只有房间主设备）。
     pub pushed_rooms: i64,
+    /// 成功入队的设备槽位数（= `pushed_rooms`，语义更准确的新字段）。
+    pub pushed_slots: i64,
 }
 
 /// `GET /admin/agent-configs`：所有作用域的配置（含 policy patch）。
@@ -75,7 +94,7 @@ pub async fn list(
     Ok(Json(AgentConfigListReply { items, total }))
 }
 
-/// `GET /admin/agent-configs/effective?room_id=`：某房间合并后的生效策略。
+/// `GET /admin/agent-configs/effective?room_id=` / `?device_slot=`：合并后的生效策略。
 pub async fn effective(
     State(state): State<AppState>,
     AuthUser { id }: AuthUser,
@@ -83,18 +102,38 @@ pub async fn effective(
 ) -> AppResult<Json<EffectiveAgentPolicyReply>> {
     authorization::require_permission(&state, id, permissions::DEVICE_READ).await?;
 
-    if state.rooms.get(query.room_id).await?.is_none() {
-        return Err(AppError::not_found("房间不存在"));
+    match (query.room_id, query.device_slot) {
+        (Some(room_id), None) => {
+            if state.rooms.get(room_id).await?.is_none() {
+                return Err(AppError::not_found("房间不存在"));
+            }
+            let effective = state.agent_configs.effective_for_room(room_id).await?;
+            Ok(Json(EffectiveAgentPolicyReply {
+                room_id: Some(room_id),
+                device_slot: None,
+                policy: effective.policy,
+                revision: effective.revision,
+            }))
+        }
+        (None, Some(raw_slot)) => {
+            let slot = raw_slot.trim();
+            if slot.is_empty() {
+                return Err(AppError::bad_request("device_slot 不能为空"));
+            }
+            if !state.agent_configs.device_slot_exists(slot).await? {
+                return Err(AppError::not_found("设备不存在"));
+            }
+            let effective = state.agent_configs.effective_for_slot(slot).await?;
+            Ok(Json(EffectiveAgentPolicyReply {
+                room_id: None,
+                device_slot: Some(slot.to_owned()),
+                policy: effective.policy,
+                revision: effective.revision,
+            }))
+        }
+        (Some(_), Some(_)) => Err(AppError::bad_request("room_id 与 device_slot 只能二选一")),
+        (None, None) => Err(AppError::bad_request("必须提供 room_id 或 device_slot")),
     }
-    let effective = state
-        .agent_configs
-        .effective_for_room(query.room_id)
-        .await?;
-    Ok(Json(EffectiveAgentPolicyReply {
-        room_id: query.room_id,
-        policy: effective.policy,
-        revision: effective.revision,
-    }))
 }
 
 /// `PUT /admin/agent-configs`：校验作用域与策略 → upsert → 审计 → 二次下发。
@@ -106,12 +145,28 @@ pub async fn update(
 ) -> AppResult<Json<UpdateAgentConfigReply>> {
     authorization::require_permission(&state, id, permissions::DEVICE_MANAGE).await?;
 
-    ensure_scope(&state, request.scope_type, request.scope_id).await?;
+    let scope_key = ensure_scope(&state, &request).await?;
     validate_policy_patch(&request.policy)?;
+    // 写入前预演合并结果，拦掉「单字段合法但合并后非法」的策略（如 full < fast）。
+    state
+        .agent_configs
+        .preview_effective(
+            request.scope_type,
+            request.scope_id,
+            scope_key.as_deref(),
+            &request.policy,
+        )
+        .await?;
 
     let config = state
         .agent_configs
-        .upsert(request.scope_type, request.scope_id, &request.policy, id)
+        .upsert(
+            request.scope_type,
+            request.scope_id,
+            scope_key.as_deref(),
+            &request.policy,
+            id,
+        )
         .await?;
 
     super::audit::record_or_log(
@@ -123,6 +178,7 @@ pub async fn update(
         json!({
             "scope_type": config.scope_type.as_str(),
             "scope_id": config.scope_id,
+            "device_slot": config.scope_key,
             "policy": config.policy,
             "revision": config.revision,
         }),
@@ -130,82 +186,106 @@ pub async fn update(
     )
     .await;
 
-    let room_ids = state
+    // 受影响设备槽位：主设备 + room_devices 子机，各自合并后下发。
+    let slots = state
         .agent_configs
-        .rooms_for_scope(request.scope_type, request.scope_id)
+        .device_slots_for_scope(request.scope_type, request.scope_id, scope_key.as_deref())
         .await?;
-    let mut pushed_rooms = 0_i64;
-    for room_id in room_ids {
-        if dispatch_config_update(&state, room_id).await {
-            pushed_rooms += 1;
+    let mut pushed_slots = 0_i64;
+    for slot in slots {
+        if dispatch_config_update(&state, &slot).await {
+            pushed_slots += 1;
         }
     }
 
     Ok(Json(UpdateAgentConfigReply {
         config,
-        pushed_rooms,
+        pushed_rooms: pushed_slots,
+        pushed_slots,
     }))
 }
 
-/// 作用域与 `scope_id` 的组合约束，并校验 area/room 目标存在（404）。
+/// 校验作用域与 `scope_id` / `device_slot` 的组合，并检查目标存在（404）。
+///
+/// 返回 device 作用域的槽位 key（其余作用域为 `None`）。
 async fn ensure_scope(
     state: &AppState,
-    scope_type: ConfigScopeType,
-    scope_id: Option<Uuid>,
-) -> AppResult<()> {
-    match scope_type {
+    request: &UpdateAgentConfigRequest,
+) -> AppResult<Option<String>> {
+    let device_slot = request
+        .device_slot
+        .as_deref()
+        .map(str::trim)
+        .filter(|slot| !slot.is_empty())
+        .map(str::to_owned);
+
+    match request.scope_type {
         ConfigScopeType::Global => {
-            if scope_id.is_some() {
+            if request.scope_id.is_some() {
                 return Err(AppError::bad_request(
                     "scope_type=global 时不能提供 scope_id",
                 ));
             }
+            if device_slot.is_some() {
+                return Err(AppError::bad_request(
+                    "scope_type=global 时不能提供 device_slot",
+                ));
+            }
+            Ok(None)
         }
         ConfigScopeType::Area => {
-            let area_id = scope_id
+            if device_slot.is_some() {
+                return Err(AppError::bad_request(
+                    "scope_type=area 时不能提供 device_slot",
+                ));
+            }
+            let area_id = request
+                .scope_id
                 .ok_or_else(|| AppError::bad_request("scope_type=area 时必须提供 scope_id"))?;
             if state.areas.get(area_id).await?.is_none() {
                 return Err(AppError::not_found("区域不存在"));
             }
+            Ok(None)
         }
         ConfigScopeType::Room => {
-            let room_id = scope_id
+            if device_slot.is_some() {
+                return Err(AppError::bad_request(
+                    "scope_type=room 时不能提供 device_slot",
+                ));
+            }
+            let room_id = request
+                .scope_id
                 .ok_or_else(|| AppError::bad_request("scope_type=room 时必须提供 scope_id"))?;
             if state.rooms.get(room_id).await?.is_none() {
                 return Err(AppError::not_found("房间不存在"));
             }
+            Ok(None)
+        }
+        ConfigScopeType::Device => {
+            if request.scope_id.is_some() {
+                return Err(AppError::bad_request(
+                    "scope_type=device 时不能提供 scope_id（用 device_slot）",
+                ));
+            }
+            let slot = device_slot
+                .ok_or_else(|| AppError::bad_request("scope_type=device 时必须提供 device_slot"))?;
+            if !state.agent_configs.device_slot_exists(&slot).await? {
+                return Err(AppError::not_found("设备不存在"));
+            }
+            Ok(Some(slot))
         }
     }
-    Ok(())
 }
 
-/// 向单个房间做 `config.update` 二次下发；返回是否成功入队。
+/// 向单个设备槽位做 `config.update` 二次下发；返回是否成功入队。
 ///
-/// 尽力而为：房间不存在 / 未绑定槽位 / 没有存活设备 / 入队失败都只记 `warn!`。
-async fn dispatch_config_update(state: &AppState, room_id: Uuid) -> bool {
-    let slot = match state.rooms.get(room_id).await {
-        Ok(Some(room)) => room.device_slot,
-        Ok(None) => {
-            tracing::warn!(%room_id, "房间不存在，跳过 config.update 下发");
-            return false;
-        }
-        Err(error) => {
-            tracing::warn!(%error, %room_id, "读取房间失败，跳过 config.update 下发");
-            return false;
-        }
-    };
-    let Some(slot) = slot
-        .map(|slot| slot.trim().to_owned())
-        .filter(|slot| !slot.is_empty())
-    else {
-        tracing::warn!(%room_id, "房间未绑定设备槽位，config.update 未下发");
-        return false;
-    };
-
-    let effective = match state.agent_configs.effective_for_room(room_id).await {
+/// 使用 `effective_for_slot` 合并（global → area → room → device），保证 device 级
+/// 覆盖随下发一起生效。尽力而为：槽位无存活设备 / 入队失败都只记 `warn!`。
+async fn dispatch_config_update(state: &AppState, slot: &str) -> bool {
+    let effective = match state.agent_configs.effective_for_slot(slot).await {
         Ok(effective) => effective,
         Err(error) => {
-            tracing::warn!(%error, %room_id, "读取生效配置失败，跳过 config.update 下发");
+            tracing::warn!(%error, %slot, "读取生效配置失败，跳过 config.update 下发");
             return false;
         }
     };
@@ -217,7 +297,7 @@ async fn dispatch_config_update(state: &AppState, room_id: Uuid) -> bool {
 
     match state
         .storage_repo
-        .enqueue_downlink_for_slot(&slot, "config.update", &payload)
+        .enqueue_downlink_for_slot(slot, "config.update", &payload)
         .await
     {
         Ok(Some(serial)) => {
@@ -232,11 +312,11 @@ async fn dispatch_config_update(state: &AppState, room_id: Uuid) -> bool {
             true
         }
         Ok(None) => {
-            tracing::warn!(%room_id, %slot, "设备槽位当前没有存活设备，config.update 未下发");
+            tracing::warn!(%slot, "设备槽位当前没有存活设备，config.update 未下发");
             false
         }
         Err(error) => {
-            tracing::warn!(%error, %room_id, %slot, "config.update 入队失败");
+            tracing::warn!(%error, %slot, "config.update 入队失败");
             false
         }
     }

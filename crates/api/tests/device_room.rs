@@ -65,6 +65,8 @@ fn test_config() -> Config {
         schedule_webhook_timeout_secs: 5,
         schedule_webhook_max_attempts: 5,
         schedule_delivery_batch: 50,
+        machine_agent_token: None,
+        machine_snapshot_keep: 100,
         device_presence_enabled: false,
         device_presence_tick_secs: 5,
         device_presence_webhook_timeout_secs: 5,
@@ -502,4 +504,187 @@ async fn send_json(
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
     (status, value)
+}
+
+/// P1：一个房间除主设备外还可以挂多台子机；子机升格为主设备时自动从子机列表移除。
+#[tokio::test]
+#[ignore = "requires PostgreSQL and Redis; run via scripts/test-integration.sh"]
+async fn room_supports_primary_and_multiple_machines() {
+    let state = test_state().await;
+    let app: Router = api::router(state.clone());
+    let users = UserRepo::new(state.db.pool().clone());
+    let password = "MultiMachine@12345";
+    let password_hash = hash_password_async(password.to_owned())
+        .await
+        .expect("hash password");
+    let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let admin_name = format!("mm_{suffix}");
+    let admin = users
+        .create_with_roles(
+            &admin_name,
+            None,
+            "Multi Machine Admin",
+            &password_hash,
+            &["admin".to_owned()],
+        )
+        .await
+        .expect("create admin");
+    let token = login(&app, &admin_name, password).await;
+
+    let (status, area) = send_json(
+        &app,
+        "POST",
+        "/api/v1/admin/areas",
+        Some(&token),
+        Some(json!({ "code": unique_code("marea"), "name": "多机测试区域" })),
+    )
+    .await;
+    assert_eq!(status, 201, "{area}");
+    let area_id = area["id"].as_str().expect("area id").to_owned();
+
+    let room_code = unique_code("mroom");
+    let (status, room) = send_json(
+        &app,
+        "POST",
+        "/api/v1/admin/rooms",
+        Some(&token),
+        Some(json!({
+            "area_id": area_id,
+            "code": room_code,
+            "name": "多机测试房间",
+            "capacity": 20
+        })),
+    )
+    .await;
+    assert_eq!(status, 201, "{room}");
+    let room_id = room["id"].as_str().expect("room id").to_owned();
+
+    // 主设备：沿用旧接口绑定槽位。
+    let primary_slot = format!("{room_code}-primary");
+    let (status, body) = send_json(
+        &app,
+        "PUT",
+        &format!("/api/v1/admin/rooms/{room_id}/device"),
+        Some(&token),
+        Some(json!({ "device_slot": primary_slot })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // 子机 1 / 子机 2：各自签发注册 token，槽位自动分配为 {code}-m1 / -m2。
+    let mut machine_slots = Vec::new();
+    for index in 1..=2 {
+        let (status, issued) = send_json(
+            &app,
+            "POST",
+            &format!("/api/v1/admin/rooms/{room_id}/devices/token"),
+            Some(&token),
+            Some(json!({ "kind": "auto", "ttl_secs": 600, "label": format!("子机 {index}") })),
+        )
+        .await;
+        assert_eq!(status, 200, "{issued}");
+        let slot = issued["device_slot"].as_str().expect("slot").to_owned();
+        assert_eq!(slot, format!("{room_code}-m{index}"), "{issued}");
+        assert_eq!(issued["token"].as_str().expect("token").len(), 64);
+        assert!(issued["link"].as_str().expect("link").contains("token="));
+        machine_slots.push(slot);
+    }
+
+    let (status, machines) = send_json(
+        &app,
+        "GET",
+        &format!("/api/v1/admin/rooms/{room_id}/devices"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{machines}");
+    let items = machines.as_array().expect("machines array");
+    assert_eq!(items.len(), 3, "{machines}");
+    assert_eq!(items[0]["device_slot"], primary_slot);
+    assert_eq!(items[0]["is_primary"], true);
+    assert_eq!(items[0]["pending_token"], false);
+    for slot in &machine_slots {
+        let item = items
+            .iter()
+            .find(|item| item["device_slot"] == *slot)
+            .unwrap_or_else(|| panic!("缺少子机 {slot}: {machines}"));
+        assert_eq!(item["is_primary"], false);
+        assert_eq!(item["pending_token"], true);
+        assert!(item["serial"].is_null());
+    }
+
+    // 子机升格为主设备：应自动从子机列表移除（触发器清理 room_devices）。
+    let promoted = machine_slots[0].clone();
+    let (status, body) = send_json(
+        &app,
+        "PUT",
+        &format!("/api/v1/admin/rooms/{room_id}/device"),
+        Some(&token),
+        Some(json!({ "device_slot": promoted })),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, machines) = send_json(
+        &app,
+        "GET",
+        &format!("/api/v1/admin/rooms/{room_id}/devices"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{machines}");
+    let items = machines.as_array().expect("machines array");
+    assert_eq!(items.len(), 2, "{machines}");
+    assert_eq!(items[0]["device_slot"], promoted);
+    assert_eq!(items[0]["is_primary"], true);
+    assert!(
+        items.iter().all(|item| item["device_slot"] != primary_slot),
+        "旧主设备已解绑，不应再出现：{machines}"
+    );
+
+    // 删除剩下的子机绑定。
+    let (status, _) = send_json(
+        &app,
+        "DELETE",
+        &format!("/api/v1/admin/rooms/{room_id}/devices/{}", machine_slots[1]),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 204);
+
+    let (status, machines) = send_json(
+        &app,
+        "GET",
+        &format!("/api/v1/admin/rooms/{room_id}/devices"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{machines}");
+    assert_eq!(machines.as_array().expect("machines array").len(), 1);
+
+    // 清理：房间（级联 room_devices）→ 区域 → 用户；注册 token 没有外键，按槽位前缀清掉。
+    sqlx::query("DELETE FROM device_bootstrap_token WHERE device_slot LIKE $1")
+        .bind(format!("{room_code}%"))
+        .execute(state.db.pool())
+        .await
+        .expect("cleanup tokens");
+    sqlx::query("DELETE FROM rooms WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&room_id).expect("room uuid"))
+        .execute(state.db.pool())
+        .await
+        .expect("cleanup room");
+    sqlx::query("DELETE FROM areas WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&area_id).expect("area uuid"))
+        .execute(state.db.pool())
+        .await
+        .expect("cleanup area");
+    sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+        .bind(vec![admin.id])
+        .execute(state.db.pool())
+        .await
+        .expect("cleanup users");
 }
