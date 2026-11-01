@@ -894,7 +894,9 @@ qe-agent (machine) ──mTLS POST /machine/report──▶ device-pki ──▶
 
 - **认证**：默认 mTLS，证书由 device-pki 签发（每台机器一个设备身份）。
   `REPORT_MODE=bearer` 只作过渡，保留 `MACHINE_API_BASE` + `MACHINE_AGENT_TOKEN` 旧路径；
-  服务端未配置 token 时 Bearer 端点仍返回 503。
+  服务端未配置 token 时 Bearer 端点仍返回 503。**退场计划**：v0.2 删除旧
+  `qe-node-agent`/`qe-room-agent` 二进制；设备全部迁 mTLS 后删除 Bearer 端点
+  （见 [`crates/agent/README.md`](crates/agent/README.md#退场时间表p4)）。
 - **两档采集**：`fast`（内置指标，默认 10s，5..=60s）/ `full`（含外部工具，默认 300s，
   60..=3600s）。机器上报带 `tier`，落 `machine_snapshots.tier`；`--once` 发一份 full，
   `--print` 只打印 JSON。

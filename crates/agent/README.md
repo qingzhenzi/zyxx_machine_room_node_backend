@@ -178,3 +178,14 @@ DEVICE_DATA_DIR=/var/lib/qe-agent qe-agent run --role machine --once
 
 systemd 迁移：`qe-room-agent.service` → `qe-agent.service`（`--role both`）；
 node-agent 目前无 unit（手工启动），迁移时一并并到这个单元。
+
+### 退场时间表（P4）
+
+| 版本 | 状态 | 动作 |
+| --- | --- | --- |
+| v0.1（当前） | 过渡 | 默认 mTLS / `--role both`；`qe-node-agent`、`qe-room-agent` 保留为**弃用 shim**（启动打印提示）；Bearer fleet token 仅作回退 |
+| v0.2 | 删除旧入口 | 移除 `qe-node-agent`/`qe-room-agent` 二进制（保留库 crate），部署/CI/文档只认 `qe-agent` |
+| v0.2+ | 删除旧认证 | 所有设备迁移到 mTLS 后，移除 `MACHINE_AGENT_TOKEN` 与 qe-api 的 Bearer `/api/v1/machine/report` |
+
+删除条件：管理端 `/admin/devices` 没有 Bearer 设备流量；所有 systemd/脚本已指向
+`qe-agent`；现场完成一次 mTLS 上报验收。
