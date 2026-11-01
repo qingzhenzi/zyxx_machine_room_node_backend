@@ -7,6 +7,7 @@
 pub mod agent_config;
 pub mod device;
 pub mod error;
+pub mod machine;
 pub mod models;
 pub mod rbac;
 pub mod schedule;

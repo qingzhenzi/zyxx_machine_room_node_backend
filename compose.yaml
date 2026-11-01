@@ -142,6 +142,27 @@ services:
     networks:
       - backend
 
+
+  # 可选：管理控制台（frontend/ 的 Vite 构建 + nginx）。
+  # 启动：docker compose --profile console up -d console
+  console:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /api/v1
+    image: ${CONSOLE_IMAGE:-qestudio/console:local}
+    profiles: ["console"]
+    ports:
+      - "${CONSOLE_PORT:-8081}:80"
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - backend
+
   # 可选：S3 兼容对象存储（资源/镜像 P0）。`docker compose --profile storage up -d rustfs`
   # 控制台默认 9001；把 S3_ENDPOINT 指向 http://rustfs:9000、S3_BUCKET=qestudio 即可启用。
   rustfs:

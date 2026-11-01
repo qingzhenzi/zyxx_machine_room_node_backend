@@ -508,7 +508,11 @@ const ROOM_COLUMNS: &str = "r.id, r.area_id, a.name AS area_name, r.code, r.name
      r.device_slot, r.webhook_url, a.timezone AS timezone, r.is_active, r.metadata,
      r.created_at, r.updated_at,
      de.serial AS device_serial, de.status AS device_status,
-     ds.state AS device_online, ds.updated_at AS device_last_seen_at,
+     CASE WHEN ds.state = 'online' THEN 'online'
+          WHEN ms.collected_at IS NOT NULL
+           AND ms.collected_at >= now() - interval '5 minutes' THEN 'online'
+          ELSE ds.state END AS device_online,
+     GREATEST(ds.updated_at, ms.received_at) AS device_last_seen_at,
      EXISTS (SELECT 1 FROM device_bootstrap_token t
              WHERE t.device_slot = r.device_slot AND t.used_at IS NULL AND t.expires_at > now())
          AS device_pending_token";
@@ -523,7 +527,14 @@ const ROOM_DEVICE_JOINS: &str = "LEFT JOIN LATERAL (
                   de.issued_at DESC NULLS LAST, de.serial
          LIMIT 1
      ) de ON TRUE
-     LEFT JOIN device_session ds ON ds.serial = de.serial";
+     LEFT JOIN device_session ds ON ds.serial = de.serial
+     LEFT JOIN LATERAL (
+         SELECT m.collected_at, m.received_at
+           FROM machine_snapshots m
+          WHERE m.serial = de.serial
+          ORDER BY m.collected_at DESC
+          LIMIT 1
+     ) ms ON TRUE";
 
 const SCHEDULE_COLUMNS: &str = "s.id, s.room_id, r.name AS room_name, s.name, s.start_date,
      s.end_date, a.timezone AS timezone, s.is_active, s.created_by, s.created_at, s.updated_at";

@@ -59,6 +59,8 @@ fn local_policy() -> AgentPolicy {
         poll_interval_secs: 2,
         download_concurrency: 4,
         cache_max_bytes: 10 * 1024 * 1024 * 1024,
+        telemetry_fast_interval_secs: 10,
+        telemetry_full_interval_secs: 300,
     }
 }
 
@@ -70,6 +72,8 @@ fn complete_payload(revision: i64, policy: &AgentPolicy) -> String {
             "poll_interval_secs": policy.poll_interval_secs,
             "download_concurrency": policy.download_concurrency,
             "cache_max_bytes": policy.cache_max_bytes,
+            "telemetry_fast_interval_secs": policy.telemetry_fast_interval_secs,
+            "telemetry_full_interval_secs": policy.telemetry_full_interval_secs,
         }
     })
     .to_string()
@@ -129,6 +133,7 @@ fn config_file_patch_overrides_defaults() {
             poll_interval_secs: 7,
             download_concurrency: 3,
             cache_max_bytes: 2048,
+            ..AgentPolicy::default()
         }
     );
     assert!(config.lxc_auto_start);
@@ -165,6 +170,7 @@ fn env_overrides_config_file() {
             poll_interval_secs: 9,
             download_concurrency: 8,
             cache_max_bytes: 4096,
+            ..AgentPolicy::default()
         }
     );
 }
@@ -234,6 +240,8 @@ async fn remote_policy_overrides_local_policy() {
         poll_interval_secs: 11,
         download_concurrency: 12,
         cache_max_bytes: 8192,
+        telemetry_fast_interval_secs: 15,
+        telemetry_full_interval_secs: 600,
     };
     let runtime = RuntimePolicy::new(local_policy());
     let client = StaticClient {
@@ -298,6 +306,7 @@ fn config_update_applies_complete_policy() {
         poll_interval_secs: 30,
         download_concurrency: 4,
         cache_max_bytes: 10 * 1024 * 1024 * 1024,
+        ..local_policy()
     };
 
     let change = handle_config_update(&complete_payload(9, &next), &runtime).unwrap();
@@ -318,6 +327,7 @@ fn config_update_flags_restart_only_for_puller_fields() {
         poll_interval_secs: 2,
         download_concurrency: 9,
         cache_max_bytes: 10 * 1024 * 1024 * 1024,
+        ..local_policy()
     };
     let change = handle_config_update(&complete_payload(2, &next), &runtime).unwrap();
     assert!(change.restart_required());

@@ -20,29 +20,49 @@ use uuid::Uuid;
 use qe_domain::{
     device::{
         BootstrapTokenKind, DeviceFilter, DeviceInfo, DeviceOnlineState, DeviceStatus,
-        IssuedBootstrapToken,
+        IssuedBootstrapToken, RoomMachine,
     },
     models::Page,
     schedule::Room,
 };
 
-use crate::error::DbResult;
+use crate::error::{DbError, DbResult};
 
 /// `rooms.device_slot` 的最大长度（与 `qe_domain::validation::normalize_device_slot` 一致）。
 const MAX_DEVICE_SLOT_LEN: usize = 128;
 /// 槽位冲突时追加的 id 片段长度。
 const SHORT_ID_LEN: usize = 8;
+/// 子机槽位候选 `{code}-m{n}` 的最大尝试次数。
+const MAX_MACHINE_SLOT_TRIES: usize = 512;
 
+/// 机器在线 = device-pki mTLS 会话 online，或最近 5 分钟内有 room-agent 快照。
+/// 为什么不是只看 device_session：v1 room-agent 走 HTTP + fleet token，不更新 mTLS 会话；
+/// 两台都不可用时才回退到 device_session 的原始状态（通常为 offline）。
 const DEVICE_COLUMNS: &str = "de.serial, de.device_slot, de.status,
-     ds.state AS device_online, ds.updated_at AS device_last_seen_at,
+     CASE WHEN ds.state = 'online' THEN 'online'
+          WHEN ms.collected_at IS NOT NULL
+           AND ms.collected_at >= now() - interval '5 minutes' THEN 'online'
+          ELSE ds.state END AS device_online,
+     GREATEST(ds.updated_at, ms.received_at) AS device_last_seen_at,
      (de.downloaded_at IS NOT NULL) AS downloaded,
      de.client_info, de.issued_at, de.activated_at, de.revoked_at,
      r.id AS room_id, r.code AS room_code, r.name AS room_name,
      a.id AS area_id, a.name AS area_name";
 
-const DEVICE_JOINS: &str = "LEFT JOIN rooms r ON r.device_slot = de.device_slot
+/// 房间关联：主设备看 `rooms.device_slot`（rp），子机看 `room_devices`（rd）。
+/// 同一槽位不可能同时是主设备与子机（迁移 0015 的触发器兜底），COALESCE 只是防御。
+const DEVICE_JOINS: &str = "LEFT JOIN rooms rp ON rp.device_slot = de.device_slot
+     LEFT JOIN room_devices rd ON rd.device_slot = de.device_slot
+     LEFT JOIN rooms r ON r.id = COALESCE(rp.id, rd.room_id)
      LEFT JOIN areas a ON a.id = r.area_id
-     LEFT JOIN device_session ds ON ds.serial = de.serial";
+     LEFT JOIN device_session ds ON ds.serial = de.serial
+     LEFT JOIN LATERAL (
+         SELECT m.collected_at, m.received_at
+           FROM machine_snapshots m
+          WHERE m.serial = de.serial
+          ORDER BY m.collected_at DESC
+          LIMIT 1
+     ) ms ON TRUE";
 
 /// 过滤条件（注释里的 `$n` 与 `list` 中的参数顺序一致）。
 const DEVICE_FILTER: &str = "($1::uuid IS NULL OR a.id = $1)
@@ -148,6 +168,35 @@ impl From<DeviceInfoRow> for DeviceInfo {
             room_name: row.room_name,
             area_id: row.area_id,
             area_name: row.area_name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct RoomMachineRow {
+    device_slot: String,
+    is_primary: bool,
+    label: Option<String>,
+    serial: Option<String>,
+    status: Option<String>,
+    online: Option<String>,
+    last_seen_at: Option<DateTime<Utc>>,
+    pending_token: bool,
+    linked_at: Option<DateTime<Utc>>,
+}
+
+impl From<RoomMachineRow> for RoomMachine {
+    fn from(row: RoomMachineRow) -> Self {
+        Self {
+            device_slot: row.device_slot,
+            is_primary: row.is_primary,
+            label: row.label,
+            serial: row.serial,
+            status: row.status.as_deref().map(status_from_str),
+            online: online_from_str(row.online.as_deref()),
+            last_seen_at: row.last_seen_at,
+            pending_token: row.pending_token,
+            created_at: row.linked_at,
         }
     }
 }
@@ -349,6 +398,167 @@ impl DeviceRepo {
         .await?;
 
         Ok(IssuedBootstrapToken { token, expires_at })
+    }
+
+    /// 房间机器列表：主设备（`rooms.device_slot`）+ 子设备（`room_devices`）。
+    /// 房间不存在返回 `None`；存在但没有机器时返回空列表。
+    pub async fn list_room_machines(&self, room_id: Uuid) -> DbResult<Option<Vec<RoomMachine>>> {
+        let exists: Option<Uuid> = sqlx::query_scalar("SELECT id FROM rooms WHERE id = $1")
+            .bind(room_id)
+            .fetch_optional(&self.db)
+            .await?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+
+        let rows = sqlx::query_as::<_, RoomMachineRow>(
+            "WITH slots AS (
+                 SELECT r.device_slot, TRUE AS is_primary, NULL::text AS label,
+                        r.created_at AS linked_at
+                   FROM rooms r
+                  WHERE r.id = $1 AND r.device_slot IS NOT NULL
+                 UNION ALL
+                 SELECT rd.device_slot, FALSE AS is_primary, rd.label,
+                        rd.created_at AS linked_at
+                   FROM room_devices rd
+                  WHERE rd.room_id = $1
+             )
+             SELECT s.device_slot,
+                    s.is_primary,
+                    s.label,
+                    de.serial,
+                    de.status,
+                    CASE WHEN ds.state = 'online' THEN 'online'
+                         WHEN ms.collected_at IS NOT NULL
+                          AND ms.collected_at >= now() - interval '5 minutes' THEN 'online'
+                         ELSE ds.state END AS online,
+                    GREATEST(ds.updated_at, ms.received_at) AS last_seen_at,
+                    EXISTS (
+                        SELECT 1 FROM device_bootstrap_token t
+                         WHERE t.device_slot = s.device_slot
+                           AND t.used_at IS NULL AND t.expires_at > now()
+                    ) AS pending_token,
+                    s.linked_at
+               FROM slots s
+               LEFT JOIN LATERAL (
+                   SELECT de.serial, de.status
+                     FROM device_enrollment de
+                    WHERE de.device_slot = s.device_slot
+                    ORDER BY (de.status IN ('pending', 'issued', 'active')) DESC,
+                             de.issued_at DESC NULLS LAST, de.serial
+                    LIMIT 1
+               ) de ON TRUE
+               LEFT JOIN device_session ds ON ds.serial = de.serial
+               LEFT JOIN LATERAL (
+                   SELECT m.collected_at, m.received_at
+                     FROM machine_snapshots m
+                    WHERE m.serial = de.serial
+                    ORDER BY m.collected_at DESC
+                    LIMIT 1
+               ) ms ON TRUE
+              ORDER BY s.is_primary DESC, s.linked_at, s.device_slot",
+        )
+        .bind(room_id)
+        .fetch_all(&self.db)
+        .await?;
+
+        Ok(Some(rows.into_iter().map(RoomMachine::from).collect()))
+    }
+
+    /// 为房间签发一台子机的注册 token：分配 `{code}-m{n}` 槽位、登记 `room_devices`、
+    /// 写入一次性 bootstrap token（同一事务）。房间不存在返回 `None`。
+    pub async fn issue_machine_token(
+        &self,
+        room_id: Uuid,
+        kind: BootstrapTokenKind,
+        created_by: &str,
+        ttl_secs: i64,
+        label: Option<&str>,
+    ) -> DbResult<Option<(String, IssuedBootstrapToken)>> {
+        let mut tx = self.db.begin().await?;
+
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT code FROM rooms WHERE id = $1 FOR UPDATE")
+                .bind(room_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((code,)) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        let base = slot_from_code(&code, room_id);
+        let mut chosen: Option<String> = None;
+        for index in 1..=MAX_MACHINE_SLOT_TRIES {
+            let suffix = format!("-m{index}");
+            let max_base = MAX_DEVICE_SLOT_LEN.saturating_sub(suffix.chars().count());
+            let trimmed: String = base.chars().take(max_base).collect();
+            let candidate = format!("{trimmed}{suffix}");
+            let taken: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM rooms WHERE device_slot = $1
+                     UNION ALL SELECT 1 FROM room_devices WHERE device_slot = $1
+                     UNION ALL SELECT 1 FROM device_enrollment WHERE device_slot = $1
+                     UNION ALL SELECT 1 FROM device_bootstrap_token
+                       WHERE device_slot = $1 AND used_at IS NULL AND expires_at > now()
+                 )",
+            )
+            .bind(&candidate)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !taken {
+                chosen = Some(candidate);
+                break;
+            }
+        }
+        let Some(device_slot) = chosen else {
+            tx.rollback().await?;
+            return Err(DbError::conflict(
+                "房间子机槽位已用尽，请清理未完成注册的历史 token",
+            ));
+        };
+
+        sqlx::query("INSERT INTO room_devices (device_slot, room_id, label) VALUES ($1, $2, $3)")
+            .bind(&device_slot)
+            .bind(room_id)
+            .bind(label)
+            .execute(&mut *tx)
+            .await?;
+
+        let token = random_token();
+        let token_hash = hash_token(&token);
+        let expires_at = Utc::now() + Duration::seconds(ttl_secs);
+        sqlx::query(
+            "INSERT INTO device_bootstrap_token
+                (token_hash, kind, device_slot, created_by, expires_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(token_hash.as_slice())
+        .bind(kind.as_str())
+        .bind(&device_slot)
+        .bind(created_by)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some((
+            device_slot,
+            IssuedBootstrapToken { token, expires_at },
+        )))
+    }
+
+    /// 解除房间与子机的绑定；主设备（`rooms.device_slot`）不走这里。
+    /// 返回 `true` 表示确实删除了一条子机绑定。
+    pub async fn remove_room_machine(&self, room_id: Uuid, device_slot: &str) -> DbResult<bool> {
+        let deleted =
+            sqlx::query("DELETE FROM room_devices WHERE room_id = $1 AND device_slot = $2")
+                .bind(room_id)
+                .bind(device_slot)
+                .execute(&self.db)
+                .await?
+                .rows_affected();
+        Ok(deleted > 0)
     }
 }
 

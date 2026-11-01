@@ -101,6 +101,24 @@ pub struct RoomDevice {
     pub pending_token: bool, // 存在未使用且未过期的注册 token
 }
 
+/// 房间内的机器条目（`GET /admin/rooms/{id}/devices`）。
+///
+/// 主设备来自 `rooms.device_slot`，子设备来自 `room_devices`；
+/// `serial` / `status` 为 `None` 表示槽位已分配但设备尚未注册。
+#[derive(Debug, Clone, Serialize)]
+pub struct RoomMachine {
+    pub device_slot: String,
+    /// `true` = 房间主设备（保留既有下发口径），`false` = 子机。
+    pub is_primary: bool,
+    pub label: Option<String>,
+    pub serial: Option<String>,
+    pub status: Option<DeviceStatus>,
+    pub online: Option<DeviceOnlineState>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub pending_token: bool,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
 /// 设备列表条目（`GET /admin/devices`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceInfo {

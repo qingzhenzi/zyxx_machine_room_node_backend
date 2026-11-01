@@ -12,6 +12,7 @@ use crate::{
         announcements::AnnouncementRepo,
         audit::AuditLogRepo,
         device::DeviceRepo,
+        machine::MachineRepo,
         presence::{PresenceEventRecord, PresenceRepo},
         roles::RoleRepo,
         schedule::{AreaRepo, EventRuleRepo, RoomRepo, ScheduleEventRepo, ScheduleRepo},
@@ -42,6 +43,8 @@ pub struct AppState {
     pub schedule_events: ScheduleEventRepo,
     // ---- 设备 ----
     pub devices: DeviceRepo,
+    // ---- 机器遥测（room-agent 上报）----
+    pub machines: MachineRepo,
     // ---- 设备在线事件与可靠投递（P3）----
     pub presence: PresenceRepo,
     /// 事件落库后的本地广播（SSE 实时推送；跨副本仍以查库为准）。
@@ -80,6 +83,7 @@ impl AppState {
             event_rules: EventRuleRepo::new(db.pool().clone()),
             schedule_events: ScheduleEventRepo::new(db.pool().clone()),
             devices: DeviceRepo::new(db.pool().clone()),
+            machines: MachineRepo::new(db.pool().clone()),
             presence: PresenceRepo::new(db.pool().clone()),
             presence_events,
             agent_configs: AgentConfigRepo::new(db.pool().clone()),

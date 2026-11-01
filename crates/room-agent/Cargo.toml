@@ -1,0 +1,30 @@
+[package]
+name = "qe-room-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "QEStudio 房间机器 agent：采集主机/健康/诊断数据并上报 qe-api"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+qe-device-pki-client = { path = "../device-pki-client" }
+qe-domain = { path = "../domain" }
+rustls = "0.23"
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"

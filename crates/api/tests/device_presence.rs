@@ -83,6 +83,8 @@ fn test_config() -> Config {
         schedule_webhook_timeout_secs: 5,
         schedule_webhook_max_attempts: 5,
         schedule_delivery_batch: 50,
+        machine_agent_token: None,
+        machine_snapshot_keep: 100,
         // 不启动 presence worker：测试直接写事件/投递表，避免后台任务竞态。
         device_presence_enabled: false,
         device_presence_tick_secs: 5,

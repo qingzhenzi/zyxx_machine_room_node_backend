@@ -1,0 +1,10 @@
+node_modules
+dist
+dist-*
+.cache
+.playwright-browsers
+.playwright-cli
+playwright-report
+test-results
+*.log
+.git

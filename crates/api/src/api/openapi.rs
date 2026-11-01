@@ -53,6 +53,8 @@ pub async fn json_spec() -> Json<Value> {
             { "name": "ScheduleEvents", "description": "触发规则、事件与投递重放/重试" },
             { "name": "Devices", "description": "设备：注册状态、在线状态与区域/房间绑定（v3）" },
             { "name": "DeviceEvents", "description": "设备在线事件：历史查询、SSE 实时流与可靠投递记录（P3）" },
+            { "name": "Machines", "description": "机器总览：room-agent 周期性上报的主机清单、健康结论与诊断历史" },
+            { "name": "MachineAgent", "description": "机器遥测上报端点（room-agent 使用 fleet Bearer token）" },
             { "name": "Storage", "description": "对象存储：预签名上传、对象登记、分发/收集任务（P0，S3 兼容）" },
             { "name": "Images", "description": "镜像：manifest、验证、发布与房间分配（P0，不做 Registry 协议）" },
             { "name": "AgentConfigs", "description": "节点配置：按 global → area → room 合并的生效策略与二次下发（P2）" },
@@ -356,7 +358,7 @@ pub async fn json_spec() -> Json<Value> {
                 "DeviceOnlineState": {
                     "type": "string",
                     "enum": ["online", "offline"],
-                    "description": "设备在线状态（来自 device_session.state）。"
+                    "description": "设备在线状态：device-pki 会话为 online，或最近 5 分钟内有 room-agent 快照。"
                 },
                 "RoomDevice": {
                     "type": "object",
@@ -365,7 +367,7 @@ pub async fn json_spec() -> Json<Value> {
                         "device_slot": { "type": "string" },
                         "serial": { "type": ["string", "null"], "description": "null = 已分配槽位但尚未注册。" },
                         "status": { "type": ["string", "null"], "enum": ["pending", "issued", "active", "rejected", "revoked", null] },
-                        "online": { "type": ["string", "null"], "enum": ["online", "offline", null] },
+                        "online": { "type": ["string", "null"], "enum": ["online", "offline", null], "description": "综合在线状态：device-pki 会话 online 或最近 5 分钟内有 room-agent 快照。" },
                         "last_seen_at": { "type": ["string", "null"], "format": "date-time" },
                         "pending_token": { "type": "boolean", "description": "存在未使用且未过期的注册 token。" }
                     }
@@ -377,7 +379,7 @@ pub async fn json_spec() -> Json<Value> {
                         "serial": { "type": "string" },
                         "device_slot": { "type": "string" },
                         "status": { "$ref": "#/components/schemas/DeviceStatus" },
-                        "online": { "oneOf": [{ "$ref": "#/components/schemas/DeviceOnlineState" }, { "type": "null" }] },
+                        "online": { "oneOf": [{ "$ref": "#/components/schemas/DeviceOnlineState" }, { "type": "null" }], "description": "综合在线状态：device-pki 会话 online 或最近 5 分钟内有 room-agent 快照。" },
                         "last_seen_at": { "type": ["string", "null"], "format": "date-time" },
                         "downloaded": { "type": "boolean" },
                         "client_info": { "type": ["object", "null"], "description": "设备注册时上报的客户端信息。" },
@@ -416,6 +418,29 @@ pub async fn json_spec() -> Json<Value> {
                         "device_slot": { "type": "string" },
                         "expires_at": { "type": "string", "format": "date-time" },
                         "link": { "type": "string", "format": "uri", "description": "设备注册链接：{PUBLIC_ENROLL_ENDPOINT}/enroll?token=…&slot=…" }
+                    }
+                },
+                "RoomMachine": {
+                    "type": "object",
+                    "required": ["device_slot", "is_primary", "serial", "status", "online", "last_seen_at", "pending_token"],
+                    "properties": {
+                        "device_slot": { "type": "string" },
+                        "is_primary": { "type": "boolean", "description": "true = 房间主设备（保留既有下发口径），false = 子机。" },
+                        "label": { "type": ["string", "null"], "description": "子机可读标签。" },
+                        "serial": { "type": ["string", "null"], "description": "null = 槽位已分配但设备尚未注册。" },
+                        "status": { "type": ["string", "null"], "enum": ["pending", "issued", "active", "rejected", "revoked", null] },
+                        "online": { "type": ["string", "null"], "enum": ["online", "offline", null], "description": "综合在线状态：device-pki 会话 online 或最近 5 分钟内有机器快照。" },
+                        "last_seen_at": { "type": ["string", "null"], "format": "date-time" },
+                        "pending_token": { "type": "boolean", "description": "存在未使用且未过期的注册 token。" },
+                        "created_at": { "type": ["string", "null"], "format": "date-time", "description": "绑定到房间的时间。" }
+                    }
+                },
+                "MachineTokenRequest": {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["auto", "approval"], "default": "auto", "description": "auto = 自动注册；approval = 需审批。" },
+                        "ttl_secs": { "type": "integer", "minimum": 60, "maximum": 86400, "default": 900 },
+                        "label": { "type": "string", "maxLength": 64, "description": "可读标签（如“左侧投影机”）。" }
                     }
                 },
                 "CreateRoomRequest": {
@@ -1104,6 +1129,153 @@ pub async fn json_spec() -> Json<Value> {
                         "items": { "type": "array", "items": { "$ref": "#/components/schemas/PresenceDelivery" } },
                         "total": { "type": "integer", "description": "本次返回条数。" }
                     }
+                },
+                "MachineIssue": {
+                    "type": "object",
+                    "required": ["severity", "code", "message"],
+                    "properties": {
+                        "severity": { "type": "string", "enum": ["info", "warning", "critical"] },
+                        "code": { "type": "string", "description": "稳定的问题码，例如 disk.usage / thermal.temperature。" },
+                        "message": { "type": "string" },
+                        "detail": { "type": ["string", "null"] }
+                    }
+                },
+                "MachineHealth": {
+                    "type": "object",
+                    "required": ["status"],
+                    "properties": {
+                        "status": { "type": "string", "enum": ["ok", "warning", "critical"] },
+                        "score": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+                        "issues": { "type": "array", "items": { "$ref": "#/components/schemas/MachineIssue" } }
+                    }
+                },
+                "MachineMetrics": {
+                    "type": "object",
+                    "properties": {
+                        "cpu_usage_percent": { "type": ["number", "null"], "minimum": 0, "maximum": 100 },
+                        "memory_usage_percent": { "type": ["number", "null"], "minimum": 0, "maximum": 100 },
+                        "disk_usage_percent": { "type": ["number", "null"], "minimum": 0, "maximum": 100 },
+                        "uptime_secs": { "type": ["integer", "null"], "minimum": 0 }
+                    }
+                },
+                "MachineReportRequest": {
+                    "type": "object",
+                    "required": ["device_slot", "agent_version", "hostname", "health"],
+                    "properties": {
+                        "schema": { "type": "integer", "const": 1, "default": 1 },
+                        "device_slot": { "type": "string", "maxLength": 128 },
+                        "agent_version": { "type": "string", "maxLength": 64 },
+                        "collected_at": { "type": "string", "format": "date-time", "description": "缺省为服务端当前时间；未来超过 5 分钟会被拒绝。" },
+                        "hostname": { "type": "string", "maxLength": 255 },
+                        "os_name": { "type": ["string", "null"] },
+                        "kernel_version": { "type": ["string", "null"] },
+                        "health": { "$ref": "#/components/schemas/MachineHealth" },
+                        "metrics": { "$ref": "#/components/schemas/MachineMetrics" },
+                        "sections": { "type": "object", "description": "各采集域原始 JSON：platform_health / diagnose / security / containers / vms / agent。" }
+                    }
+                },
+                "MachineReportReply": {
+                    "type": "object",
+                    "required": ["snapshot_id", "serial", "device_slot", "received_at"],
+                    "properties": {
+                        "snapshot_id": { "type": "integer", "format": "int64" },
+                        "serial": { "type": "string" },
+                        "device_slot": { "type": "string" },
+                        "received_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "MachineReportSummary": {
+                    "type": "object",
+                    "required": ["collected_at", "received_at", "agent_version", "hostname", "health_status"],
+                    "properties": {
+                        "collected_at": { "type": "string", "format": "date-time" },
+                        "received_at": { "type": "string", "format": "date-time" },
+                        "agent_version": { "type": "string" },
+                        "hostname": { "type": "string" },
+                        "os_name": { "type": ["string", "null"] },
+                        "kernel_version": { "type": ["string", "null"] },
+                        "health_status": { "type": "string", "enum": ["ok", "warning", "critical", "unknown"] },
+                        "health_score": { "type": ["integer", "null"] },
+                        "cpu_usage_percent": { "type": ["number", "null"] },
+                        "memory_usage_percent": { "type": ["number", "null"] },
+                        "disk_usage_percent": { "type": ["number", "null"] },
+                        "uptime_secs": { "type": ["integer", "null"] }
+                    }
+                },
+                "MachineSummary": {
+                    "type": "object",
+                    "required": ["serial", "device_slot", "status", "online", "session_online", "last_seen_at", "room_id", "room_code", "room_name", "area_id", "area_code", "area_name", "report", "report_stale"],
+                    "properties": {
+                        "serial": { "type": "string" },
+                        "device_slot": { "type": "string" },
+                        "status": { "type": "string", "enum": ["pending", "issued", "active", "rejected", "revoked"] },
+                        "online": { "type": ["string", "null"], "enum": ["online", "offline", null], "description": "综合在线状态：device-pki 会话 online 或最近 5 分钟内有 room-agent 快照。" },
+                        "session_online": { "type": ["string", "null"], "enum": ["online", "offline", null], "description": "device-pki 的 mTLS 会话原始状态，仅用于排障展示。" },
+                        "last_seen_at": { "type": ["string", "null"], "format": "date-time", "description": "最近一次 device-pki 心跳或 room-agent 快照接收时间。" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid" },
+                        "room_code": { "type": ["string", "null"] },
+                        "room_name": { "type": ["string", "null"] },
+                        "area_id": { "type": ["string", "null"], "format": "uuid" },
+                        "area_code": { "type": ["string", "null"] },
+                        "area_name": { "type": ["string", "null"] },
+                        "report": { "oneOf": [{ "$ref": "#/components/schemas/MachineReportSummary" }, { "type": "null" }], "description": "null = 从未上报。" },
+                        "report_stale": { "type": "boolean", "description": "最新快照超过 5 分钟未更新。" }
+                    }
+                },
+                "MachinePage": {
+                    "type": "object",
+                    "required": ["items", "total", "page", "page_size"],
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/MachineSummary" } },
+                        "total": { "type": "integer" },
+                        "page": { "type": "integer" },
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "MachineSnapshotPoint": {
+                    "type": "object",
+                    "required": ["id", "serial", "device_slot", "collected_at", "received_at", "agent_version", "hostname", "health_status"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "serial": { "type": "string" },
+                        "device_slot": { "type": "string" },
+                        "collected_at": { "type": "string", "format": "date-time" },
+                        "received_at": { "type": "string", "format": "date-time" },
+                        "agent_version": { "type": "string" },
+                        "hostname": { "type": "string" },
+                        "os_name": { "type": ["string", "null"] },
+                        "kernel_version": { "type": ["string", "null"] },
+                        "health_status": { "type": "string", "enum": ["ok", "warning", "critical"] },
+                        "health_score": { "type": ["integer", "null"] },
+                        "cpu_usage_percent": { "type": ["number", "null"] },
+                        "memory_usage_percent": { "type": ["number", "null"] },
+                        "disk_usage_percent": { "type": ["number", "null"] },
+                        "uptime_secs": { "type": ["integer", "null"] }
+                    }
+                },
+                "MachineSnapshot": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/MachineSnapshotPoint" },
+                        {
+                            "type": "object",
+                            "required": ["payload"],
+                            "properties": {
+                                "payload": { "type": "object", "description": "room-agent 上报的完整 JSON（sections 原样保存）。" }
+                            }
+                        }
+                    ]
+                },
+                "MachineDetail": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/MachineSummary" },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "latest": { "oneOf": [{ "$ref": "#/components/schemas/MachineSnapshot" }, { "type": "null" }] },
+                                "history": { "type": "array", "items": { "$ref": "#/components/schemas/MachineSnapshotPoint" } }
+                            }
+                        }
+                    ]
                 }
             }
         },
@@ -1561,6 +1733,50 @@ pub async fn json_spec() -> Json<Value> {
                         "400": error_response("token 类型或 ttl_secs 不合法"),
                         "403": error_response("缺少 device:manage"),
                         "404": error_response("房间不存在")
+                    }
+                }
+            },
+            "/admin/rooms/{id}/devices": {
+                "get": {
+                    "tags": ["Devices"],
+                    "summary": "房间机器列表（主设备 + 子机）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "机器列表（主设备在前）", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/RoomMachine" } } } } },
+                        "403": error_response("缺少 device:read"),
+                        "404": error_response("房间不存在")
+                    }
+                }
+            },
+            "/admin/rooms/{id}/devices/token": {
+                "post": {
+                    "tags": ["Devices"],
+                    "summary": "给房间新增一台子机并签发注册 token（槽位自动分配为 {room_code}-m{n}）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MachineTokenRequest" } } } },
+                    "responses": {
+                        "200": { "description": "注册 token 与注册链接", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeviceTokenReply" } } } },
+                        "400": error_response("token 类型 / ttl_secs / label 不合法"),
+                        "403": error_response("缺少 device:manage"),
+                        "404": error_response("房间不存在")
+                    }
+                }
+            },
+            "/admin/rooms/{id}/devices/{slot}": {
+                "delete": {
+                    "tags": ["Devices"],
+                    "summary": "解除房间与子机的绑定（不吊销证书）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "slot", "in": "path", "required": true, "schema": { "type": "string" }, "description": "子机槽位（主设备请走 PUT /admin/rooms/{id}/device）。" }
+                    ],
+                    "responses": {
+                        "204": { "description": "已解除绑定" },
+                        "403": error_response("缺少 device:manage"),
+                        "404": error_response("房间未绑定该子机")
                     }
                 }
             },
@@ -2147,6 +2363,90 @@ pub async fn json_spec() -> Json<Value> {
                         "403": error_response("缺少 device:read")
                     }
                 }
+            },
+            "/machine/report": {
+                "post": {
+                    "tags": ["MachineAgent"],
+                    "summary": "room-agent 上报机器快照（fleet Bearer token）",
+                    "description": "认证头：Authorization: Bearer <MACHINE_AGENT_TOKEN>；服务端未配置 token 时返回 503。按 device_slot 解析已注册设备（issued/active），同一 (serial, collected_at) 幂等。",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MachineReportRequest" } } } },
+                    "responses": {
+                        "202": { "description": "已接收", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MachineReportReply" } } } },
+                        "400": error_response("上报体校验失败"),
+                        "401": error_response("机器上报 token 无效"),
+                        "404": error_response("device_slot 对应的设备不存在"),
+                        "503": error_response("机器上报未启用")
+                    }
+                }
+            },
+            "/admin/machines": {
+                "get": {
+                    "tags": ["Machines"],
+                    "summary": "机器分页（设备 + 房间/区域 + 最新快照摘要）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "area_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "room_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "keyword", "in": "query", "schema": { "type": "string" }, "description": "serial / 槽位 / 房间 code/name / hostname 模糊匹配" },
+                        { "name": "health", "in": "query", "schema": { "type": "string", "enum": ["ok", "warning", "critical", "missing", "unknown"] }, "description": "missing = 从未上报" },
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "机器分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MachinePage" } } } },
+                        "400": error_response("参数不合法"),
+                        "403": error_response("缺少 device:read")
+                    }
+                }
+            },
+            "/admin/machines/stream": {
+                "get": {
+                    "tags": ["Machines"],
+                    "summary": "机器快照 SSE 实时流（新快照 2s 内推送）",
+                    "description": "首次连接从当前最新快照 id 开始（不补历史）；断线重连时带最后收到的 id 作为 after_id，可补发最多 200 条。帧事件：`ready`（建连即发，data 为空）、`machine.snapshot`（data 为 MachineSnapshotPoint）、每 15s `heartbeat`。浏览器 EventSource 不能带 Authorization，请用 fetch + ReadableStream。",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "after_id", "in": "query", "schema": { "type": "integer", "format": "int64", "minimum": 0 }, "description": "从该快照 id 之后补发；缺省 = 只推送连接之后的新快照。" },
+                        { "name": "serial", "in": "query", "schema": { "type": "string" }, "description": "只订阅某台机器；缺省为全部机器。" }
+                    ],
+                    "responses": {
+                        "200": { "description": "SSE 流", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
+                        "400": error_response("after_id 不合法"),
+                        "403": error_response("缺少 device:read")
+                    }
+                }
+            },
+            "/admin/machines/{serial}": {
+                "get": {
+                    "tags": ["Machines"],
+                    "summary": "机器详情（设备 + 最新完整快照 + 历史）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "serial", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "history_limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "机器详情", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MachineDetail" } } } },
+                        "403": error_response("缺少 device:read"),
+                        "404": error_response("机器不存在")
+                    }
+                }
+            },
+            "/admin/machines/{serial}/snapshots": {
+                "get": {
+                    "tags": ["Machines"],
+                    "summary": "机器快照历史（元数据，collected_at 倒序）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "serial", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "快照历史", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/MachineSnapshotPoint" } } } } },
+                        "403": error_response("缺少 device:read"),
+                        "404": error_response("机器不存在")
+                    }
+                }
             }
         }
     }))
@@ -2177,6 +2477,9 @@ mod tests {
         assert!(paths.contains_key("/admin/devices/{serial}"));
         assert!(paths.contains_key("/admin/rooms/{id}/device"));
         assert!(paths.contains_key("/admin/rooms/{id}/device-token"));
+        assert!(paths.contains_key("/admin/rooms/{id}/devices"));
+        assert!(paths.contains_key("/admin/rooms/{id}/devices/token"));
+        assert!(paths.contains_key("/admin/rooms/{id}/devices/{slot}"));
         assert!(paths.contains_key("/admin/storage/objects/presign"));
         assert!(paths.contains_key("/admin/storage/objects"));
         assert!(paths.contains_key("/admin/storage/objects/{sha256}"));
@@ -2190,6 +2493,11 @@ mod tests {
         assert!(paths.contains_key("/admin/collections"));
         assert!(paths.contains_key("/admin/agent-configs"));
         assert!(paths.contains_key("/admin/agent-configs/effective"));
+        assert!(paths.contains_key("/admin/machines"));
+        assert!(paths.contains_key("/admin/machines/{serial}"));
+        assert!(paths.contains_key("/admin/machines/stream"));
+        assert!(paths.contains_key("/admin/machines/{serial}/snapshots"));
+        assert!(paths.contains_key("/machine/report"));
         assert!(paths.contains_key("/admin/device-events"));
         assert!(paths.contains_key("/admin/device-events/stream"));
         assert!(paths.contains_key("/admin/device-presence-deliveries"));

@@ -1,12 +1,14 @@
 //! v3 设备接入区域/房间：设备列表/详情、房间设备摘要、绑定/迁移/解绑、签发注册 token。
 //!
 //! 契约见 `docs/schedule-design.md` 第 11.4 节。设备注册记录本身由 `device_enrollment`
-//! 管理，本模块只读设备状态，并在 `rooms.device_slot` 上完成绑定关系；设备在线状态来自
+//! 管理，本模块只读设备状态，并在 `rooms.device_slot`（主设备）/ `room_devices`（子机）
+//! 上完成绑定关系；设备在线状态来自
 //! `device_session`。`Room` 响应里的 `device` 摘要由 `qe-db` 的 Room 查询自动带出。
 
 use axum::{
     Json,
     extract::{Path, Query, State},
+    http::StatusCode,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -17,7 +19,9 @@ use crate::{
     api::extractors::{ApiJson, AuthUser, ClientIp},
     auth::authorization,
     domain::{
-        device::{BootstrapTokenKind, DeviceFilter, DeviceInfo, DeviceStatus, RoomDevice},
+        device::{
+            BootstrapTokenKind, DeviceFilter, DeviceInfo, DeviceStatus, RoomDevice, RoomMachine,
+        },
         models::Page,
         rbac::permissions,
         schedule::Room,
@@ -65,6 +69,29 @@ pub struct DeviceTokenRequest {
     pub kind: Option<String>,
     #[serde(default)]
     pub ttl_secs: Option<i64>,
+}
+
+/// `POST /rooms/{id}/devices/token` 请求体：给房间新增一台子机并签发注册 token。
+#[derive(Debug, Deserialize)]
+pub struct MachineTokenRequest {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub ttl_secs: Option<i64>,
+    /// 可读标签（如"左侧投影机"），仅用于管理端展示。
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// 子机标签：去空白、空串视为无标签、最长 64 字符。
+fn normalize_machine_label(raw: Option<&str>) -> AppResult<Option<String>> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().count() > 64 {
+        return Err(AppError::bad_request("机器标签不能超过 64 个字符"));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 /// 签发结果：明文 token 只在这一次响应里出现，库中只存 SHA-256。
@@ -255,4 +282,113 @@ pub async fn issue_device_token(
         expires_at: issued.expires_at,
         link,
     }))
+}
+
+/// `GET /rooms/{id}/devices`：房间机器列表（主设备 + 子机）。
+///
+/// 主设备来自 `rooms.device_slot`；子机来自 `room_devices`。未注册的槽位
+/// `serial` / `status` 为 `null`，管理端据此显示"等待注册"。
+pub async fn list_room_machines(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    Path(room_id): Path<Uuid>,
+) -> AppResult<Json<Vec<RoomMachine>>> {
+    authorization::require_permission(&state, id, permissions::DEVICE_READ).await?;
+
+    let machines = state
+        .devices
+        .list_room_machines(room_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("房间不存在"))?;
+    Ok(Json(machines))
+}
+
+/// `POST /rooms/{id}/devices/token`：给房间新增一台子机并签发一次性注册 token。
+///
+/// 槽位由仓储层分配为 `{room_code}-m{n}`（冲突自动递增），并预登记到
+/// `room_devices`；设备注册成功后机器总览按该槽位自动关联到房间。
+pub async fn issue_machine_token(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    ClientIp(ip): ClientIp,
+    Path(room_id): Path<Uuid>,
+    ApiJson(request): ApiJson<MachineTokenRequest>,
+) -> AppResult<Json<DeviceTokenReply>> {
+    authorization::require_permission(&state, id, permissions::DEVICE_MANAGE).await?;
+
+    let kind = parse_token_kind(request.kind.as_deref())?;
+    let ttl_secs = validation::validate_token_ttl_secs(
+        request.ttl_secs.unwrap_or(DEFAULT_DEVICE_TOKEN_TTL_SECS),
+    )?;
+    let label = normalize_machine_label(request.label.as_deref())?;
+
+    let (device_slot, issued) = state
+        .devices
+        .issue_machine_token(room_id, kind, &id.to_string(), ttl_secs, label.as_deref())
+        .await?
+        .ok_or_else(|| AppError::not_found("房间不存在"))?;
+
+    let link = format!(
+        "{}/enroll?token={}&slot={}",
+        state.config.public_enroll_endpoint, issued.token, device_slot
+    );
+
+    super::audit::record_or_log(
+        &state,
+        id,
+        "room.issue_machine_token",
+        "room",
+        Some(room_id.to_string()),
+        json!({
+            "device_slot": device_slot,
+            "label": label,
+            "kind": kind.as_str(),
+            "expires_at": issued.expires_at,
+        }),
+        ip.as_deref(),
+    )
+    .await;
+
+    Ok(Json(DeviceTokenReply {
+        token: issued.token,
+        kind,
+        device_slot,
+        expires_at: issued.expires_at,
+        link,
+    }))
+}
+
+/// `DELETE /rooms/{id}/devices/{slot}`：解除房间与子机的绑定。
+///
+/// 只删除 `room_devices` 关系，不吊销已签发证书；主设备（`rooms.device_slot`）
+/// 请走 `PUT /rooms/{id}/device`。
+pub async fn remove_room_machine(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    ClientIp(ip): ClientIp,
+    Path((room_id, device_slot)): Path<(Uuid, String)>,
+) -> AppResult<StatusCode> {
+    authorization::require_permission(&state, id, permissions::DEVICE_MANAGE).await?;
+
+    let device_slot = validation::normalize_device_slot(&device_slot)?;
+    if !state
+        .devices
+        .remove_room_machine(room_id, &device_slot)
+        .await?
+    {
+        return Err(AppError::not_found("房间未绑定该子机"));
+    }
+
+    super::audit::record_or_log(
+        &state,
+        id,
+        "room.remove_machine",
+        "room",
+        Some(room_id.to_string()),
+        json!({ "device_slot": device_slot }),
+        ip.as_deref(),
+    )
+    .await;
+
+    Ok(StatusCode::NO_CONTENT)
 }

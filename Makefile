@@ -1,4 +1,4 @@
-.PHONY: help init fmt fmt-check clippy test check build run dev-up dev-down mail-up integration up down logs ps migrate secret obs-up obs-down obs-logs
+.PHONY: help init fmt fmt-check clippy test check build run dev-up dev-down mail-up integration up down logs ps migrate secret obs-up obs-down obs-logs web-dev web-build web-check web-docker room-agent-build agent-build
 
 init: ## 从模板初始化（make init SLUG=acme NAME="Acme"）
 	@test -n "$(SLUG)" || (echo "用法: make init SLUG=acme NAME='Acme' [REPO=https://github.com/acme/backend]"; exit 1)
@@ -66,3 +66,22 @@ obs-down: ## 只停止可观测性组件
 
 obs-logs: ## 跟踪可观测性组件日志
 	docker compose -f compose.yaml -f compose.observability.yaml --profile observability logs -f loki alloy grafana
+
+web-dev: ## 启动管理控制台开发服务器（需先 make run；默认 127.0.0.1:5174）
+	cd frontend && ./node_modules/.bin/vite --host 127.0.0.1 --port 5174
+
+web-build: ## 构建管理控制台静态资源到 frontend/dist
+	cd frontend && ./node_modules/.bin/vite build
+
+web-check: ## 管理控制台类型检查 + 单元测试
+	cd frontend && ./node_modules/.bin/vue-tsc --noEmit -p tsconfig.app.json
+	cd frontend && ./node_modules/.bin/vitest run
+
+room-agent-build: ## 构建 room-agent（房间机器遥测 agent）
+	cargo build -p qe-room-agent
+
+agent-build: ## 构建统一 agent 客户端（qe-agent：enroll / node / machine）
+	cargo build -p qe-agent
+
+web-docker: ## 构建并启动控制台容器（http://localhost:8081，需先 make up）
+	docker compose --profile console up -d --build console

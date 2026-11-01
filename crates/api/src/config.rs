@@ -82,6 +82,11 @@ pub struct Config {
     /// 重试退避基数（秒）。
     pub device_presence_retry_base_seconds: u64,
     // ---- 对象存储（S3 兼容）----
+    // ---- 机器遥测（room-agent）----
+    /// 机器上报 Bearer token；`None` = 上报端点关闭（返回 503）。
+    pub machine_agent_token: Option<String>,
+    /// 每台机器保留的快照条数。
+    pub machine_snapshot_keep: i64,
     /// 未配置 `S3_ENDPOINT` + `S3_BUCKET` 时为 None，存储/镜像接口返回 503。
     pub storage: Option<StorageConfig>,
 }
@@ -226,6 +231,18 @@ impl Config {
             bail!("SCHEDULE_DELIVERY_BATCH 需在 1-500 之间");
         }
 
+        let machine_agent_token =
+            env_optional("MACHINE_AGENT_TOKEN").filter(|token| !token.is_empty());
+        if let Some(token) = machine_agent_token.as_deref()
+            && token.len() < 16
+        {
+            bail!("MACHINE_AGENT_TOKEN 至少需要 16 个字符");
+        }
+        let machine_snapshot_keep = env_parse("MACHINE_SNAPSHOT_KEEP", 100_i64)?;
+        if !(10..=1000).contains(&machine_snapshot_keep) {
+            bail!("MACHINE_SNAPSHOT_KEEP 需在 10-1000 之间");
+        }
+
         let storage = parse_storage_config()?;
 
         reject_insecure_production_defaults(
@@ -288,6 +305,8 @@ impl Config {
             device_presence_webhook_max_attempts,
             device_presence_webhook_batch,
             device_presence_retry_base_seconds,
+            machine_agent_token,
+            machine_snapshot_keep,
             public_enroll_endpoint: env_optional("PUBLIC_ENROLL_ENDPOINT")
                 .unwrap_or_else(|| "https://localhost:4440".to_owned())
                 .trim_end_matches('/')

@@ -445,7 +445,9 @@ async fn load_rows(pool: &PgPool) -> Result<Vec<PresenceRow>, sqlx::Error> {
                 r.id, r.code, r.name, r.webhook_url,
                 a.id, a.code, a.name, a.webhook_url
            FROM device_session ds
-           JOIN rooms r ON r.device_slot = ds.device_slot
+           LEFT JOIN rooms rp ON rp.device_slot = ds.device_slot
+           LEFT JOIN room_devices rd ON rd.device_slot = ds.device_slot
+           JOIN rooms r ON r.id = COALESCE(rp.id, rd.room_id)
            JOIN areas a ON a.id = r.area_id
           WHERE r.is_active = true",
     )
