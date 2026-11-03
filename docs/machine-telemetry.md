@@ -20,8 +20,9 @@
 
 ```text
 room-agent（每个房间机器）
-   ├─ fast 档（默认 10s）：内置 /proc、/sys、df、hwmon —— 不启动外部工具
-   ├─ full 档（默认 300s）：内置采集 + platform-health / platform-diagnose / qeaudit / docker / virsh
+   ├─ fast 档（默认 10s）：内置 /proc、/sys、df、hwmon —— 不做能力采集
+   ├─ full 档（默认 300s）：内置采集 + 安全 / 容器 / 虚机（进程内库直调）+ platform-health / platform-diagnose
+   ├─ 安全扫描独立规则（默认 300s，0 = 跟随 full 档）：刷新即经 mTLS 实时回传 full 快照
    ├─ 启动/运行期：mTLS GET {DEVICE_PKI_MTLS_URL}/agent/config 拉两档间隔
    └─ mTLS POST {DEVICE_PKI_MTLS_URL}/machine/report        ──► qe-device-pki ──► PostgreSQL
                                                                             │
@@ -133,11 +134,14 @@ room-agent（每个房间机器）
 
 | 档位 | 默认周期 | 范围 | 内容 |
 |---|---|---|---|
-| `fast` | `10s` | `5..=60` | 只跑内置采集（host/CPU/内存/磁盘/网络/温度）；`sections.agent.tools` 五项均为 `{"available": false, "skipped": true}`，`sections` 不含外部工具分区 |
-| `full` | `300s` | `60..=3600` | 内置采集 + platform-health / platform-diagnose / qeaudit / docker / virsh（各自超时、可选、失败不影响上报） |
+| `fast` | `10s` | `5..=60` | 只跑内置采集（host/CPU/内存/磁盘/网络/温度）；`sections.agent.tools` 五项均为 `{"available": false, "skipped": true}`，`sections` 不含能力采集分区 |
+| `full` | `300s` | `60..=3600` | 内置采集 + 安全 qeaudit / 容器 qe-container / 虚机 virt-libvirt（进程内库直调，CLI 兜底）+ platform-health / platform-diagnose（外部命令，各自超时、可选、失败不影响上报） |
 
 - 服务端按 `tier` 落库（`machine_snapshots.tier`，0016）；列表/详情默认展示最近快照，
   快照历史接口可返回两档混合记录。
+- **安全扫描独立规则**：qeaudit 按 `ROOM_AGENT_SECURITY_INTERVAL_SECS`（默认 300s，
+  0 = 跟随 full 档）独立调度；扫描刷新后**立即**回传一份 full 快照（事件驱动的实时
+  回传），服务端按普通 full 快照落库，无新契约字段。
 - `--once` 只上报**一份 full**；daemon 分别按两个周期发送（两条独立 deadline，
   采集耗时超周期时顺延，不突发补跑）。
 - `--print`（不发请求）在 daemon 下 fast/full 各打印一份契约 JSON。

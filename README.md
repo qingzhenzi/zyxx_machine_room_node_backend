@@ -796,7 +796,7 @@ image:read      image:manage
 
 ### P1（已实现）
 
-- 节点 agent（独立 crate `room_agent/qe-node-agent`）：复用 **device-pki 认证服务端 + 客户端**
+- 节点 agent（独立 crate `room_agent/crates/qe-node-agent`）：复用 **device-pki 认证服务端 + 客户端**
   （`qe-device-pki-client` 的证书/mTLS/上下行），不新增认证体系；大文件仍走 S3 预签名直连。
 - device-pki 新增 mTLS 端点 `POST /resources/presign`（按设备证书身份签发 manifest/分片/签名 URL），
   以及上行 kind `transfer.progress` / `transfer.completed`（回写 `transfers` 与房间发布状态）。
@@ -806,7 +806,7 @@ image:read      image:manage
   - LXC/Incus：`incus image import`，plain LXC 解包 rootfs；
   - VM：`virsh vol-create-as/vol-upload` 到 libvirt storage pool。
 - 详见 [`docs/storage-design.md`](docs/storage-design.md) §15–§16 与
-  [`room_agent/qe-node-agent/README.md`](../../room_agent/qe-node-agent/README.md)。
+  [`room_agent/crates/qe-node-agent/README.md`](../../room_agent/crates/qe-node-agent/README.md)。
 
 P2 待做：zstd/gzip 压缩与解压校验、chunk 复用/增量、S3 Event 兜底、收集上传、配额/保留期/GC、
 `transfers`/`collections` 状态过滤、只读 Registry（Zot facade）、Trivy 扫描、真实 RustFS/Incus/libvirt 环境联调。
@@ -941,7 +941,7 @@ data: {}
 房间内的机器由 `qe-agent run --role machine`（旧二进制 `qe-room-agent` 仍可用）周期采集，
 **默认经 device-pki mTLS** 上报；控制台「机器总览」展示每台机器的实时健康、诊断与历史快照。
 契约见 [`docs/machine-telemetry.md`](docs/machine-telemetry.md)，入口见
-[`room_agent/qe-agent/README.md`](../../room_agent/qe-agent/README.md)。
+[`room_agent/crates/qe-agent/README.md`](../../room_agent/crates/qe-agent/README.md)。
 
 ```text
 qe-agent (machine) ──mTLS POST /machine/report──▶ device-pki ──▶ machine_snapshots (PG)
@@ -954,7 +954,7 @@ qe-agent (machine) ──mTLS POST /machine/report──▶ device-pki ──▶
   `REPORT_MODE=bearer` 只作过渡，保留 `MACHINE_API_BASE` + `MACHINE_AGENT_TOKEN` 旧路径；
   服务端未配置 token 时 Bearer 端点仍返回 503。**退场计划**：v0.2 删除旧
   `qe-node-agent`/`qe-room-agent` 二进制；设备全部迁 mTLS 后删除 Bearer 端点
-  （见 [`room_agent/qe-agent/README.md`](../../room_agent/qe-agent/README.md#退场时间表p4)）。
+  （见 [`room_agent/crates/qe-agent/README.md`](../../room_agent/crates/qe-agent/README.md#退场时间表p4)）。
 - **两档采集**：`fast`（内置指标，默认 10s，5..=60s）/ `full`（含外部工具，默认 300s，
   60..=3600s）。机器上报带 `tier`，落 `machine_snapshots.tier`；`--once` 发一份 full，
   `--print` 只打印 JSON。
@@ -970,7 +970,7 @@ qe-agent (machine) ──mTLS POST /machine/report──▶ device-pki ──▶
 - 外部采集工具缺失时 agent 仍能上报内置指标，缺失/跳过项记录在 `sections.agent.tools`。
 - **桌面客户端（agent-client）**：Tauri GUI 默认隐藏、托盘常驻，通过本机 Unix socket IPC
   读取 daemon 的状态/日志/注册，协议见 [`room_agent/docs/agent-ipc.md`](../../room_agent/docs/agent-ipc.md)；
-  代码在 `room_agent/agent-client`（从 client-app 模板改造）。
+  代码在 `room_agent/apps/agent-client`（从 client-app 模板改造）。
 
 ```bash
 # 构建统一入口（agent 侧 crate 已迁至 room_agent 工作区）
@@ -988,10 +988,10 @@ DEVICE_PKI_MTLS_URL=https://node:4441 DEVICE_SLOT=room-101 DEVICE_DATA_DIR=/var/
 ```
 
 systemd（`qe-agent.service`，`--role both` + IPC）与更多参数见
-[`room_agent/qe-agent/README.md`](../../room_agent/qe-agent/README.md) 与 [`room_agent/qe-agent/deploy/`](../../room_agent/qe-agent/deploy)；
+[`room_agent/crates/qe-agent/README.md`](../../room_agent/crates/qe-agent/README.md) 与 [`room_agent/crates/qe-agent/deploy/`](../../room_agent/crates/qe-agent/deploy)；
 机器端完整部署（daemon + GUI + 子机 + 升级排障）见 [`room_agent/docs/agent-deploy.md`](../../room_agent/docs/agent-deploy.md)；
 旧 room-agent 部署说明见
-[`room_agent/qe-room-agent/README.md`](../../room_agent/qe-room-agent/README.md)。
+[`room_agent/crates/qe-room-agent/README.md`](../../room_agent/crates/qe-room-agent/README.md)。
 
 ## 工单（Ticket / P0 + P1 Wave 1/2/3）
 
