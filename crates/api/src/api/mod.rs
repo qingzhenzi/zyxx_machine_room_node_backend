@@ -11,7 +11,7 @@ use std::{any::Any, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -52,6 +52,7 @@ pub fn router(state: AppState) -> Router {
                     security_headers(request, next, production)
                 }))
                 .layer(CatchPanicLayer::custom(handle_panic))
+                .layer(DefaultBodyLimit::max(max_body_bytes))
                 .layer(RequestBodyLimitLayer::new(max_body_bytes))
                 .layer(CompressionLayer::new())
                 // Cors 需要其内层响应体实现 Default，因此必须放在 Compression 之内。

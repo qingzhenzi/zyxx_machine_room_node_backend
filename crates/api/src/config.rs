@@ -318,6 +318,76 @@ impl Config {
     pub fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.request_timeout_secs)
     }
+
+    /// 读取工单自动建单 worker 的配置。
+    ///
+    /// 这些开关只影响后台 worker，因此独立成 [`TicketWorkerConfig`]（不进入核心
+    /// `Config` 结构体），避免为了新增后台任务改动所有既有 `Config` 构造点。
+    /// 解析/范围校验与其它 worker 配置保持一致：启动时失败即退出。
+    pub fn ticket_worker_config(&self) -> Result<TicketWorkerConfig> {
+        TicketWorkerConfig::from_env()
+    }
+
+    /// 工单邮件通知开关（`TICKET_EMAIL_ENABLED`，默认 true）。
+    /// 供 API handler 做转派通知；worker 侧直接使用 [`TicketWorkerConfig`]。
+    pub fn ticket_email_enabled(&self) -> bool {
+        env_parse_bool("TICKET_EMAIL_ENABLED", true).unwrap_or(true)
+    }
+}
+
+/// 工单自动建单 worker 配置（环境变量见 `.env.example`）。
+#[derive(Clone, Debug)]
+pub struct TicketWorkerConfig {
+    /// `TICKETS_AUTO_ENABLED`，默认 `true`。
+    pub auto_enabled: bool,
+    /// `TICKET_TICK_SECONDS`，默认 60（10..=600）。
+    pub tick_secs: u64,
+    /// `TICKET_DEVICE_OFFLINE_MINUTES`，默认 10（1..=1440）。
+    pub device_offline_minutes: i64,
+    /// `TICKET_HEALTH_CONSECUTIVE`，默认 2（1..=10）。
+    pub health_consecutive: i64,
+    /// `TICKET_LOOKBACK_HOURS`，默认 24（1..=168）。
+    pub lookback_hours: i64,
+    /// `TICKET_EMAIL_ENABLED`，默认 true（无 SMTP 时走 log driver）。
+    pub email_enabled: bool,
+    /// `TICKET_OVERDUE_REMIND_HOURS`，默认 24（1..=168）。
+    pub overdue_remind_hours: i64,
+}
+
+impl TicketWorkerConfig {
+    pub fn from_env() -> Result<Self> {
+        let auto_enabled = env_parse_bool("TICKETS_AUTO_ENABLED", true)?;
+        let tick_secs = env_parse("TICKET_TICK_SECONDS", 60_u64)?;
+        if !(10..=600).contains(&tick_secs) {
+            bail!("TICKET_TICK_SECONDS 需在 10-600 秒之间");
+        }
+        let device_offline_minutes = env_parse("TICKET_DEVICE_OFFLINE_MINUTES", 10_i64)?;
+        if !(1..=1440).contains(&device_offline_minutes) {
+            bail!("TICKET_DEVICE_OFFLINE_MINUTES 需在 1-1440 分钟之间");
+        }
+        let health_consecutive = env_parse("TICKET_HEALTH_CONSECUTIVE", 2_i64)?;
+        if !(1..=10).contains(&health_consecutive) {
+            bail!("TICKET_HEALTH_CONSECUTIVE 需在 1-10 之间");
+        }
+        let lookback_hours = env_parse("TICKET_LOOKBACK_HOURS", 24_i64)?;
+        if !(1..=168).contains(&lookback_hours) {
+            bail!("TICKET_LOOKBACK_HOURS 需在 1-168 小时之间");
+        }
+        let email_enabled = env_parse_bool("TICKET_EMAIL_ENABLED", true)?;
+        let overdue_remind_hours = env_parse("TICKET_OVERDUE_REMIND_HOURS", 24_i64)?;
+        if !(1..=168).contains(&overdue_remind_hours) {
+            bail!("TICKET_OVERDUE_REMIND_HOURS 需在 1-168 小时之间");
+        }
+        Ok(Self {
+            auto_enabled,
+            tick_secs,
+            device_offline_minutes,
+            health_consecutive,
+            lookback_hours,
+            email_enabled,
+            overdue_remind_hours,
+        })
+    }
 }
 
 fn parse_environment() -> Result<Environment> {

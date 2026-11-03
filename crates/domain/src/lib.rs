@@ -11,5 +11,7 @@ pub mod machine;
 pub mod models;
 pub mod rbac;
 pub mod schedule;
+pub mod schedule_plan;
 pub mod storage;
+pub mod ticket;
 pub mod validation;

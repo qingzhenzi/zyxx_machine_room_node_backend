@@ -18,6 +18,7 @@ interface NavItem {
   icon: string
   to: string
   permission?: string
+  permissionAny?: string[]
 }
 
 const navGroups: { label: string; items: NavItem[] }[] = [
@@ -81,6 +82,13 @@ const navGroups: { label: string; items: NavItem[] }[] = [
         permission: PERMISSIONS.scheduleRead,
       },
       {
+        name: 'schedule-plans',
+        label: '排课计划',
+        icon: 'layers',
+        to: '/schedules/plans',
+        permission: PERMISSIONS.scheduleRead,
+      },
+      {
         name: 'events',
         label: '触发事件',
         icon: 'zap',
@@ -112,6 +120,46 @@ const navGroups: { label: string; items: NavItem[] }[] = [
         icon: 'sliders',
         to: '/agent-configs',
         permission: PERMISSIONS.deviceRead,
+      },
+    ],
+  },
+  {
+    label: '运维',
+    items: [
+      {
+        name: 'tickets',
+        label: '工单',
+        icon: 'ticket',
+        to: '/tickets',
+        permission: PERMISSIONS.ticketRead,
+      },
+      {
+        name: 'ticket-insights',
+        label: '工单分析',
+        icon: 'chart',
+        to: '/tickets/insights',
+        permission: PERMISSIONS.ticketRead,
+      },
+      {
+        name: 'ticket-rules',
+        label: '自动规则',
+        icon: 'sliders',
+        to: '/tickets/rules',
+        permissionAny: [PERMISSIONS.ticketRuleManage, PERMISSIONS.ticketManage],
+      },
+      {
+        name: 'ticket-scopes',
+        label: '可见范围',
+        icon: 'shield',
+        to: '/tickets/scopes',
+        permissionAny: [PERMISSIONS.ticketScopeManage, PERMISSIONS.ticketManage],
+      },
+      {
+        name: 'ticket-inspections',
+        label: '巡检计划',
+        icon: 'calendar',
+        to: '/tickets/inspections',
+        permissionAny: [PERMISSIONS.ticketInspectionManage, PERMISSIONS.ticketManage],
       },
     ],
   },
@@ -154,7 +202,11 @@ const visibleGroups = computed(() =>
   navGroups
     .map((group) => ({
       ...group,
-      items: group.items.filter((item) => !item.permission || auth.can(item.permission)),
+      items: group.items.filter(
+        (item) =>
+          (!item.permission || auth.can(item.permission)) &&
+          (!item.permissionAny?.length || item.permissionAny.some((code) => auth.can(code))),
+      ),
     }))
     .filter((group) => group.items.length > 0),
 )

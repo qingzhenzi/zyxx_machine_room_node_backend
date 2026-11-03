@@ -725,6 +725,21 @@ impl AreaRepo {
         ))
     }
 
+    /// 排课工作台用：一次取回全部区域（含停用），按 `name` 排序。
+    ///
+    /// 只给前端筛选下拉用，不做分页；数据量是「区域数量」级，无需 N+1。
+    pub async fn board_areas(&self) -> DbResult<Vec<Area>> {
+        let sql = format!(
+            "SELECT {AREA_COLUMNS}
+             FROM areas a
+             ORDER BY a.name, a.code, a.id"
+        );
+        let rows = sqlx::query_as::<_, AreaRow>(&sql)
+            .fetch_all(&self.db)
+            .await?;
+        Ok(rows.into_iter().map(Area::from).collect())
+    }
+
     pub async fn get(&self, id: Uuid) -> DbResult<Option<Area>> {
         let sql = format!("SELECT {AREA_COLUMNS} FROM areas a WHERE a.id = $1");
         let row = sqlx::query_as::<_, AreaRow>(&sql)
@@ -910,6 +925,27 @@ impl RoomRepo {
         ))
     }
 
+    /// 排课工作台用：一次取回启用中的房间（含设备摘要），按 `area.name, room.code` 排序。
+    ///
+    /// `area_id` 只过滤房间；设备摘要仍由 `ROOM_DEVICE_JOINS` 一次 JOIN 带出，避免按房间
+    /// 逐个查设备（禁止 N+1）。
+    pub async fn board_rooms(&self, area_id: Option<Uuid>) -> DbResult<Vec<Room>> {
+        let sql = format!(
+            "SELECT {ROOM_COLUMNS}
+             FROM rooms r
+             JOIN areas a ON a.id = r.area_id
+             {ROOM_DEVICE_JOINS}
+             WHERE r.is_active
+               AND ($1::uuid IS NULL OR r.area_id = $1)
+             ORDER BY a.name, r.code, r.id"
+        );
+        let rows = sqlx::query_as::<_, RoomRow>(&sql)
+            .bind(area_id)
+            .fetch_all(&self.db)
+            .await?;
+        Ok(rows.into_iter().map(Room::from).collect())
+    }
+
     pub async fn get(&self, id: Uuid) -> DbResult<Option<Room>> {
         let mut connection = self.db.acquire().await?;
         room_on(&mut connection, id).await
@@ -1019,6 +1055,15 @@ impl RoomRepo {
 // 课表
 // ---------------------------------------------------------------------------
 
+/// `ensure_for_rooms` 的结果：本次新建 / 已存在的课表（按请求的 `room_ids` 顺序）。
+#[derive(Debug, Clone, Default)]
+pub struct EnsureSchedulesOutcome {
+    /// 本次新建的课表。
+    pub created: Vec<Schedule>,
+    /// 已存在且与目标日期区间有交集的启用课表（每房间取 `start_date` 最早一份）。
+    pub existing: Vec<Schedule>,
+}
+
 #[derive(Clone)]
 pub struct ScheduleRepo {
     db: PgPool,
@@ -1085,6 +1130,113 @@ impl ScheduleRepo {
         Ok(row.map(Schedule::from))
     }
 
+    /// 排课工作台用：一次取回这些房间下启用中的课表，按房间与开始日期排序。
+    pub async fn board_schedules(&self, room_ids: &[Uuid]) -> DbResult<Vec<Schedule>> {
+        if room_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT {SCHEDULE_COLUMNS}
+             FROM schedules s
+             JOIN rooms r ON r.id = s.room_id
+             JOIN areas a ON a.id = r.area_id
+             WHERE s.room_id = ANY($1)
+               AND s.is_active
+             ORDER BY s.room_id, s.start_date, s.created_at, s.id"
+        );
+        let rows = sqlx::query_as::<_, ScheduleRow>(&sql)
+            .bind(room_ids)
+            .fetch_all(&self.db)
+            .await?;
+        Ok(rows.into_iter().map(Schedule::from).collect())
+    }
+
+    /// 排课工作台用：一次取回这些课表的全部周模板，按 `day_of_week, start_time` 排序。
+    pub async fn board_weekly_slots(&self, schedule_ids: &[Uuid]) -> DbResult<Vec<WeeklySlot>> {
+        if schedule_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT {WEEKLY_SLOT_COLUMNS}
+             FROM schedule_weekly_slots w
+             LEFT JOIN rooms rm ON rm.id = w.room_id
+             WHERE w.schedule_id = ANY($1)
+             ORDER BY w.day_of_week, w.start_time, w.schedule_id, w.id"
+        );
+        let rows = sqlx::query_as::<_, WeeklySlotRow>(&sql)
+            .bind(schedule_ids)
+            .fetch_all(&self.db)
+            .await?;
+        Ok(rows.into_iter().map(WeeklySlot::from).collect())
+    }
+
+    /// 排课工作台用：一次取回这些课表在 `[from, to]` 内的单日覆盖（含 slots，内存分组）。
+    ///
+    /// 两条查询（覆盖 + 全部 slots）按集合批量取，避免按课表逐个查（禁止 N+1）。
+    pub async fn board_exceptions(
+        &self,
+        schedule_ids: &[Uuid],
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> DbResult<Vec<ScheduleException>> {
+        if schedule_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sql = format!(
+            "SELECT {EXCEPTION_COLUMNS}
+             FROM schedule_exceptions
+             WHERE schedule_id = ANY($1)
+               AND exception_date BETWEEN $2 AND $3
+             ORDER BY exception_date, schedule_id, id"
+        );
+        let rows = sqlx::query_as::<_, ExceptionRow>(&sql)
+            .bind(schedule_ids)
+            .bind(from)
+            .bind(to)
+            .fetch_all(&self.db)
+            .await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+        let slot_sql = format!(
+            "SELECT {EXCEPTION_SLOT_COLUMNS}
+             FROM schedule_exception_slots es
+             LEFT JOIN rooms rm ON rm.id = es.room_id
+             WHERE es.exception_id = ANY($1)
+             ORDER BY es.start_time, es.id"
+        );
+        let slot_rows = sqlx::query_as::<_, ExceptionSlotRow>(&slot_sql)
+            .bind(&ids)
+            .fetch_all(&self.db)
+            .await?;
+
+        let mut slots_by_exception: std::collections::HashMap<Uuid, Vec<ScheduleExceptionSlot>> =
+            std::collections::HashMap::new();
+        for row in slot_rows {
+            slots_by_exception
+                .entry(row.exception_id)
+                .or_default()
+                .push(ScheduleExceptionSlot::from(row));
+        }
+
+        Ok(rows
+            .into_iter()
+            .map(|row| ScheduleException {
+                id: row.id,
+                schedule_id: row.schedule_id,
+                exception_date: row.exception_date,
+                kind: exception_kind_from_str(&row.kind),
+                note: row.note,
+                slots: slots_by_exception.remove(&row.id).unwrap_or_default(),
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            })
+            .collect())
+    }
+
     pub async fn create(&self, input: &NewSchedule) -> DbResult<Schedule> {
         let sql = format!(
             "WITH inserted AS (
@@ -1108,6 +1260,114 @@ impl ScheduleRepo {
             .fetch_one(&self.db)
             .await?;
         Ok(Schedule::from(row))
+    }
+
+    /// `POST /admin/schedules/ensure`：幂等地为一批房间补默认课表。
+    ///
+    /// 语义（契约 §2.2）：
+    /// - 房间必须存在且启用，否则返回 [`DbError::NotFound`] / [`DbError::BadRequest`]；
+    /// - 每房间：已有 `is_active` 且与 `[start_date, end_date]` 有交集的课表 → `existing`
+    ///   （取 `start_date` 最早一份）；否则新建一份 → `created`；
+    /// - 全部在同一事务内完成；事务开始先 `FOR UPDATE` 锁目标房间行（按 id 排序），
+    ///   串行化同一批房间的并发 ensure，配合「再次查询是否有交集」保证幂等。
+    pub async fn ensure_for_rooms(
+        &self,
+        room_ids: &[Uuid],
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        name: &str,
+        created_by: Option<Uuid>,
+    ) -> DbResult<EnsureSchedulesOutcome> {
+        let mut tx = self.db.begin().await?;
+
+        // 锁住目标房间行：同一房间的并发 ensure 会在此排队，后到的事务在锁释放后
+        // 重新取快照，从而能看到先到事务新建的课表（幂等）。
+        // 房间不存在 → 404；房间已停用 → 400。
+        let rooms = if room_ids.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_as::<_, (Uuid, bool)>(
+                "SELECT id, is_active FROM rooms WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+            )
+            .bind(room_ids)
+            .fetch_all(&mut *tx)
+            .await?
+        };
+        for room_id in room_ids {
+            match rooms.iter().find(|(id, _)| id == room_id) {
+                None => {
+                    tx.rollback().await?;
+                    return Err(DbError::not_found(format!("房间不存在：{room_id}")));
+                }
+                Some((_, false)) => {
+                    tx.rollback().await?;
+                    return Err(DbError::bad_request(format!("房间已停用：{room_id}")));
+                }
+                Some((_, true)) => {}
+            }
+        }
+
+        // 一次查出所有房间与目标区间有交集的启用课表，每房间只保留 start_date 最早的一份。
+        let mut existing_by_room: std::collections::HashMap<Uuid, Schedule> =
+            std::collections::HashMap::new();
+        if !room_ids.is_empty() {
+            let sql = format!(
+                "SELECT DISTINCT ON (s.room_id) {SCHEDULE_COLUMNS}
+                 FROM schedules s
+                 JOIN rooms r ON r.id = s.room_id
+                 JOIN areas a ON a.id = r.area_id
+                 WHERE s.room_id = ANY($1)
+                   AND s.is_active
+                   AND s.start_date <= $3
+                   AND s.end_date >= $2
+                 ORDER BY s.room_id, s.start_date, s.created_at, s.id"
+            );
+            let rows = sqlx::query_as::<_, ScheduleRow>(&sql)
+                .bind(room_ids)
+                .bind(start_date)
+                .bind(end_date)
+                .fetch_all(&mut *tx)
+                .await?;
+            for row in rows {
+                let schedule = Schedule::from(row);
+                existing_by_room.entry(schedule.room_id).or_insert(schedule);
+            }
+        }
+
+        let mut created = Vec::new();
+        let mut existing = Vec::new();
+        for room_id in room_ids {
+            match existing_by_room.remove(room_id) {
+                Some(schedule) => existing.push(schedule),
+                None => {
+                    // 插入后 JOIN 房间/区域带出继承时区，返回值与 `GET /schedules` 一致。
+                    let sql = format!(
+                        "WITH inserted AS (
+                            INSERT INTO schedules
+                                (room_id, name, start_date, end_date, is_active, created_by)
+                            VALUES ($1, $2, $3, $4, TRUE, $5)
+                            RETURNING *
+                         )
+                         SELECT {SCHEDULE_COLUMNS}
+                         FROM inserted s
+                         JOIN rooms r ON r.id = s.room_id
+                         JOIN areas a ON a.id = r.area_id"
+                    );
+                    let row = sqlx::query_as::<_, ScheduleRow>(&sql)
+                        .bind(*room_id)
+                        .bind(name)
+                        .bind(start_date)
+                        .bind(end_date)
+                        .bind(created_by)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                    created.push(Schedule::from(row));
+                }
+            }
+        }
+
+        tx.commit().await?;
+        Ok(EnsureSchedulesOutcome { created, existing })
     }
 
     pub async fn update(&self, id: Uuid, input: &UpdateSchedule) -> DbResult<Option<Schedule>> {

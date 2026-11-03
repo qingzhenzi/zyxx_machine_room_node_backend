@@ -247,6 +247,9 @@ withDefaults(
     <template v-else-if="name === 'rotate-ccw'">
       <path d="M4 11a8 8 0 1 1 2.3 6.4M4 5v6h6" />
     </template>
+    <template v-else-if="name === 'rotate-cw'">
+      <path d="M20 11a8 8 0 1 0-2.3 6.4M20 5v6h-6" />
+    </template>
     <template v-else-if="name === 'play-circle'">
       <circle cx="12" cy="12" r="8.5" />
       <path d="M10 8.5v7l6-3.5z" />
@@ -254,6 +257,15 @@ withDefaults(
     <template v-else-if="name === 'check-circle'">
       <circle cx="12" cy="12" r="8.5" />
       <path d="m8.5 12 2.5 2.5 4.5-5" />
+    </template>
+    <template v-else-if="name === 'ticket'">
+      <path
+        d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"
+      />
+      <path d="M13 5v2M13 11v2M13 17v2" />
+    </template>
+    <template v-else-if="name === 'chart'">
+      <path d="M4 20V11M10 20V4M16 20v-6M22 20H2" />
     </template>
   </svg>
 </template>

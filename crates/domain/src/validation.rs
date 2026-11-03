@@ -144,26 +144,25 @@ pub fn normalize_permission_codes(codes: &[String]) -> DomainResult<Vec<String>>
     Ok(normalized.into_iter().collect())
 }
 
+/// 权限编码：`<资源>:<动作>`，允许最多 4 段（如 `ticket:rule:manage`、
+/// `ticket:scope:all`）。每段都必须以字母开头，只含字母/数字/下划线/短横线。
 fn normalize_permission_code(raw: &str) -> DomainResult<String> {
     let code = raw.trim().to_ascii_lowercase();
     if code.chars().count() > 64 {
         return Err(DomainError::bad_request("权限编码不能超过 64 个字符"));
     }
-    let Some((resource, action)) = code.split_once(':') else {
-        return Err(DomainError::bad_request("权限编码格式应为 <资源>:<动作>"));
-    };
-    if resource.is_empty() || action.is_empty() || action.contains(':') {
-        return Err(DomainError::bad_request("权限编码格式应为 <资源>:<动作>"));
+    const FORMAT_HINT: &str = "权限编码格式应为 <资源>:<动作> 或 <资源>:<子资源>:<动作>";
+    let parts: Vec<&str> = code.split(':').collect();
+    if !(2..=4).contains(&parts.len()) || parts.iter().any(|part| part.is_empty()) {
+        return Err(DomainError::bad_request(FORMAT_HINT));
     }
-    for part in [resource, action] {
+    for part in parts {
         let mut characters = part.chars();
         let first = characters
             .next()
-            .ok_or_else(|| DomainError::bad_request("权限编码的资源与动作都不能为空"))?;
+            .ok_or_else(|| DomainError::bad_request("权限编码的每一段都不能为空"))?;
         if !first.is_ascii_alphabetic() {
-            return Err(DomainError::bad_request(
-                "权限编码的资源与动作必须以字母开头",
-            ));
+            return Err(DomainError::bad_request("权限编码的每一段必须以字母开头"));
         }
         if !characters
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
@@ -670,6 +669,22 @@ mod tests {
                 .unwrap();
         assert_eq!(permissions, vec!["announcement:read".to_owned()]);
         assert!(normalize_permission_codes(&["announcement".into()]).is_err());
+        // 多段权限码（P1 细粒度）允许 2-4 段；非法段数/空段拒绝。
+        assert_eq!(
+            normalize_permission_codes(&[
+                "ticket:rule:manage".into(),
+                "ticket:scope:all".into(),
+                "ticket:scope:manage".into(),
+            ])
+            .unwrap(),
+            vec![
+                "ticket:rule:manage".to_owned(),
+                "ticket:scope:all".to_owned(),
+                "ticket:scope:manage".to_owned(),
+            ]
+        );
+        assert!(normalize_permission_codes(&["a:b:c:d:e".into()]).is_err());
+        assert!(normalize_permission_codes(&["ticket::manage".into()]).is_err());
     }
 
     #[test]

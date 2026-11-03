@@ -44,8 +44,9 @@ export const useOverviewStore = defineStore('overview', () => {
     loading.value = true
     error.value = null
 
-    const optional = <T>(enabled: boolean, request: Promise<T>) =>
-      enabled ? request : Promise.resolve(null)
+    // 注意：必须懒执行，否则 `request` 参数在调用前就已经发出（低权限账号会刷 403）。
+    const optional = <T>(enabled: boolean, request: () => Promise<T>) =>
+      enabled ? request() : Promise.resolve(null)
 
     try {
       const [
@@ -62,33 +63,36 @@ export const useOverviewStore = defineStore('overview', () => {
         transfers,
         announcements,
       ] = await Promise.all([
-        api.listAreas({ page_size: 1 }),
-        api.listRooms({ page_size: 1 }),
-        api.listDevices({ page_size: 100 }),
-        api.listSchedules({ page_size: 1 }),
-        api.listImages({ page_size: 1 }),
+        optional(auth.can(PERMISSIONS.areaRead), () => api.listAreas({ page_size: 1 })),
+        optional(auth.can(PERMISSIONS.roomRead), () => api.listRooms({ page_size: 1 })),
+        optional(auth.can(PERMISSIONS.deviceRead), () => api.listDevices({ page_size: 100 })),
+        optional(auth.can(PERMISSIONS.scheduleRead), () => api.listSchedules({ page_size: 1 })),
+        optional(auth.can(PERMISSIONS.imageRead), () => api.listImages({ page_size: 1 })),
         auth.can(PERMISSIONS.imageRead)
           ? api.listImages({ status: 'published', page_size: 1 })
           : null,
-        api.listScheduleEvents({ from: startOfToday(), to: startOfTomorrow(), page_size: 1 }),
-        api.listDeviceEvents({ limit: 10 }),
-        api.listScheduleEvents({ page_size: 8 }),
-        optional(auth.can(PERMISSIONS.auditRead), api.listAuditLogs({ page_size: 8 })),
-        optional(auth.can(PERMISSIONS.storageRead), api.listTransfers({ page_size: 8 })),
-        optional(
-          auth.can(PERMISSIONS.announcementRead),
+        optional(auth.can(PERMISSIONS.scheduleRead), () =>
+          api.listScheduleEvents({ from: startOfToday(), to: startOfTomorrow(), page_size: 1 }),
+        ),
+        optional(auth.can(PERMISSIONS.deviceRead), () => api.listDeviceEvents({ limit: 10 })),
+        optional(auth.can(PERMISSIONS.scheduleRead), () =>
+          api.listScheduleEvents({ page_size: 8 }),
+        ),
+        optional(auth.can(PERMISSIONS.auditRead), () => api.listAuditLogs({ page_size: 8 })),
+        optional(auth.can(PERMISSIONS.storageRead), () => api.listTransfers({ page_size: 8 })),
+        optional(auth.can(PERMISSIONS.announcementRead), () =>
           api.listAdminAnnouncements({ page_size: 5 }),
         ),
       ])
 
-      const deviceItems = devices.items ?? []
+      const deviceItems = devices?.items ?? []
       const kpi: KpiSummary = {
-        areas: areas.total ?? 0,
-        rooms: rooms.total ?? 0,
-        devices: devices.total ?? 0,
+        areas: areas?.total ?? 0,
+        rooms: rooms?.total ?? 0,
+        devices: devices?.total ?? 0,
         onlineDevices: deviceItems.filter((device) => device.online === 'online').length,
-        schedules: schedules.total ?? 0,
-        images: images.total ?? 0,
+        schedules: schedules?.total ?? 0,
+        images: images?.total ?? 0,
         publishedImages: publishedImages?.total ?? 0,
         announcements: announcements?.total ?? 0,
       }
@@ -97,9 +101,9 @@ export const useOverviewStore = defineStore('overview', () => {
 
       data.value = {
         kpi,
-        todayEvents: todayEvents.total ?? 0,
-        recentPresence: presence.items,
-        recentEvents: events.items ?? [],
+        todayEvents: todayEvents?.total ?? 0,
+        recentPresence: presence?.items ?? [],
+        recentEvents: events?.items ?? [],
         recentAudit: audit?.items ?? [],
         transfers: (transfers?.items ?? []).filter(
           (transfer) => transfer.status !== 'completed' && transfer.status !== 'expired',

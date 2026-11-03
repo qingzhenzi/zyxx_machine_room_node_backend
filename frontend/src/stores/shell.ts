@@ -3,7 +3,9 @@ import { computed, ref } from 'vue'
 
 import { api } from '@/api'
 import type { PresenceEvent } from '@/api/schema'
+import { useAuthStore } from '@/stores/auth'
 import { errorMessage } from '@/utils/errors'
+import { PERMISSIONS } from '@/utils/permissions'
 
 const SEEN_KEY = 'rn:presence:seen-id'
 
@@ -45,9 +47,14 @@ export const useShellStore = defineStore('shell', () => {
   )
 
   async function loadSummary() {
+    const auth = useAuthStore()
     const [roomPage, devicePage] = await Promise.allSettled([
-      api.listRooms({ page_size: 1 }),
-      api.listDevices({ page_size: 100 }),
+      auth.can(PERMISSIONS.roomRead)
+        ? api.listRooms({ page_size: 1 })
+        : Promise.reject(new Error('skip')),
+      auth.can(PERMISSIONS.deviceRead)
+        ? api.listDevices({ page_size: 100 })
+        : Promise.reject(new Error('skip')),
     ])
 
     if (roomPage.status === 'fulfilled') rooms.value = roomPage.value.total ?? 0
@@ -60,6 +67,8 @@ export const useShellStore = defineStore('shell', () => {
   }
 
   async function refreshPresence() {
+    const auth = useAuthStore()
+    if (!auth.can(PERMISSIONS.deviceRead)) return
     try {
       const data = await api.listDeviceEvents({ limit: 12 })
       presenceEvents.value = data.items

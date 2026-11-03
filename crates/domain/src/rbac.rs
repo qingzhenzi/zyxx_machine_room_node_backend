@@ -28,6 +28,23 @@ pub mod permissions {
     pub const STORAGE_MANAGE: &str = "storage:manage";
     pub const IMAGE_READ: &str = "image:read";
     pub const IMAGE_MANAGE: &str = "image:manage";
+    pub const TICKET_READ: &str = "ticket:read";
+    pub const TICKET_CREATE: &str = "ticket:create";
+    pub const TICKET_HANDLE: &str = "ticket:handle";
+    pub const TICKET_MANAGE: &str = "ticket:manage";
+    // P1 Wave 1：独立细粒度权限（与 handle/manage 做 OR 兼容）。
+    pub const TICKET_CLAIM: &str = "ticket:claim";
+    pub const TICKET_COMMENT: &str = "ticket:comment";
+    pub const TICKET_TRANSITION: &str = "ticket:transition";
+    pub const TICKET_ASSIGN: &str = "ticket:assign";
+    pub const TICKET_UPDATE: &str = "ticket:update";
+    pub const TICKET_RULE_MANAGE: &str = "ticket:rule:manage";
+    pub const TICKET_EXPORT: &str = "ticket:export";
+    // Wave 2：区域数据范围 + 附件。
+    pub const TICKET_SCOPE_MANAGE: &str = "ticket:scope:manage";
+    pub const TICKET_SCOPE_ALL: &str = "ticket:scope:all";
+    pub const TICKET_ATTACHMENT: &str = "ticket:attachment";
+    pub const TICKET_INSPECTION_MANAGE: &str = "ticket:inspection:manage";
 
     pub const ALL: &[&str] = &[
         ANNOUNCEMENT_READ,
@@ -51,6 +68,21 @@ pub mod permissions {
         STORAGE_MANAGE,
         IMAGE_READ,
         IMAGE_MANAGE,
+        TICKET_READ,
+        TICKET_CREATE,
+        TICKET_HANDLE,
+        TICKET_MANAGE,
+        TICKET_CLAIM,
+        TICKET_COMMENT,
+        TICKET_TRANSITION,
+        TICKET_ASSIGN,
+        TICKET_UPDATE,
+        TICKET_RULE_MANAGE,
+        TICKET_EXPORT,
+        TICKET_SCOPE_MANAGE,
+        TICKET_SCOPE_ALL,
+        TICKET_ATTACHMENT,
+        TICKET_INSPECTION_MANAGE,
     ];
 }
 
@@ -92,7 +124,58 @@ mod tests {
         ] {
             assert!(permissions::ALL.contains(&code), "缺少权限：{code}");
         }
-        assert_eq!(permissions::ALL.len(), 21);
+        assert_eq!(permissions::ALL.len(), 36);
+    }
+
+    #[test]
+    fn ticket_permissions_are_registered() {
+        for code in [
+            permissions::TICKET_READ,
+            permissions::TICKET_CREATE,
+            permissions::TICKET_HANDLE,
+            permissions::TICKET_MANAGE,
+        ] {
+            assert!(permissions::ALL.contains(&code), "缺少权限：{code}");
+        }
+        assert_eq!(permissions::TICKET_READ, "ticket:read");
+        assert_eq!(permissions::TICKET_CREATE, "ticket:create");
+        assert_eq!(permissions::TICKET_HANDLE, "ticket:handle");
+        assert_eq!(permissions::TICKET_MANAGE, "ticket:manage");
+        assert_eq!(permissions::ALL.len(), 36);
+    }
+
+    #[test]
+    fn p1_ticket_permissions_are_registered() {
+        for (code, expected) in [
+            (permissions::TICKET_CLAIM, "ticket:claim"),
+            (permissions::TICKET_COMMENT, "ticket:comment"),
+            (permissions::TICKET_TRANSITION, "ticket:transition"),
+            (permissions::TICKET_ASSIGN, "ticket:assign"),
+            (permissions::TICKET_UPDATE, "ticket:update"),
+            (permissions::TICKET_RULE_MANAGE, "ticket:rule:manage"),
+            (permissions::TICKET_EXPORT, "ticket:export"),
+        ] {
+            assert!(permissions::ALL.contains(&code), "缺少权限：{code}");
+            assert_eq!(code, expected);
+        }
+        assert_eq!(permissions::ALL.len(), 36);
+    }
+
+    #[test]
+    fn wave2_ticket_permissions_are_registered() {
+        for (code, expected) in [
+            (permissions::TICKET_SCOPE_MANAGE, "ticket:scope:manage"),
+            (permissions::TICKET_SCOPE_ALL, "ticket:scope:all"),
+            (permissions::TICKET_ATTACHMENT, "ticket:attachment"),
+            (
+                permissions::TICKET_INSPECTION_MANAGE,
+                "ticket:inspection:manage",
+            ),
+        ] {
+            assert!(permissions::ALL.contains(&code), "缺少权限：{code}");
+            assert_eq!(code, expected);
+        }
+        assert_eq!(permissions::ALL.len(), 36);
     }
 
     #[test]

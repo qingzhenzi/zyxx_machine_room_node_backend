@@ -39,6 +39,26 @@ const auth = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 
+const canCreateTicket = computed(() => auth.can(PERMISSIONS.ticketCreate))
+
+/** P1 Wave 2 报修入口：把房间上下文带进工单创建弹窗。 */
+function reportIssue() {
+  const current = room.value
+  if (!current) return
+  void router.push({
+    name: 'tickets',
+    query: {
+      new: '1',
+      room_id: current.id,
+      ...(current.device?.serial ? { serial: current.device.serial } : {}),
+      ...(current.device?.device_slot || current.device_slot
+        ? { device_slot: current.device?.device_slot || current.device_slot || '' }
+        : {}),
+      title: `房间报修：${current.name}`,
+    },
+  })
+}
+
 const room = ref<Room | null>(null)
 const device = ref<RoomDevice | null>(null)
 const areas = ref<Area[]>([])
@@ -340,6 +360,9 @@ onMounted(() => {
           :loading="loading || activityLoading"
           @click="load"
         />
+        <AppButton v-if="canCreateTicket && room" icon="ticket" @click="reportIssue">
+          报修 / 建单
+        </AppButton>
         <AppButton
           v-if="room"
           icon="cpu"

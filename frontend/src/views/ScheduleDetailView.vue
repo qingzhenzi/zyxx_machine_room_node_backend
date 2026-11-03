@@ -236,7 +236,7 @@ onMounted(() => {
       class="inline-flex items-center gap-1 text-[11.5px] text-muted transition-colors hover:text-ink"
     >
       <AppIcon name="arrow-left" :size="12" />
-      返回课表列表
+      返回排课工作台
     </RouterLink>
 
     <PageHeader

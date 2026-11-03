@@ -25,6 +25,21 @@ export const PERMISSIONS = {
   storageManage: 'storage:manage',
   imageRead: 'image:read',
   imageManage: 'image:manage',
+  ticketRead: 'ticket:read',
+  ticketCreate: 'ticket:create',
+  ticketHandle: 'ticket:handle',
+  ticketManage: 'ticket:manage',
+  ticketClaim: 'ticket:claim',
+  ticketComment: 'ticket:comment',
+  ticketTransition: 'ticket:transition',
+  ticketAssign: 'ticket:assign',
+  ticketUpdate: 'ticket:update',
+  ticketRuleManage: 'ticket:rule:manage',
+  ticketExport: 'ticket:export',
+  ticketScopeManage: 'ticket:scope:manage',
+  ticketScopeAll: 'ticket:scope:all',
+  ticketAttachment: 'ticket:attachment',
+  ticketInspectionManage: 'ticket:inspection:manage',
 } as const
 
 export type PermissionCode = (typeof PERMISSIONS)[keyof typeof PERMISSIONS]

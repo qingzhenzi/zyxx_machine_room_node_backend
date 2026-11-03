@@ -148,7 +148,18 @@ onMounted(() => {
 
 <template>
   <div class="mx-auto max-w-[1440px] px-7 py-5">
-    <PageHeader title="课表" description="管理的周模板、单日覆盖与排课实例；课表归属于具体房间。">
+    <RouterLink
+      :to="{ name: 'schedules' }"
+      class="mb-2 inline-flex items-center gap-1 text-[11.5px] text-muted transition-colors hover:text-ink"
+    >
+      <AppIcon name="arrow-left" :size="12" />
+      返回排课工作台
+    </RouterLink>
+
+    <PageHeader
+      title="课表列表"
+      description="按房间管理的周模板、单日覆盖与排课实例；日常排课请使用排课工作台。"
+    >
       <template #actions>
         <IconButton
           icon="refresh"

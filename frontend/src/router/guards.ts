@@ -39,6 +39,11 @@ export function installRouterGuards(router: Router) {
     if (required && !auth.can(required)) {
       return { name: 'forbidden', query: { from: to.fullPath } }
     }
+    // 支持“任一权限即可”的页面（如自动规则：ticket:rule:manage 或 ticket:manage）。
+    const requiredAny = to.meta.permissionAny as string[] | undefined
+    if (requiredAny?.length && !auth.canAny(...requiredAny)) {
+      return { name: 'forbidden', query: { from: to.fullPath } }
+    }
 
     return true
   })

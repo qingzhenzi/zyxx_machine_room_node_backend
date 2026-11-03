@@ -18,6 +18,7 @@ const GROUP_LABELS: Record<string, string> = {
   device: '设备',
   storage: '存储',
   image: '镜像',
+  ticket: '工单',
 }
 
 const GROUP_ORDER = [
@@ -31,6 +32,7 @@ const GROUP_ORDER = [
   'device',
   'storage',
   'image',
+  'ticket',
 ]
 
 export function permissionPrefix(code: string | undefined): string {

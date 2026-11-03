@@ -5,3 +5,6 @@
 !.env.example
 *.log
 /data/
+
+# Playwright CLI 会话缓存
+.playwright-cli/

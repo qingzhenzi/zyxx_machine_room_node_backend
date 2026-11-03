@@ -34,8 +34,9 @@ fn secured() -> Value {
     json!([{ "bearerAuth": [] }])
 }
 
-pub async fn json_spec() -> Json<Value> {
-    Json(json!({
+/// 构建 OpenAPI 文档（纯函数；HTTP 端点与离线导出示例共用）。
+pub fn spec() -> Value {
+    json!({
         "openapi": "3.1.0",
         "info": {
             "title": "QEStudio API",
@@ -50,9 +51,17 @@ pub async fn json_spec() -> Json<Value> {
             { "name": "Areas", "description": "区域：楼栋 / 楼层 / 片区（总管理节点预留 parent_id）" },
             { "name": "Rooms", "description": "房间：调度最小单位，可绑定设备槽位" },
             { "name": "Schedules", "description": "课表：周模板、单日覆盖与排课实例" },
+            { "name": "ScheduleBoard", "description": "排课工作台：区域/房间/课表/周模板/单日覆盖一次聚合，并为房间幂等补默认课表" },
+            { "name": "Terms", "description": "学期：排课计划归属的起止区间与启用状态" },
+            { "name": "Teachers", "description": "排课主数据：教师（轻量编码 + 名称 / 联系方式）" },
+            { "name": "Classes", "description": "排课主数据：班级（轻量编码 + 名称 / 年级）" },
+            { "name": "Courses", "description": "排课主数据：课程（轻量编码 + 名称 / 色值）" },
+            { "name": "SchedulePlans", "description": "排课计划：草稿 / 发布、条目编辑与发布桥接写入 legacy 课表（路径 2 Phase A）" },
             { "name": "ScheduleEvents", "description": "触发规则、事件与投递重放/重试" },
             { "name": "Devices", "description": "设备：注册状态、在线状态与区域/房间绑定（v3）" },
             { "name": "DeviceEvents", "description": "设备在线事件：历史查询、SSE 实时流与可靠投递记录（P3）" },
+            { "name": "TicketInspections", "description": "巡检计划：周期检查 scope 内机器健康，异常自动建工单" },
+            { "name": "Tickets", "description": "工单：人工/自动建单、状态机、时间线、统计与「我的待办」（P0）" },
             { "name": "Machines", "description": "机器总览：room-agent 周期性上报的主机清单、健康结论与诊断历史" },
             { "name": "MachineAgent", "description": "机器遥测上报端点（room-agent 使用 fleet Bearer token）" },
             { "name": "Storage", "description": "对象存储：预签名上传、对象登记、分发/收集任务（P0，S3 兼容）" },
@@ -494,6 +503,125 @@ pub async fn json_spec() -> Json<Value> {
                         "total": { "type": "integer" },
                         "page": { "type": "integer" },
                         "page_size": { "type": "integer" }
+                    }
+                },
+                "BoardDevice": {
+                    "type": "object",
+                    "required": ["serial", "status", "online"],
+                    "properties": {
+                        "serial": { "type": "string", "description": "设备序列号（device_enrollment.serial）。" },
+                        "status": { "type": ["string", "null"], "enum": ["pending", "issued", "active", "rejected", "revoked", null], "description": "设备注册状态。" },
+                        "online": { "type": ["boolean", "null"], "description": "设备在线状态；取不到为 null。" }
+                    }
+                },
+                "BoardArea": {
+                    "type": "object",
+                    "required": ["id", "code", "name", "timezone"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "timezone": { "type": "string", "example": "Asia/Shanghai", "description": "IANA 时区（继承自区域）。" }
+                    }
+                },
+                "BoardRoom": {
+                    "type": "object",
+                    "required": ["id", "area_id", "area_name", "code", "name", "capacity", "device_slot", "is_active", "timezone", "device"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "area_id": { "type": "string", "format": "uuid" },
+                        "area_name": { "type": "string" },
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "capacity": { "type": "integer", "minimum": 0 },
+                        "device_slot": { "type": ["string", "null"] },
+                        "is_active": { "type": "boolean", "description": "工作台只返回启用中的房间，恒为 true。" },
+                        "timezone": { "type": "string", "example": "Asia/Shanghai" },
+                        "device": { "oneOf": [{ "$ref": "#/components/schemas/BoardDevice" }, { "type": "null" }], "description": "null = 房间未绑定槽位或无 enrollment。" }
+                    }
+                },
+                "BoardSchedule": {
+                    "type": "object",
+                    "required": ["id", "room_id", "name", "start_date", "end_date", "is_active", "timezone"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "room_id": { "type": "string", "format": "uuid" },
+                        "name": { "type": "string" },
+                        "start_date": { "type": "string", "format": "date" },
+                        "end_date": { "type": "string", "format": "date" },
+                        "is_active": { "type": "boolean", "description": "工作台只返回启用中的课表，恒为 true。" },
+                        "timezone": { "type": "string", "example": "Asia/Shanghai" }
+                    }
+                },
+                "BoardWeeklySlot": {
+                    "type": "object",
+                    "required": ["id", "schedule_id", "day_of_week", "start_time", "end_time", "course_name", "teacher", "room_id", "note"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "schedule_id": { "type": "string", "format": "uuid" },
+                        "day_of_week": { "type": "integer", "minimum": 1, "maximum": 7, "description": "ISO 星期：周一=1 .. 周日=7。" },
+                        "start_time": { "type": "string", "example": "08:00" },
+                        "end_time": { "type": "string", "example": "09:40" },
+                        "course_name": { "type": "string" },
+                        "teacher": { "type": "string" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid", "description": "调课到其他房间；null = 课表所属房间。" },
+                        "note": { "type": "string" }
+                    }
+                },
+                "BoardExceptionSlot": {
+                    "type": "object",
+                    "required": ["id", "start_time", "end_time", "course_name", "teacher", "room_id", "note"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "start_time": { "type": "string", "example": "08:00" },
+                        "end_time": { "type": "string", "example": "09:40" },
+                        "course_name": { "type": "string" },
+                        "teacher": { "type": "string" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid" },
+                        "note": { "type": "string" }
+                    }
+                },
+                "BoardException": {
+                    "type": "object",
+                    "required": ["id", "schedule_id", "exception_date", "kind", "note", "slots"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "schedule_id": { "type": "string", "format": "uuid" },
+                        "exception_date": { "type": "string", "format": "date" },
+                        "kind": { "type": "string", "enum": ["cancel", "replace"] },
+                        "note": { "type": "string" },
+                        "slots": { "type": "array", "items": { "$ref": "#/components/schemas/BoardExceptionSlot" }, "description": "按 start_time 排序。" }
+                    }
+                },
+                "ScheduleBoard": {
+                    "type": "object",
+                    "required": ["from", "to", "areas", "rooms", "schedules", "weekly_slots", "exceptions"],
+                    "properties": {
+                        "from": { "type": "string", "format": "date" },
+                        "to": { "type": "string", "format": "date" },
+                        "areas": { "type": "array", "items": { "$ref": "#/components/schemas/BoardArea" }, "description": "全部区域（含停用），按 name 排序。" },
+                        "rooms": { "type": "array", "items": { "$ref": "#/components/schemas/BoardRoom" }, "description": "启用中的房间，按 area.name + room.code 排序。" },
+                        "schedules": { "type": "array", "items": { "$ref": "#/components/schemas/BoardSchedule" }, "description": "属于上述房间的启用课表（不裁剪日期）。" },
+                        "weekly_slots": { "type": "array", "items": { "$ref": "#/components/schemas/BoardWeeklySlot" }, "description": "上述课表的全部周模板，按 day_of_week + start_time 排序。" },
+                        "exceptions": { "type": "array", "items": { "$ref": "#/components/schemas/BoardException" }, "description": "上述课表在 [from, to] 内的单日覆盖。" }
+                    }
+                },
+                "EnsureSchedulesRequest": {
+                    "type": "object",
+                    "required": ["room_ids", "start_date", "end_date"],
+                    "properties": {
+                        "room_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "minItems": 1, "maxItems": 100, "description": "去重后 1..=100 个房间；房间必须存在且启用。" },
+                        "start_date": { "type": "string", "format": "date" },
+                        "end_date": { "type": "string", "format": "date", "description": "必须 >= start_date。" },
+                        "name": { "type": "string", "maxLength": 200, "default": "默认课表" }
+                    }
+                },
+                "EnsureSchedulesResponse": {
+                    "type": "object",
+                    "required": ["created", "existing"],
+                    "properties": {
+                        "created": { "type": "array", "items": { "$ref": "#/components/schemas/Schedule" }, "description": "本次新建的课表（沿用 Schedule 结构）。" },
+                        "existing": { "type": "array", "items": { "$ref": "#/components/schemas/Schedule" }, "description": "已存在且与目标日期区间有交集的启用课表（每房间取 start_date 最早一份）。" }
                     }
                 },
                 "CreateScheduleRequest": {
@@ -1276,7 +1404,811 @@ pub async fn json_spec() -> Json<Value> {
                             }
                         }
                     ]
+                },
+                "TicketStatus": {
+                    "type": "string",
+                    "enum": ["open", "in_progress", "resolved", "closed", "cancelled"]
+                },
+                "TicketPriority": {
+                    "type": "string",
+                    "enum": ["urgent", "high", "normal", "low"]
+                },
+                "TicketCategory": {
+                    "type": "string",
+                    "enum": ["machine_health", "device_offline", "delivery_failed", "distribution_failed", "security", "other"]
+                },
+                "TicketSource": {
+                    "type": "string",
+                    "enum": ["auto", "manual"]
+                },
+                "TicketEventKind": {
+                    "type": "string",
+                    "enum": ["created", "claimed", "assigned", "status_changed", "priority_changed", "commented", "occurred", "updated", "reminded"]
+                },
+                "Ticket": {
+                    "type": "object",
+                    "required": ["id", "code", "title", "description", "status", "priority", "category", "source",
+                                 "source_type", "source_id", "dedupe_key", "area_id", "room_id", "serial",
+                                 "device_slot", "reporter_id", "reporter_name", "assignee_id", "assignee_name",
+                                 "due_at", "acknowledged_at", "resolved_at", "closed_at", "resolution",
+                                 "root_cause", "occurrence_count", "last_seen_at", "metadata",
+                                 "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "code": { "type": "string", "description": "人类可读单号 `T-YYYYMMDD-####`（只用于展示/搜索，路由用 id）。" },
+                        "title": { "type": "string" },
+                        "description": { "type": "string" },
+                        "status": { "$ref": "#/components/schemas/TicketStatus" },
+                        "priority": { "$ref": "#/components/schemas/TicketPriority" },
+                        "category": { "$ref": "#/components/schemas/TicketCategory" },
+                        "source": { "$ref": "#/components/schemas/TicketSource" },
+                        "source_type": { "type": ["string", "null"], "description": "精确信号来源类型，如 machine_snapshot / device_presence / schedule_delivery。" },
+                        "source_id": { "type": ["string", "null"], "description": "源行 id（快照 id / 投递 id 等），用于详情回看原始证据。" },
+                        "dedupe_key": { "type": ["string", "null"], "description": "自动单幂等键；手工单为 null。" },
+                        "area_id": { "type": ["string", "null"], "format": "uuid" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid" },
+                        "serial": { "type": ["string", "null"] },
+                        "device_slot": { "type": ["string", "null"] },
+                        "reporter_id": { "type": ["string", "null"], "format": "uuid" },
+                        "reporter_name": { "type": ["string", "null"] },
+                        "assignee_id": { "type": ["string", "null"], "format": "uuid" },
+                        "assignee_name": { "type": ["string", "null"] },
+                        "due_at": { "type": ["string", "null"], "format": "date-time", "description": "按优先级计算的时效截止（urgent 1h / high 4h / normal 24h / low 72h）。" },
+                        "acknowledged_at": { "type": ["string", "null"], "format": "date-time" },
+                        "resolved_at": { "type": ["string", "null"], "format": "date-time" },
+                        "closed_at": { "type": ["string", "null"], "format": "date-time" },
+                        "resolution": { "type": ["string", "null"] },
+                        "root_cause": { "oneOf": [{ "type": "string", "enum": ["hardware", "network", "software", "config", "usage", "other"] }, { "type": "null" }], "description": "根因分类（resolve/close 时写入；NULL = 未填写）。" },
+                        "occurrence_count": { "type": "integer", "format": "int64" },
+                        "last_seen_at": { "type": "string", "format": "date-time" },
+                        "metadata": { "type": "object", "description": "建单时的信号快照（健康问题列表、投递错误等），源表被裁剪后仍可回看。" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "TicketPage": {
+                    "type": "object",
+                    "required": ["items", "total", "page", "page_size"],
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/Ticket" } },
+                        "total": { "type": "integer", "format": "int64" },
+                        "page": { "type": "integer", "format": "int64" },
+                        "page_size": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "TicketEvent": {
+                    "type": "object",
+                    "required": ["id", "ticket_id", "kind", "actor_id", "actor_name", "from_status", "to_status",
+                                 "note", "payload", "source_type", "source_id", "created_at"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "ticket_id": { "type": "string", "format": "uuid" },
+                        "kind": { "$ref": "#/components/schemas/TicketEventKind" },
+                        "actor_id": { "type": ["string", "null"], "format": "uuid" },
+                        "actor_name": { "type": "string", "description": "操作人显示名；系统事件固定为「系统」。" },
+                        "from_status": { "oneOf": [{ "$ref": "#/components/schemas/TicketStatus" }, { "type": "null" }] },
+                        "to_status": { "oneOf": [{ "$ref": "#/components/schemas/TicketStatus" }, { "type": "null" }] },
+                        "note": { "type": "string" },
+                        "payload": { "type": "object" },
+                        "source_type": { "type": ["string", "null"] },
+                        "source_id": { "type": ["string", "null"] },
+                        "created_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "TicketContext": {
+                    "type": "object",
+                    "description": "详情页关联上下文（全部可空）。health_status/health_score/collected_at 取该 serial 最新 machine_snapshots；online = device-pki 会话在线或最近 5 分钟内有快照，无法判断为 null。",
+                    "required": ["room_id", "room_name", "room_code", "area_id", "area_name", "serial",
+                                 "device_slot", "health_status", "health_score", "collected_at", "online"],
+                    "properties": {
+                        "room_id": { "type": ["string", "null"], "format": "uuid" },
+                        "room_name": { "type": ["string", "null"] },
+                        "room_code": { "type": ["string", "null"] },
+                        "area_id": { "type": ["string", "null"], "format": "uuid" },
+                        "area_name": { "type": ["string", "null"] },
+                        "serial": { "type": ["string", "null"] },
+                        "device_slot": { "type": ["string", "null"] },
+                        "health_status": { "type": ["string", "null"], "enum": ["ok", "warning", "critical", null] },
+                        "health_score": { "type": ["integer", "null"] },
+                        "collected_at": { "type": ["string", "null"], "format": "date-time" },
+                        "online": { "type": ["boolean", "null"] }
+                    }
+                },
+                "TicketDetail": {
+                    "type": "object",
+                    "required": ["ticket", "events", "context"],
+                    "properties": {
+                        "ticket": { "$ref": "#/components/schemas/Ticket" },
+                        "events": { "type": "array", "items": { "$ref": "#/components/schemas/TicketEvent" } },
+                        "context": { "$ref": "#/components/schemas/TicketContext" }
+                    }
+                },
+                "TicketSummary": {
+                    "type": "object",
+                    "required": ["by_status", "unassigned", "overdue", "mine_active"],
+                    "properties": {
+                        "by_status": {
+                            "type": "object",
+                            "description": "五种状态的全量计数（缺失状态补 0）。",
+                            "additionalProperties": { "type": "integer", "format": "int64" }
+                        },
+                        "unassigned": { "type": "integer", "format": "int64" },
+                        "overdue": { "type": "integer", "format": "int64" },
+                        "mine_active": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "TicketAssignee": {
+                    "type": "object",
+                    "required": ["id", "display_name", "roles"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "display_name": { "type": "string" },
+                        "roles": { "type": "array", "items": { "type": "string" } }
+                    }
+                },
+                "TicketRule": {
+                    "type": "object",
+                    "required": ["id", "name", "signal_type", "enabled", "priority", "scope_type",
+                                 "scope_id", "thresholds", "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "name": { "type": "string" },
+                        "signal_type": {
+                            "type": "string",
+                            "enum": ["machine_health", "device_offline", "schedule_delivery",
+                                     "presence_delivery", "transfer", "image_verify"]
+                        },
+                        "enabled": { "type": "boolean" },
+                        "priority": { "$ref": "#/components/schemas/TicketPriority" },
+                        "scope_type": { "type": "string", "enum": ["global", "area", "room"] },
+                        "scope_id": { "type": ["string", "null"], "format": "uuid" },
+                        "thresholds": { "type": "object", "additionalProperties": { "type": "integer", "format": "int64" } },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "TicketRuleList": {
+                    "type": "object",
+                    "required": ["items", "total"],
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/TicketRule" } },
+                        "total": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "CreateTicketRuleRequest": {
+                    "type": "object",
+                    "required": ["name", "signal_type"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "signal_type": {
+                            "type": "string",
+                            "enum": ["machine_health", "device_offline", "schedule_delivery",
+                                     "presence_delivery", "transfer", "image_verify"]
+                        },
+                        "enabled": { "type": "boolean", "default": true },
+                        "priority": { "$ref": "#/components/schemas/TicketPriority" },
+                        "scope_type": { "type": "string", "enum": ["global", "area", "room"], "default": "global" },
+                        "scope_id": { "type": ["string", "null"], "format": "uuid" },
+                        "thresholds": { "type": "object", "additionalProperties": { "type": "integer", "format": "int64" } }
+                    }
+                },
+                "UpdateTicketRuleRequest": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "enabled": { "type": "boolean" },
+                        "priority": { "$ref": "#/components/schemas/TicketPriority" },
+                        "scope_type": { "type": "string", "enum": ["global", "area", "room"] },
+                        "scope_id": { "type": ["string", "null"], "format": "uuid", "description": "显式 null 仅在 scope_type=global 时合法。" },
+                        "thresholds": { "type": "object", "additionalProperties": { "type": "integer", "format": "int64" } }
+                    }
+                },
+                "TicketStreamEvent": {
+                    "type": "object",
+                    "required": ["id", "ticket_id", "ticket_code", "kind", "status",
+                                 "actor_id", "actor_name", "note", "payload", "created_at"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "ticket_id": { "type": "string", "format": "uuid" },
+                        "ticket_code": { "type": "string" },
+                        "kind": { "$ref": "#/components/schemas/TicketEventKind" },
+                        "status": { "$ref": "#/components/schemas/TicketStatus" },
+                        "actor_id": { "type": ["string", "null"], "format": "uuid" },
+                        "actor_name": { "type": "string" },
+                        "note": { "type": "string" },
+                        "payload": { "type": "object" },
+                        "created_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "TicketStatsTotals": {
+                    "type": "object",
+                    "required": ["created", "resolved", "closed", "open_now", "overdue", "avg_resolve_secs", "median_resolve_secs"],
+                    "properties": {
+                        "created": { "type": "integer", "format": "int64" },
+                        "resolved": { "type": "integer", "format": "int64" },
+                        "closed": { "type": "integer", "format": "int64" },
+                        "open_now": { "type": "integer", "format": "int64" },
+                        "overdue": { "type": "integer", "format": "int64" },
+                        "avg_resolve_secs": { "type": ["integer", "null"], "format": "int64" },
+                        "median_resolve_secs": { "type": ["integer", "null"], "format": "int64" }
+                    }
+                },
+                "TicketDayStat": {
+                    "type": "object",
+                    "required": ["date", "created", "resolved", "closed"],
+                    "properties": {
+                        "date": { "type": "string", "description": "按关联区域时区聚合的本地日期 YYYY-MM-DD。" },
+                        "created": { "type": "integer", "format": "int64" },
+                        "resolved": { "type": "integer", "format": "int64" },
+                        "closed": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "TicketCategoryStat": {
+                    "type": "object",
+                    "required": ["category", "count"],
+                    "properties": {
+                        "category": { "$ref": "#/components/schemas/TicketCategory" },
+                        "count": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "TicketPriorityStat": {
+                    "type": "object",
+                    "required": ["priority", "count"],
+                    "properties": {
+                        "priority": { "$ref": "#/components/schemas/TicketPriority" },
+                        "count": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "TicketTopRoom": {
+                    "type": "object",
+                    "required": ["room_id", "room_name", "count"],
+                    "properties": {
+                        "room_id": { "type": "string", "format": "uuid" },
+                        "room_name": { "type": "string" },
+                        "count": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "TicketTopDevice": {
+                    "type": "object",
+                    "required": ["serial", "device_slot", "count"],
+                    "properties": {
+                        "serial": { "type": "string" },
+                        "device_slot": { "type": ["string", "null"] },
+                        "count": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "TicketAssigneeStat": {
+                    "type": "object",
+                    "required": ["assignee_id", "display_name", "active", "resolved", "avg_resolve_secs"],
+                    "properties": {
+                        "assignee_id": { "type": "string", "format": "uuid" },
+                        "display_name": { "type": "string" },
+                        "active": { "type": "integer", "format": "int64" },
+                        "resolved": { "type": "integer", "format": "int64" },
+                        "avg_resolve_secs": { "type": ["integer", "null"], "format": "int64" }
+                    }
+                },
+                "TicketStats": {
+                    "type": "object",
+                    "required": ["from", "to", "totals", "by_day", "by_category", "by_priority",
+                                 "top_rooms", "top_devices", "by_assignee"],
+                    "properties": {
+                        "from": { "type": "string", "format": "date-time" },
+                        "to": { "type": "string", "format": "date-time" },
+                        "totals": { "$ref": "#/components/schemas/TicketStatsTotals" },
+                        "by_day": { "type": "array", "items": { "$ref": "#/components/schemas/TicketDayStat" } },
+                        "by_category": { "type": "array", "items": { "$ref": "#/components/schemas/TicketCategoryStat" } },
+                        "by_priority": { "type": "array", "items": { "$ref": "#/components/schemas/TicketPriorityStat" } },
+                        "top_rooms": { "type": "array", "items": { "$ref": "#/components/schemas/TicketTopRoom" } },
+                        "top_devices": { "type": "array", "items": { "$ref": "#/components/schemas/TicketTopDevice" } },
+                        "by_assignee": { "type": "array", "items": { "$ref": "#/components/schemas/TicketAssigneeStat" } }
+                    }
+                },
+                "CreateTicketRequest": {
+                    "type": "object",
+                    "required": ["title"],
+                    "properties": {
+                        "title": { "type": "string", "description": "1-200 字符。" },
+                        "description": { "type": "string", "description": "纯文本，最长 10000 字符。" },
+                        "category": { "$ref": "#/components/schemas/TicketCategory" },
+                        "priority": { "$ref": "#/components/schemas/TicketPriority" },
+                        "room_id": { "type": ["string", "null"], "format": "uuid" },
+                        "area_id": { "type": ["string", "null"], "format": "uuid" },
+                        "serial": { "type": ["string", "null"] },
+                        "device_slot": { "type": ["string", "null"] }
+                    }
+                },
+                "UpdateTicketRequest": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" },
+                        "description": { "type": ["string", "null"], "description": "缺失 = 不修改；显式 null = 清空。" },
+                        "priority": { "$ref": "#/components/schemas/TicketPriority" },
+                        "category": { "$ref": "#/components/schemas/TicketCategory" }
+                    }
+                },
+                "AssignTicketRequest": {
+                    "type": "object",
+                    "required": ["assignee_id"],
+                    "properties": {
+                        "assignee_id": { "type": ["string", "null"], "format": "uuid", "description": "null = 释放认领；目标必须拥有 ticket:handle。" }
+                    }
+                },
+                "TransitionTicketRequest": {
+                    "type": "object",
+                    "required": ["to_status"],
+                    "properties": {
+                        "to_status": { "$ref": "#/components/schemas/TicketStatus" },
+                        "resolution": { "type": ["string", "null"], "description": "标记解决（to_status=resolved）时必填。" },
+                        "note": { "type": ["string", "null"] },
+                        "root_cause": { "oneOf": [{ "type": "string", "enum": ["hardware", "network", "software", "config", "usage", "other"] }, { "type": "null" }], "description": "根因分类（resolve/close 时写入；resolved→closed 可补充）。" }
+                    }
+                },
+                "TicketScopeUser": {
+                    "type": "object",
+                    "required": ["user_id", "display_name", "roles", "area_ids"],
+                    "properties": {
+                        "user_id": { "type": "string", "format": "uuid" },
+                        "display_name": { "type": "string" },
+                        "roles": { "type": "array", "items": { "type": "string" } },
+                        "area_ids": { "type": "array", "items": { "type": "string", "format": "uuid" } }
+                    }
+                },
+                "ScopeAreaOption": {
+                "type": "object",
+                "required": ["id", "name", "code"],
+                "properties": {
+                    "id": { "type": "string", "format": "uuid" },
+                    "name": { "type": "string" },
+                    "code": { "type": "string" }
                 }
+            },
+            "UpdateTicketScopesRequest": {
+                    "type": "object",
+                    "required": ["area_ids"],
+                    "properties": {
+                        "area_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "description": "整体替换该用户的区域范围；空数组 = 清除（恢复不限制）。" }
+                    }
+                },
+                "TicketAttachment": {
+                    "type": "object",
+                    "required": ["id", "ticket_id", "object_key", "filename", "content_type", "size",
+                                 "sha256", "uploaded_by", "uploaded_by_name", "created_at", "download_url"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "ticket_id": { "type": "string", "format": "uuid" },
+                        "object_key": { "type": "string" },
+                        "filename": { "type": "string" },
+                        "content_type": { "type": "string" },
+                        "size": { "type": "integer", "format": "int64" },
+                        "sha256": { "type": "string" },
+                        "uploaded_by": { "type": ["string", "null"], "format": "uuid" },
+                        "uploaded_by_name": { "type": ["string", "null"] },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "download_url": { "type": ["string", "null"], "description": "下载预签名地址；未配置对象存储时为 null。" }
+                    }
+                },
+                "AttachmentPresignRequest": {
+                    "type": "object",
+                    "required": ["filename", "content_type", "size", "sha256"],
+                    "properties": {
+                        "filename": { "type": "string", "description": "≤255 字符；对象 key 中会做安全字符替换。" },
+                        "content_type": { "type": "string", "description": "image/*, application/pdf, text/plain, application/zip, application/gzip, application/octet-stream。" },
+                        "size": { "type": "integer", "format": "int64", "description": "1..=20971520 字节。" },
+                        "sha256": { "type": "string", "description": "64 位十六进制。" }
+                    }
+                },
+                "AttachmentPresignReply": {
+                    "type": "object",
+                    "required": ["object_key", "upload_url", "expires_at"],
+                    "properties": {
+                        "object_key": { "type": "string" },
+                        "upload_url": { "type": "string" },
+                        "expires_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "AttachmentRegisterRequest": {
+                    "type": "object",
+                    "required": ["object_key", "filename", "content_type", "size", "sha256"],
+                    "properties": {
+                        "object_key": { "type": "string", "description": "必须是 presign 返回的 key（tickets/{ticket_id}/…）。" },
+                        "filename": { "type": "string" },
+                        "content_type": { "type": "string" },
+                        "size": { "type": "integer", "format": "int64" },
+                        "sha256": { "type": "string" }
+                    }
+                },
+                "InspectionScopeType": {
+                    "type": "string",
+                    "enum": ["global", "area", "room"]
+                },
+                "InspectionRunStatus": {
+                    "type": "string",
+                    "enum": ["running", "ok", "issues", "failed"]
+                },
+                "InspectionLastRun": {
+                    "type": "object",
+                    "required": ["status", "started_at", "issue_machines", "ticket_id"],
+                    "properties": {
+                        "status": { "$ref": "#/components/schemas/InspectionRunStatus" },
+                        "started_at": { "type": "string", "format": "date-time" },
+                        "issue_machines": { "type": "integer", "format": "int64" },
+                        "ticket_id": { "type": ["string", "null"], "format": "uuid" }
+                    }
+                },
+                "InspectionPlan": {
+                    "type": "object",
+                    "required": ["id", "name", "scope_type", "scope_id", "interval_hours", "enabled",
+                                 "created_by", "created_by_name", "last_run_at", "next_run_at",
+                                 "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "name": { "type": "string" },
+                        "scope_type": { "$ref": "#/components/schemas/InspectionScopeType" },
+                        "scope_id": { "type": ["string", "null"], "format": "uuid" },
+                        "interval_hours": { "type": "integer", "format": "int64", "description": "1..=168 小时。" },
+                        "enabled": { "type": "boolean" },
+                        "created_by": { "type": ["string", "null"], "format": "uuid" },
+                        "created_by_name": { "type": ["string", "null"] },
+                        "last_run_at": { "type": ["string", "null"], "format": "date-time" },
+                        "next_run_at": { "type": ["string", "null"], "format": "date-time", "description": "null = 立即到期。" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "InspectionPlanView": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/InspectionPlan" },
+                        {
+                            "type": "object",
+                            "required": ["last_run"],
+                            "properties": {
+                                "last_run": { "oneOf": [{ "$ref": "#/components/schemas/InspectionLastRun" }, { "type": "null" }] }
+                            }
+                        }
+                    ]
+                },
+                "CreateInspectionPlanRequest": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                        "name": { "type": "string", "description": "1-100 字符。" },
+                        "scope_type": { "$ref": "#/components/schemas/InspectionScopeType" },
+                        "scope_id": { "type": ["string", "null"], "format": "uuid", "description": "scope_type=area/room 时必填且必须存在。" },
+                        "interval_hours": { "type": "integer", "format": "int64", "minimum": 1, "maximum": 168 },
+                        "enabled": { "type": "boolean" }
+                    }
+                },
+                "UpdateInspectionPlanRequest": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "scope_type": { "$ref": "#/components/schemas/InspectionScopeType" },
+                        "scope_id": { "type": ["string", "null"], "format": "uuid", "description": "缺失 = 不修改；显式 null 清空。" },
+                        "interval_hours": { "type": "integer", "format": "int64", "minimum": 1, "maximum": 168 },
+                        "enabled": { "type": "boolean" }
+                    }
+                },
+                "InspectionRun": {
+                    "type": "object",
+                    "required": ["id", "plan_id", "started_at", "finished_at", "status",
+                                 "checked_machines", "issue_machines", "ticket_id", "summary", "error"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "plan_id": { "type": "string", "format": "uuid" },
+                        "started_at": { "type": "string", "format": "date-time" },
+                        "finished_at": { "type": ["string", "null"], "format": "date-time" },
+                        "status": { "$ref": "#/components/schemas/InspectionRunStatus" },
+                        "checked_machines": { "type": "integer", "format": "int64" },
+                        "issue_machines": { "type": "integer", "format": "int64" },
+                        "ticket_id": { "type": ["string", "null"], "format": "uuid" },
+                        "summary": { "type": "object", "description": "检查机器清单与异常明细快照。" },
+                        "error": { "type": ["string", "null"] }
+                    }
+                },
+                "CommentTicketRequest": {
+                    "type": "object",
+                    "required": ["body"],
+                    "properties": {
+                        "body": { "type": "string", "description": "评论内容（1-2000 字符），兼容别名 note。" }
+                    }
+                },
+                "TermView": {
+                    "type": "object",
+                    "required": ["id", "code", "name", "start_date", "end_date", "is_active", "usage", "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "start_date": { "type": "string", "format": "date" },
+                        "end_date": { "type": "string", "format": "date" },
+                        "is_active": { "type": "boolean" },
+                        "usage": { "type": "integer", "format": "int64", "description": "被排课计划引用数（列表展示用）。" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "TeacherView": {
+                    "type": "object",
+                    "required": ["id", "code", "name", "phone", "email", "is_active", "metadata", "usage", "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "phone": { "type": "string" },
+                        "email": { "type": "string" },
+                        "is_active": { "type": "boolean" },
+                        "metadata": { "type": "object" },
+                        "usage": { "type": "integer", "format": "int64", "description": "被计划条目引用数（列表展示用）。" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "ClassView": {
+                    "type": "object",
+                    "required": ["id", "code", "name", "grade", "is_active", "metadata", "usage", "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "grade": { "type": "string" },
+                        "is_active": { "type": "boolean" },
+                        "metadata": { "type": "object" },
+                        "usage": { "type": "integer", "format": "int64", "description": "被计划条目引用数（列表展示用）。" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "CourseView": {
+                    "type": "object",
+                    "required": ["id", "code", "name", "color", "is_active", "metadata", "usage", "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "color": { "type": "string", "description": "前端课程色值（如 #3a5bd9）；空 = 按课程名取色。" },
+                        "is_active": { "type": "boolean" },
+                        "metadata": { "type": "object" },
+                        "usage": { "type": "integer", "format": "int64", "description": "被计划条目引用数（列表展示用）。" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "PlanStatus": {
+                    "type": "string",
+                    "enum": ["draft", "published"],
+                    "description": "排课计划状态：draft 草稿可编辑 / published 已发布只读（同一学期只允许一个 published）。"
+                },
+                "SchedulePlan": {
+                    "type": "object",
+                    "required": ["id", "term_id", "term_name", "name", "status", "version", "published_at", "published_by", "created_by", "entry_count", "course_count", "room_count", "created_at", "updated_at"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "term_id": { "type": "string", "format": "uuid" },
+                        "term_name": { "type": "string" },
+                        "name": { "type": "string" },
+                        "status": { "$ref": "#/components/schemas/PlanStatus" },
+                        "version": { "type": "integer", "minimum": 1 },
+                        "published_at": { "type": ["string", "null"], "format": "date-time" },
+                        "published_by": { "type": ["string", "null"], "format": "uuid" },
+                        "created_by": { "type": ["string", "null"], "format": "uuid" },
+                        "entry_count": { "type": "integer", "format": "int64" },
+                        "course_count": { "type": "integer", "format": "int64" },
+                        "room_count": { "type": "integer", "format": "int64" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "PlanEntry": {
+                    "type": "object",
+                    "required": ["id", "plan_id", "room_id", "room_code", "room_name", "area_id", "area_name", "day_of_week", "start_time", "end_time", "course_id", "course_code", "course_name", "teacher_id", "teacher_name", "class_id", "class_name", "note"],
+                    "properties": {
+                        "id": { "type": "string", "format": "uuid" },
+                        "plan_id": { "type": "string", "format": "uuid" },
+                        "room_id": { "type": "string", "format": "uuid" },
+                        "room_code": { "type": "string" },
+                        "room_name": { "type": "string" },
+                        "area_id": { "type": "string", "format": "uuid" },
+                        "area_name": { "type": "string" },
+                        "day_of_week": { "type": "integer", "minimum": 1, "maximum": 7, "description": "ISO 星期：周一=1 .. 周日=7。" },
+                        "start_time": { "type": "string", "example": "08:00" },
+                        "end_time": { "type": "string", "example": "09:40" },
+                        "course_id": { "type": "string", "format": "uuid" },
+                        "course_code": { "type": "string" },
+                        "course_name": { "type": "string" },
+                        "teacher_id": { "type": ["string", "null"], "format": "uuid" },
+                        "teacher_name": { "type": ["string", "null"] },
+                        "class_id": { "type": ["string", "null"], "format": "uuid" },
+                        "class_name": { "type": ["string", "null"] },
+                        "note": { "type": "string" }
+                    }
+                },
+                "PlanEntryInput": {
+                    "type": "object",
+                    "required": ["room_id", "day_of_week", "start_time", "end_time", "course_id"],
+                    "properties": {
+                        "room_id": { "type": "string", "format": "uuid" },
+                        "day_of_week": { "type": "integer", "minimum": 1, "maximum": 7, "description": "ISO 星期：周一=1 .. 周日=7。" },
+                        "start_time": { "type": "string", "example": "08:00" },
+                        "end_time": { "type": "string", "example": "09:40" },
+                        "course_id": { "type": "string", "format": "uuid" },
+                        "teacher_id": { "type": ["string", "null"], "format": "uuid", "description": "可选；给出的教师必须存在且启用。" },
+                        "class_id": { "type": ["string", "null"], "format": "uuid", "description": "可选；给出的班级必须存在且启用。" },
+                        "note": { "type": "string", "description": "备注，最长 1000 字符；缺省空。" }
+                    }
+                },
+                "TermPage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/TermView" } } ,
+                        "total": { "type": "integer" } ,
+                        "page": { "type": "integer" } ,
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "TeacherPage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/TeacherView" } } ,
+                        "total": { "type": "integer" } ,
+                        "page": { "type": "integer" } ,
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "ClassPage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/ClassView" } } ,
+                        "total": { "type": "integer" } ,
+                        "page": { "type": "integer" } ,
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "CoursePage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/CourseView" } } ,
+                        "total": { "type": "integer" } ,
+                        "page": { "type": "integer" } ,
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "SchedulePlanPage": {
+                    "type": "object",
+                    "properties": {
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/SchedulePlan" } } ,
+                        "total": { "type": "integer" } ,
+                        "page": { "type": "integer" } ,
+                        "page_size": { "type": "integer" }
+                    }
+                },
+                "PlanDetailResponse": {
+                    "type": "object",
+                    "required": ["plan", "entries"],
+                    "properties": {
+                        "plan": { "$ref": "#/components/schemas/SchedulePlan" } ,
+                        "entries": { "type": "array", "items": { "$ref": "#/components/schemas/PlanEntry" }, "description": "按房间 → 星期 → 开始时间排序。" }
+                    }
+                },
+                "PublishResultResponse": {
+                    "type": "object",
+                    "required": ["plan", "schedules_rebuilt", "slots_written", "occurrences"],
+                    "properties": {
+                        "plan": { "$ref": "#/components/schemas/SchedulePlan" } ,
+                        "schedules_rebuilt": { "type": "integer", "description": "成功重建实例的 legacy 课表数（失败只记日志，不计入）。" } ,
+                        "slots_written": { "type": "integer", "description": "写入 legacy 周模板的槽位数。" } ,
+                        "occurrences": { "type": "integer", "description": "重建出的排课实例数。" }
+                    }
+                },
+                "CreateTermRequest": {
+                    "type": "object",
+                    "required": ["code", "name", "start_date", "end_date"],
+                    "properties": {
+                        "code": { "type": "string", "description": "2-64 位，首字符字母，可含字母数字 - _ ." },
+                        "name": { "type": "string", "maxLength": 200 },
+                        "start_date": { "type": "string", "format": "date" },
+                        "end_date": { "type": "string", "format": "date", "description": "必须 >= start_date。" },
+                        "is_active": { "type": "boolean", "default": true }
+                    }
+                },
+                "UpdateTermRequest": {
+                    "type": "object",
+                    "properties": {
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "start_date": { "type": "string", "format": "date" },
+                        "end_date": { "type": "string", "format": "date" },
+                        "is_active": { "type": "boolean" }
+                    }
+                },
+                "CreateTeacherRequest": {
+                    "type": "object",
+                    "required": ["code", "name"],
+                    "properties": {
+                        "code": { "type": "string", "description": "2-64 位，首字符字母，可含字母数字 - _ ." },
+                        "name": { "type": "string", "maxLength": 200 },
+                        "phone": { "type": "string", "maxLength": 32 },
+                        "email": { "type": "string" },
+                        "is_active": { "type": "boolean", "default": true },
+                        "metadata": { "type": "object" }
+                    }
+                },
+                "UpdateTeacherRequest": {
+                    "type": "object",
+                    "properties": {
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "phone": { "type": "string" },
+                        "email": { "type": "string" },
+                        "is_active": { "type": "boolean" },
+                        "metadata": { "type": ["object", "null"], "description": "缺失 = 不修改；显式 null = 重置为 {}。" }
+                    }
+                },
+                "CreateClassRequest": {
+                    "type": "object",
+                    "required": ["code", "name"],
+                    "properties": {
+                        "code": { "type": "string", "description": "2-64 位，首字符字母，可含字母数字 - _ ." },
+                        "name": { "type": "string", "maxLength": 200 },
+                        "grade": { "type": "string", "maxLength": 64 },
+                        "is_active": { "type": "boolean", "default": true },
+                        "metadata": { "type": "object" }
+                    }
+                },
+                "UpdateClassRequest": {
+                    "type": "object",
+                    "properties": {
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "grade": { "type": "string" },
+                        "is_active": { "type": "boolean" },
+                        "metadata": { "type": ["object", "null"], "description": "缺失 = 不修改；显式 null = 重置为 {}。" }
+                    }
+                },
+                "CreateCourseRequest": {
+                    "type": "object",
+                    "required": ["code", "name"],
+                    "properties": {
+                        "code": { "type": "string", "description": "2-64 位，首字符字母，可含字母数字 - _ ." },
+                        "name": { "type": "string", "maxLength": 200 },
+                        "color": { "type": "string", "maxLength": 32, "description": "前端课程色值；空 = 按课程名取色。" },
+                        "is_active": { "type": "boolean", "default": true },
+                        "metadata": { "type": "object" }
+                    }
+                },
+                "UpdateCourseRequest": {
+                    "type": "object",
+                    "properties": {
+                        "code": { "type": "string" },
+                        "name": { "type": "string" },
+                        "color": { "type": "string" },
+                        "is_active": { "type": "boolean" },
+                        "metadata": { "type": ["object", "null"], "description": "缺失 = 不修改；显式 null = 重置为 {}。" }
+                    }
+                },
+                "CreateSchedulePlanRequest": {
+                    "type": "object",
+                    "required": ["term_id", "name"],
+                    "properties": {
+                        "term_id": { "type": "string", "format": "uuid", "description": "计划归属的学期；必须存在且启用。" },
+                        "name": { "type": "string", "maxLength": 200 }
+                    }
+                },
+                "UpdateSchedulePlanRequest": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                        "name": { "type": "string", "maxLength": 200 }
+                    }
+                },
+                "ReplacePlanEntriesRequest": {
+                    "type": "object",
+                    "required": ["entries"],
+                    "properties": {
+                        "entries": { "type": "array", "items": { "$ref": "#/components/schemas/PlanEntryInput" }, "maxItems": 2000, "description": "全量替换；同一房间同一天的时段不得重叠。" }
+                    }
+                }
+
             }
         },
         "paths": {
@@ -1846,6 +2778,37 @@ pub async fn json_spec() -> Json<Value> {
                         "201": { "description": "已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Schedule" } } } },
                         "400": error_response("参数校验失败"),
                         "403": error_response("缺少 schedule:manage")
+                    }
+                }
+            },
+            "/admin/schedule-board": {
+                "get": {
+                    "tags": ["ScheduleBoard"],
+                    "summary": "排课工作台聚合数据（一次返回 areas / rooms / schedules / weekly_slots / exceptions）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "from", "in": "query", "required": true, "schema": { "type": "string", "format": "date" }, "description": "起始日期（YYYY-MM-DD，必填）。" },
+                        { "name": "to", "in": "query", "required": true, "schema": { "type": "string", "format": "date" }, "description": "结束日期（YYYY-MM-DD，必填，to >= from，跨度 ≤ 62 天）。" },
+                        { "name": "area_id", "in": "query", "schema": { "type": "string", "format": "uuid" }, "description": "只过滤 rooms，不裁剪 areas。" }
+                    ],
+                    "responses": {
+                        "200": { "description": "工作台聚合数据", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScheduleBoard" } } } },
+                        "400": error_response("from/to 缺失、格式错误或日期跨度非法"),
+                        "403": error_response("缺少 schedule:read")
+                    }
+                }
+            },
+            "/admin/schedules/ensure": {
+                "post": {
+                    "tags": ["Schedules"],
+                    "summary": "幂等地为一批房间补默认课表（已有交集课表归入 existing）",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EnsureSchedulesRequest" } } } },
+                    "responses": {
+                        "200": { "description": "新建 / 已存在的课表", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EnsureSchedulesResponse" } } } },
+                        "400": error_response("room_ids 为空或超限、日期区间非法、房间已停用"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("房间不存在")
                     }
                 }
             },
@@ -2447,9 +3410,889 @@ pub async fn json_spec() -> Json<Value> {
                         "404": error_response("机器不存在")
                     }
                 }
-            }
+            },
+            "/admin/tickets": {
+                "get": {
+                    "tags": ["Tickets"],
+                    "summary": "工单分页（updated_at 倒序）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "status", "in": "query", "schema": { "$ref": "#/components/schemas/TicketStatus" } },
+                        { "name": "category", "in": "query", "schema": { "$ref": "#/components/schemas/TicketCategory" } },
+                        { "name": "priority", "in": "query", "schema": { "$ref": "#/components/schemas/TicketPriority" } },
+                        { "name": "source", "in": "query", "schema": { "$ref": "#/components/schemas/TicketSource" } },
+                        { "name": "assignee_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "unassigned", "in": "query", "schema": { "type": "boolean" }, "description": "true = 只看未分配工单；与 assignee_id 同时出现时以 assignee_id 为准。" },
+                        { "name": "mine", "in": "query", "schema": { "type": "boolean" }, "description": "true = 只看 assignee_id = 当前用户的工单；是否只看未结束由 active 参数控制。" },
+                        { "name": "active", "in": "query", "schema": { "type": "boolean" }, "description": "true = 只看 open/in_progress。" },
+                        { "name": "overdue", "in": "query", "schema": { "type": "boolean" }, "description": "true = 只看超时未结束工单。" },
+                        { "name": "area_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "room_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "serial", "in": "query", "schema": { "type": "string" } },
+                        { "name": "keyword", "in": "query", "schema": { "type": "string" }, "description": "标题/描述/单号模糊匹配（≤100 字符）。" },
+                        { "name": "from", "in": "query", "schema": { "type": "string" }, "description": "创建时间下限，RFC3339 或 YYYY-MM-DD。" },
+                        { "name": "to", "in": "query", "schema": { "type": "string" }, "description": "创建时间上限，RFC3339 或 YYYY-MM-DD（日期含当天）。" },
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "工单分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TicketPage" } } } },
+                        "400": error_response("参数不合法"),
+                        "403": error_response("缺少 ticket:read")
+                    }
+                },
+                "post": {
+                    "tags": ["Tickets"],
+                    "summary": "人工创建工单",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateTicketRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ticket" } } } },
+                        "400": error_response("标题/描述/设备槽位不合法"),
+                        "403": error_response("缺少 ticket:create"),
+                        "404": error_response("房间或区域不存在")
+                    }
+                }
+            },
+            "/admin/tickets/summary": {
+                "get": {
+                    "tags": ["Tickets"],
+                    "summary": "轻量计数：状态分布、未分配、超时、我的待办",
+                    "security": secured(),
+                    "responses": {
+                        "200": { "description": "工单计数", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TicketSummary" } } } },
+                        "403": error_response("缺少 ticket:read")
+                    }
+                }
+            },
+            "/admin/tickets/stats": {
+                "get": {
+                    "tags": ["Tickets"],
+                    "summary": "历史分析聚合（缺省近 30 天）",
+                    "description": "MTTR = 区间内 resolved_at - created_at 的平均值（排除 cancelled），同时返回中位数；按天趋势按关联区域时区聚合本地日期。",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "from", "in": "query", "schema": { "type": "string" }, "description": "RFC3339 或 YYYY-MM-DD，默认 now-30d。" },
+                        { "name": "to", "in": "query", "schema": { "type": "string" }, "description": "RFC3339 或 YYYY-MM-DD，默认 now。" }
+                    ],
+                    "responses": {
+                        "200": { "description": "统计聚合", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TicketStats" } } } },
+                        "400": error_response("时间参数不合法"),
+                        "403": error_response("缺少 ticket:read")
+                    }
+                }
+            },
+            "/admin/tickets/assignees": {
+                "get": {
+                    "tags": ["Tickets"],
+                    "summary": "可转派人员（拥有 ticket:handle 的启用用户）",
+                    "security": secured(),
+                    "responses": {
+                        "200": { "description": "人员列表", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/TicketAssignee" } } } } },
+                        "403": error_response("缺少 ticket:handle")
+                    }
+                }
+            },
+            "/admin/tickets/{id}": {
+                "get": {
+                    "tags": ["Tickets"],
+                    "summary": "工单详情（含时间线与关联上下文）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "工单详情", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TicketDetail" } } } },
+                        "403": error_response("缺少 ticket:read"),
+                        "404": error_response("工单不存在")
+                    }
+                },
+                "patch": {
+                    "tags": ["Tickets"],
+                    "summary": "修改标题/描述/优先级/分类（仅未结束工单）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateTicketRequest" } } } },
+                    "responses": {
+                        "200": { "description": "更新后的工单", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ticket" } } } },
+                        "400": error_response("标题/描述不合法"),
+                        "403": error_response("缺少 ticket:manage"),
+                        "404": error_response("工单不存在"),
+                        "409": error_response("工单已结束，不能修改")
+                    }
+                }
+            },
+            "/admin/tickets/{id}/claim": {
+                "post": {
+                    "tags": ["Tickets"],
+                    "summary": "认领（open → in_progress，幂等）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "认领后的工单", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ticket" } } } },
+                        "403": error_response("缺少 ticket:handle"),
+                        "404": error_response("工单不存在"),
+                        "409": error_response("工单已被他人认领或状态不允许认领")
+                    }
+                }
+            },
+            "/admin/tickets/{id}/assign": {
+                "post": {
+                    "tags": ["Tickets"],
+                    "summary": "转派（assignee_id = null 表示释放认领）",
+                    "description": "请求体必填：assignee_id 缺失 → 400；显式 null 表示释放认领。目标用户必须拥有 ticket:handle 权限；已结束工单不能转派。",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AssignTicketRequest" } } } },
+                    "responses": {
+                        "200": { "description": "转派后的工单", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ticket" } } } },
+                        "400": error_response("目标处理人没有 ticket:handle 权限"),
+                        "403": error_response("缺少 ticket:manage"),
+                        "404": error_response("工单不存在"),
+                        "409": error_response("工单已结束，不能转派")
+                    }
+                }
+            },
+            "/admin/tickets/{id}/transition": {
+                "post": {
+                    "tags": ["Tickets"],
+                    "summary": "状态流转（服务端状态机校验）",
+                    "description": "允许：open→in_progress/cancelled、in_progress→resolved/cancelled、resolved→closed/open、closed→open。resolved 必须带 resolution。非法流转 → 409。",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransitionTicketRequest" } } } },
+                    "responses": {
+                        "200": { "description": "流转后的工单", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ticket" } } } },
+                        "400": error_response("标记解决但缺少 resolution"),
+                        "403": error_response("缺少 ticket:handle"),
+                        "404": error_response("工单不存在"),
+                        "409": error_response("状态机不允许该流转")
+                    }
+                }
+            },
+            "/admin/tickets/{id}/comments": {
+                "post": {
+                    "tags": ["Tickets"],
+                    "summary": "追加评论（写入时间线）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CommentTicketRequest" } } } },
+                    "responses": {
+                        "201": { "description": "新建的评论事件", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TicketEvent" } } } },
+                        "400": error_response("评论内容为空或过长"),
+                        "403": error_response("缺少 ticket:handle"),
+                        "404": error_response("工单不存在")
+                    }
+                }
+            },
+            "/admin/tickets/export": {
+                "get": {
+                    "tags": ["Tickets"],
+                    "summary": "导出工单 CSV（同列表筛选，最多 5000 行）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "status", "in": "query", "schema": { "$ref": "#/components/schemas/TicketStatus" } },
+                        { "name": "category", "in": "query", "schema": { "$ref": "#/components/schemas/TicketCategory" } },
+                        { "name": "priority", "in": "query", "schema": { "$ref": "#/components/schemas/TicketPriority" } },
+                        { "name": "source", "in": "query", "schema": { "$ref": "#/components/schemas/TicketSource" } },
+                        { "name": "assignee_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "unassigned", "in": "query", "schema": { "type": "boolean" } },
+                        { "name": "mine", "in": "query", "schema": { "type": "boolean" } },
+                        { "name": "active", "in": "query", "schema": { "type": "boolean" } },
+                        { "name": "overdue", "in": "query", "schema": { "type": "boolean" } },
+                        { "name": "area_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "room_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "serial", "in": "query", "schema": { "type": "string" } },
+                        { "name": "keyword", "in": "query", "schema": { "type": "string" } },
+                        { "name": "from", "in": "query", "schema": { "type": "string" } },
+                        { "name": "to", "in": "query", "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "CSV 文件（UTF-8 BOM，中文表头）", "content": { "text/csv": { "schema": { "type": "string" } } } },
+                        "403": error_response("缺少 ticket:export 或 ticket:read")
+                    }
+                }
+            },
+            "/admin/tickets/stream": {
+                "get": {
+                    "tags": ["Tickets"],
+                    "summary": "工单事件 SSE（先补发 after_event_id 之后，再每 2s 增量）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "after_event_id", "in": "query", "schema": { "type": "integer", "format": "int64", "minimum": 0 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "SSE：ticket.event / heartbeat", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
+                        "403": error_response("缺少 ticket:read")
+                    }
+                }
+            },
+            "/admin/ticket-rules": {
+                "get": {
+                    "tags": ["Tickets"],
+                    "summary": "自动建单规则列表",
+                    "security": secured(),
+                    "responses": {
+                        "200": { "description": "规则列表", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TicketRuleList" } } } },
+                        "403": error_response("缺少 ticket:rule:manage 或 ticket:manage")
+                    }
+                },
+                "post": {
+                    "tags": ["Tickets"],
+                    "summary": "新建自动建单规则",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateTicketRuleRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TicketRule" } } } },
+                        "400": error_response("名称/阈值/范围不合法"),
+                        "403": error_response("缺少 ticket:rule:manage 或 ticket:manage")
+                    }
+                }
+            },
+            "/admin/ticket-rules/{id}": {
+                "patch": {
+                    "tags": ["Tickets"],
+                    "summary": "部分更新自动建单规则（signal_type 不可改）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateTicketRuleRequest" } } } },
+                    "responses": {
+                        "200": { "description": "更新后的规则", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TicketRule" } } } },
+                        "400": error_response("名称/阈值/范围不合法"),
+                        "403": error_response("缺少 ticket:rule:manage 或 ticket:manage"),
+                        "404": error_response("规则不存在")
+                    }
+                },
+                "delete": {
+                    "tags": ["Tickets"],
+                    "summary": "删除自动建单规则",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "204": { "description": "已删除" },
+                        "403": error_response("缺少 ticket:rule:manage 或 ticket:manage"),
+                        "404": error_response("规则不存在")
+                    }
+                }
+            },
+            "/admin/terms": {
+                "get": {
+                    "tags": ["Terms"],
+                    "summary": "学期分页",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } },
+                        { "name": "keyword", "in": "query", "schema": { "type": "string", "maxLength": 100 }, "description": "按 code / name 模糊搜索。" },
+                        { "name": "include_inactive", "in": "query", "schema": { "type": "boolean" }, "description": "是否包含停用记录，缺省 false。" }
+                    ],
+                    "responses": {
+                        "200": { "description": "学期分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TermPage" } } } },
+                        "403": error_response("缺少 schedule:read")
+                    }
+                },
+                "post": {
+                    "tags": ["Terms"],
+                    "summary": "创建学期",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateTermRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TermView" } } } },
+                        "400": error_response("参数校验失败"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "409": error_response("编码已存在")
+                    }
+                }
+            },
+            "/admin/terms/{id}": {
+                "get": {
+                    "tags": ["Terms"],
+                    "summary": "学期详情",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "学期", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TermView" } } } },
+                        "403": error_response("缺少 schedule:read"),
+                        "404": error_response("学期不存在")
+                    }
+                },
+                "patch": {
+                    "tags": ["Terms"],
+                    "summary": "局部更新学期",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateTermRequest" } } } },
+                    "responses": {
+                        "200": { "description": "已更新", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TermView" } } } },
+                        "400": error_response("参数校验失败 / 没有需要更新的字段"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("学期不存在"),
+                        "409": error_response("编码已存在")
+                    }
+                },
+                "delete": {
+                    "tags": ["Terms"],
+                    "summary": "删除学期",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "204": { "description": "已删除" },
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("学期不存在"),
+                        "409": error_response("学期仍被排课计划引用")
+                    }
+                }
+            },
+            "/admin/teachers": {
+                "get": {
+                    "tags": ["Teachers"],
+                    "summary": "教师分页",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } },
+                        { "name": "keyword", "in": "query", "schema": { "type": "string", "maxLength": 100 }, "description": "按 code / name 模糊搜索。" },
+                        { "name": "include_inactive", "in": "query", "schema": { "type": "boolean" }, "description": "是否包含停用记录，缺省 false。" }
+                    ],
+                    "responses": {
+                        "200": { "description": "教师分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TeacherPage" } } } },
+                        "403": error_response("缺少 schedule:read")
+                    }
+                },
+                "post": {
+                    "tags": ["Teachers"],
+                    "summary": "创建教师",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateTeacherRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TeacherView" } } } },
+                        "400": error_response("参数校验失败"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "409": error_response("编码已存在")
+                    }
+                }
+            },
+            "/admin/teachers/{id}": {
+                "get": {
+                    "tags": ["Teachers"],
+                    "summary": "教师详情",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "教师", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TeacherView" } } } },
+                        "403": error_response("缺少 schedule:read"),
+                        "404": error_response("教师不存在")
+                    }
+                },
+                "patch": {
+                    "tags": ["Teachers"],
+                    "summary": "局部更新教师",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateTeacherRequest" } } } },
+                    "responses": {
+                        "200": { "description": "已更新", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TeacherView" } } } },
+                        "400": error_response("参数校验失败 / 没有需要更新的字段"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("教师不存在"),
+                        "409": error_response("编码已存在")
+                    }
+                },
+                "delete": {
+                    "tags": ["Teachers"],
+                    "summary": "删除教师",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "204": { "description": "已删除" },
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("教师不存在"),
+                        "409": error_response("教师仍被计划条目引用")
+                    }
+                }
+            },
+            "/admin/classes": {
+                "get": {
+                    "tags": ["Classes"],
+                    "summary": "班级分页",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } },
+                        { "name": "keyword", "in": "query", "schema": { "type": "string", "maxLength": 100 }, "description": "按 code / name 模糊搜索。" },
+                        { "name": "include_inactive", "in": "query", "schema": { "type": "boolean" }, "description": "是否包含停用记录，缺省 false。" }
+                    ],
+                    "responses": {
+                        "200": { "description": "班级分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClassPage" } } } },
+                        "403": error_response("缺少 schedule:read")
+                    }
+                },
+                "post": {
+                    "tags": ["Classes"],
+                    "summary": "创建班级",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateClassRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClassView" } } } },
+                        "400": error_response("参数校验失败"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "409": error_response("编码已存在")
+                    }
+                }
+            },
+            "/admin/classes/{id}": {
+                "get": {
+                    "tags": ["Classes"],
+                    "summary": "班级详情",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "班级", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClassView" } } } },
+                        "403": error_response("缺少 schedule:read"),
+                        "404": error_response("班级不存在")
+                    }
+                },
+                "patch": {
+                    "tags": ["Classes"],
+                    "summary": "局部更新班级",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateClassRequest" } } } },
+                    "responses": {
+                        "200": { "description": "已更新", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClassView" } } } },
+                        "400": error_response("参数校验失败 / 没有需要更新的字段"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("班级不存在"),
+                        "409": error_response("编码已存在")
+                    }
+                },
+                "delete": {
+                    "tags": ["Classes"],
+                    "summary": "删除班级",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "204": { "description": "已删除" },
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("班级不存在"),
+                        "409": error_response("班级仍被计划条目引用")
+                    }
+                }
+            },
+            "/admin/courses": {
+                "get": {
+                    "tags": ["Courses"],
+                    "summary": "课程分页",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } },
+                        { "name": "keyword", "in": "query", "schema": { "type": "string", "maxLength": 100 }, "description": "按 code / name 模糊搜索。" },
+                        { "name": "include_inactive", "in": "query", "schema": { "type": "boolean" }, "description": "是否包含停用记录，缺省 false。" }
+                    ],
+                    "responses": {
+                        "200": { "description": "课程分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CoursePage" } } } },
+                        "403": error_response("缺少 schedule:read")
+                    }
+                },
+                "post": {
+                    "tags": ["Courses"],
+                    "summary": "创建课程",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateCourseRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CourseView" } } } },
+                        "400": error_response("参数校验失败"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "409": error_response("编码已存在")
+                    }
+                }
+            },
+            "/admin/courses/{id}": {
+                "get": {
+                    "tags": ["Courses"],
+                    "summary": "课程详情",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "课程", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CourseView" } } } },
+                        "403": error_response("缺少 schedule:read"),
+                        "404": error_response("课程不存在")
+                    }
+                },
+                "patch": {
+                    "tags": ["Courses"],
+                    "summary": "局部更新课程",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateCourseRequest" } } } },
+                    "responses": {
+                        "200": { "description": "已更新", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CourseView" } } } },
+                        "400": error_response("参数校验失败 / 没有需要更新的字段"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("课程不存在"),
+                        "409": error_response("编码已存在")
+                    }
+                },
+                "delete": {
+                    "tags": ["Courses"],
+                    "summary": "删除课程",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "204": { "description": "已删除" },
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("课程不存在"),
+                        "409": error_response("课程仍被计划条目引用")
+                    }
+                }
+            },
+            "/admin/schedule-plans": {
+                "get": {
+                    "tags": ["SchedulePlans"],
+                    "summary": "排课计划分页（可按学期 / 状态过滤）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "term_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["draft", "published"] }, "description": "计划状态；非法值 400。" },
+                        { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+                        { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "排课计划分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SchedulePlanPage" } } } },
+                        "400": error_response("状态或分页参数非法"),
+                        "403": error_response("缺少 schedule:read")
+                    }
+                },
+                "post": {
+                    "tags": ["SchedulePlans"],
+                    "summary": "创建草稿计划（version = 1）",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateSchedulePlanRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已创建草稿计划", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SchedulePlan" } } } },
+                        "400": error_response("参数校验失败 / 学期已停用"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("学期不存在")
+                    }
+                }
+            },
+            "/admin/schedule-plans/{id}": {
+                "get": {
+                    "tags": ["SchedulePlans"],
+                    "summary": "排课计划详情（计划 + 条目，含名称快照）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "计划与条目", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PlanDetailResponse" } } } },
+                        "403": error_response("缺少 schedule:read"),
+                        "404": error_response("排课计划不存在")
+                    }
+                },
+                "patch": {
+                    "tags": ["SchedulePlans"],
+                    "summary": "重命名计划（仅草稿；已发布 409）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateSchedulePlanRequest" } } } },
+                    "responses": {
+                        "200": { "description": "已更新", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SchedulePlan" } } } },
+                        "400": error_response("参数校验失败"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("排课计划不存在"),
+                        "409": error_response("已发布的计划不可修改")
+                    }
+                },
+                "delete": {
+                    "tags": ["SchedulePlans"],
+                    "summary": "删除计划（仅草稿；已发布 409；条目级联删除）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "204": { "description": "已删除" },
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("排课计划不存在"),
+                        "409": error_response("已发布的计划不可删除")
+                    }
+                }
+            },
+            "/admin/schedule-plans/{id}/clone": {
+                "post": {
+                    "tags": ["SchedulePlans"],
+                    "summary": "克隆为新草稿（任意状态可克隆；version = 同学期最大值 + 1，名称加「副本」）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "201": { "description": "新草稿计划", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SchedulePlan" } } } },
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("排课计划不存在")
+                    }
+                }
+            },
+            "/admin/schedule-plans/{id}/entries": {
+                "get": {
+                    "tags": ["SchedulePlans"],
+                    "summary": "计划条目列表（按房间 → 星期 → 开始时间排序）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "条目列表", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/PlanEntry" } } } } },
+                        "403": error_response("缺少 schedule:read"),
+                        "404": error_response("排课计划不存在")
+                    }
+                },
+                "put": {
+                    "tags": ["SchedulePlans"],
+                    "summary": "全量替换计划条目（仅草稿；同房间同日时段不得重叠）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReplacePlanEntriesRequest" } } } },
+                    "responses": {
+                        "200": { "description": "替换后的条目", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/PlanEntry" } } } } },
+                        "400": error_response("参数校验失败 / 时段重叠 / 引用的房间或主数据不存在或已停用"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("排课计划不存在"),
+                        "409": error_response("已发布的计划不可修改条目")
+                    }
+                }
+            },
+            "/admin/schedule-plans/{id}/publish": {
+                "post": {
+                    "tags": ["SchedulePlans"],
+                    "summary": "发布计划：桥接写入 legacy 课表并重建排课实例（仅草稿；重复发布 409）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "发布结果（计划 + 重建统计）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PublishResultResponse" } } } },
+                        "400": error_response("学期已停用"),
+                        "403": error_response("缺少 schedule:manage"),
+                        "404": error_response("排课计划不存在"),
+                        "409": error_response("计划已发布（重复发布）")
+                    }
+                }
+            },
+            "/admin/ticket-scopes": {
+                "get": {
+                    "tags": ["Tickets"],
+                    "summary": "工单数据范围：启用且拥有 ticket:read 的用户 + 区域范围",
+                    "security": secured(),
+                    "responses": {
+                        "200": { "description": "用户范围列表", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/TicketScopeUser" } } } } },
+                        "403": error_response("缺少 ticket:scope:manage / ticket:manage")
+                    }
+                }
+            },
+            "/admin/ticket-scopes/areas": {
+                "get": {
+                    "tags": ["Tickets"],
+                    "summary": "工单范围配置用区域选项（不要求 area:read）",
+                    "security": secured(),
+                    "responses": {
+                        "200": { "description": "区域选项", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/ScopeAreaOption" } } } } },
+                        "403": error_response("缺少 ticket:scope:manage / ticket:manage")
+                    }
+                }
+            },
+            "/admin/ticket-scopes/{user_id}": {
+                "put": {
+                    "tags": ["Tickets"],
+                    "summary": "整体替换某用户的工单区域范围（空数组 = 恢复不限制）",
+                    "description": "权限：ticket:scope:manage 或 ticket:manage；区域必须存在。审计：ticket_scope.update。",
+                    "security": secured(),
+                    "parameters": [{ "name": "user_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateTicketScopesRequest" } } } },
+                    "responses": {
+                        "200": { "description": "更新后的用户范围", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TicketScopeUser" } } } },
+                        "403": error_response("缺少 ticket:scope:manage / ticket:manage"),
+                        "404": error_response("用户或区域不存在")
+                    }
+                }
+            },
+            "/admin/tickets/{id}/attachments/upload": {
+                "post": {
+                    "tags": ["Tickets"],
+                    "summary": "代理上传附件（请求体为文件原始字节）",
+                    "description": "权限：ticket:attachment 或 ticket:handle；同源上传，避免对象存储 CORS。请求体 ≤20MiB（受 MAX_BODY_BYTES 限制），服务端计算 sha256 后写入对象存储并登记。Query：filename、content_type。",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "filename", "in": "query", "required": true, "schema": { "type": "string" } },
+                        { "name": "content_type", "in": "query", "schema": { "type": "string" } }
+                    ],
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } }
+                    },
+                    "responses": {
+                        "201": { "description": "已上传并登记", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TicketAttachment" } } } },
+                        "400": error_response("文件名/大小/sha256/类型不合法"),
+                        "403": error_response("缺少 ticket:attachment / ticket:handle，或不在数据范围内"),
+                        "404": error_response("工单不存在"),
+                        "503": error_response("未配置对象存储或对象存储不可用")
+                    }
+                }
+            },
+            "/admin/tickets/{id}/attachments/presign": {
+                "post": {
+                    "tags": ["Tickets"],
+                    "summary": "附件上传预签名（PUT URL）",
+                    "description": "权限：ticket:attachment 或 ticket:handle；未配置对象存储 → 503。对象 key 为 tickets/{ticket_id}/{uuid}/{filename}。",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AttachmentPresignRequest" } } } },
+                    "responses": {
+                        "200": { "description": "预签名上传地址", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AttachmentPresignReply" } } } },
+                        "400": error_response("文件名/大小/sha256/content-type 不合法"),
+                        "403": error_response("缺少 ticket:attachment / ticket:handle，或工单不在数据范围内"),
+                        "404": error_response("工单不存在"),
+                        "503": error_response("未配置对象存储")
+                    }
+                }
+            },
+            "/admin/tickets/{id}/attachments": {
+                "get": {
+                    "tags": ["Tickets"],
+                    "summary": "附件列表（含下载预签名；未配置存储时 download_url=null）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "附件列表", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/TicketAttachment" } } } } },
+                        "403": error_response("缺少 ticket:read"),
+                        "404": error_response("工单不存在或不在数据范围内")
+                    }
+                },
+                "post": {
+                    "tags": ["Tickets"],
+                    "summary": "登记已上传的附件（object_key 必须属于该工单）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AttachmentRegisterRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已登记", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TicketAttachment" } } } },
+                        "400": error_response("元数据或 object_key 不合法"),
+                        "403": error_response("缺少 ticket:attachment / ticket:handle，或工单不在数据范围内"),
+                        "404": error_response("工单不存在"),
+                        "409": error_response("object_key 已登记")
+                    }
+                }
+            },
+            "/admin/tickets/{id}/attachments/{attachment_id}/download": {
+                "get": {
+                    "tags": ["Tickets"],
+                    "summary": "代理下载附件（Content-Disposition: attachment）",
+                    "description": "权限：ticket:read + 工单数据范围；未配置对象存储时 503。",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "attachment_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "附件二进制", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } },
+                        "403": error_response("缺少 ticket:read 或不在数据范围内"),
+                        "404": error_response("工单或附件不存在"),
+                        "503": error_response("未配置对象存储或对象存储不可用")
+                    }
+                }
+            },
+            "/admin/tickets/{id}/attachments/{attachment_id}": {
+                "delete": {
+                    "tags": ["Tickets"],
+                    "summary": "删除附件（上传者或 ticket:manage）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "attachment_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+                    ],
+                    "responses": {
+                        "204": { "description": "已删除" },
+                        "403": error_response("缺少权限、非上传者或不在数据范围内"),
+                        "404": error_response("工单或附件不存在")
+                    }
+                }
+            },
+            "/admin/inspection-plans": {
+                "get": {
+                    "tags": ["TicketInspections"],
+                    "summary": "巡检计划列表（含最近一次执行摘要）",
+                    "security": secured(),
+                    "responses": {
+                        "200": { "description": "计划列表", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/InspectionPlanView" } } } } },
+                        "403": error_response("缺少 ticket:inspection:manage / ticket:manage")
+                    }
+                },
+                "post": {
+                    "tags": ["TicketInspections"],
+                    "summary": "创建巡检计划（global/area/room 范围 + 1..=168 小时间隔）",
+                    "security": secured(),
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateInspectionPlanRequest" } } } },
+                    "responses": {
+                        "201": { "description": "已创建", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/InspectionPlanView" } } } },
+                        "400": error_response("名称/周期/范围不合法"),
+                        "403": error_response("缺少 ticket:inspection:manage / ticket:manage"),
+                        "404": error_response("区域或房间不存在")
+                    }
+                }
+            },
+            "/admin/inspection-plans/{id}": {
+                "patch": {
+                    "tags": ["TicketInspections"],
+                    "summary": "修改巡检计划（部分更新）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateInspectionPlanRequest" } } } },
+                    "responses": {
+                        "200": { "description": "更新后的计划", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/InspectionPlanView" } } } },
+                        "400": error_response("名称/周期/范围不合法"),
+                        "403": error_response("缺少 ticket:inspection:manage / ticket:manage"),
+                        "404": error_response("巡检计划不存在")
+                    }
+                },
+                "delete": {
+                    "tags": ["TicketInspections"],
+                    "summary": "删除巡检计划（执行历史级联删除）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "204": { "description": "已删除" },
+                        "403": error_response("缺少 ticket:inspection:manage / ticket:manage"),
+                        "404": error_response("巡检计划不存在")
+                    }
+                }
+            },
+            "/admin/inspection-plans/{id}/run": {
+                "post": {
+                    "tags": ["TicketInspections"],
+                    "summary": "手动立即执行一次巡检（同步返回 run；不影响 next_run_at 周期）",
+                    "security": secured(),
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+                    "responses": {
+                        "200": { "description": "执行结果（status=ok/issues/failed；有异常时 ticket_id 非空）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/InspectionRun" } } } },
+                        "403": error_response("缺少 ticket:inspection:manage / ticket:manage"),
+                        "404": error_response("巡检计划不存在")
+                    }
+                }
+            },
+            "/admin/inspection-runs": {
+                "get": {
+                    "tags": ["TicketInspections"],
+                    "summary": "执行历史（plan_id 可选；limit 1..=100，默认 20）",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "plan_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "执行记录", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/InspectionRun" } } } } },
+                        "400": error_response("limit 不合法"),
+                        "403": error_response("缺少 ticket:inspection:manage / ticket:manage")
+                    }
+                }
+            },
         }
-    }))
+    })
+}
+
+/// HTTP 端点：`GET /api-docs/openapi.json`。
+pub async fn json_spec() -> Json<Value> {
+    Json(spec())
 }
 
 pub async fn ui() -> Html<&'static str> {
@@ -2472,6 +4315,8 @@ mod tests {
         assert!(paths.contains_key("/admin/rooms/{id}/event-rules"));
         assert!(paths.contains_key("/admin/schedules/{id}/weekly-slots"));
         assert!(paths.contains_key("/admin/schedules/{id}/occurrences"));
+        assert!(paths.contains_key("/admin/schedule-board"));
+        assert!(paths.contains_key("/admin/schedules/ensure"));
         assert!(paths.contains_key("/admin/schedule-events/{id}/deliveries/{delivery_id}/retry"));
         assert!(paths.contains_key("/admin/devices"));
         assert!(paths.contains_key("/admin/devices/{serial}"));
@@ -2501,12 +4346,172 @@ mod tests {
         assert!(paths.contains_key("/admin/device-events"));
         assert!(paths.contains_key("/admin/device-events/stream"));
         assert!(paths.contains_key("/admin/device-presence-deliveries"));
+        // ---- 工单（P0）----
+        assert!(paths.contains_key("/admin/tickets"));
+        assert!(paths.contains_key("/admin/tickets/summary"));
+        assert!(paths.contains_key("/admin/tickets/stats"));
+        assert!(paths.contains_key("/admin/tickets/assignees"));
+        assert!(paths.contains_key("/admin/tickets/{id}"));
+        assert!(paths.contains_key("/admin/tickets/{id}/claim"));
+        assert!(paths.contains_key("/admin/tickets/{id}/assign"));
+        assert!(paths.contains_key("/admin/tickets/{id}/transition"));
+        assert!(paths.contains_key("/admin/tickets/{id}/comments"));
+        // ---- Wave 2：数据范围 / 附件 ----
+        assert!(paths.contains_key("/admin/ticket-scopes"));
+        assert!(paths.contains_key("/admin/ticket-scopes/areas"));
+        assert!(paths.contains_key("/admin/ticket-scopes/{user_id}"));
+        assert!(paths.contains_key("/admin/tickets/{id}/attachments"));
+        assert!(paths.contains_key("/admin/tickets/{id}/attachments/presign"));
+        assert!(paths.contains_key("/admin/tickets/{id}/attachments/upload"));
+        assert!(paths.contains_key("/admin/tickets/{id}/attachments/{attachment_id}"));
+        assert!(paths.contains_key("/admin/tickets/{id}/attachments/{attachment_id}/download"));
+        // ---- Wave 3：巡检计划 ----
+        assert!(paths.contains_key("/admin/inspection-plans"));
+        assert!(paths.contains_key("/admin/inspection-plans/{id}"));
+        assert!(paths.contains_key("/admin/inspection-plans/{id}/run"));
+        assert!(paths.contains_key("/admin/inspection-runs"));
+        assert!(paths.contains_key("/admin/tickets/export"));
+        assert!(paths.contains_key("/admin/tickets/stream"));
+        assert!(paths.contains_key("/admin/ticket-rules"));
+        assert!(paths.contains_key("/admin/ticket-rules/{id}"));
+        // ---- 排课全局模型（路径 2 Phase A）----
+        for path in [
+            "/admin/terms",
+            "/admin/terms/{id}",
+            "/admin/teachers",
+            "/admin/teachers/{id}",
+            "/admin/classes",
+            "/admin/classes/{id}",
+            "/admin/courses",
+            "/admin/courses/{id}",
+            "/admin/schedule-plans",
+            "/admin/schedule-plans/{id}",
+            "/admin/schedule-plans/{id}/clone",
+            "/admin/schedule-plans/{id}/entries",
+            "/admin/schedule-plans/{id}/publish",
+        ] {
+            assert!(paths.contains_key(path), "缺少路径：{path}");
+        }
+        let schemas = spec["components"]["schemas"].as_object().expect("schemas");
+        for name in [
+            "Ticket",
+            "TicketPage",
+            "TicketDetail",
+            "TicketEvent",
+            "TicketContext",
+            "TicketSummary",
+            "TicketStats",
+            "TicketAssignee",
+            "CreateTicketRequest",
+            "UpdateTicketRequest",
+            "AssignTicketRequest",
+            "TransitionTicketRequest",
+            "CommentTicketRequest",
+            "TicketRule",
+            "TicketRuleList",
+            "CreateTicketRuleRequest",
+            "UpdateTicketRuleRequest",
+            "TicketStreamEvent",
+            "TicketScopeUser",
+            "UpdateTicketScopesRequest",
+            "TicketAttachment",
+            "AttachmentPresignRequest",
+            "AttachmentPresignReply",
+            "AttachmentRegisterRequest",
+            "InspectionScopeType",
+            "InspectionRunStatus",
+            "InspectionPlan",
+            "InspectionPlanView",
+            "InspectionLastRun",
+            "CreateInspectionPlanRequest",
+            "UpdateInspectionPlanRequest",
+            "InspectionRun",
+        ] {
+            assert!(schemas.contains_key(name), "缺少 schema：{name}");
+        }
+        // Phase A：主数据视图 / 计划 / 条目 / 发布结果与请求体。
+        for name in [
+            "TermView",
+            "TeacherView",
+            "ClassView",
+            "CourseView",
+            "PlanStatus",
+            "SchedulePlan",
+            "PlanEntry",
+            "PlanEntryInput",
+            "PlanDetailResponse",
+            "PublishResultResponse",
+            "TermPage",
+            "TeacherPage",
+            "ClassPage",
+            "CoursePage",
+            "SchedulePlanPage",
+            "CreateTermRequest",
+            "UpdateTermRequest",
+            "CreateTeacherRequest",
+            "UpdateTeacherRequest",
+            "CreateClassRequest",
+            "UpdateClassRequest",
+            "CreateCourseRequest",
+            "UpdateCourseRequest",
+            "CreateSchedulePlanRequest",
+            "UpdateSchedulePlanRequest",
+            "ReplacePlanEntriesRequest",
+        ] {
+            assert!(schemas.contains_key(name), "缺少 schema：{name}");
+        }
+        // Wave 2：根因字段进入 Ticket/Transition 契约。
+        assert!(
+            schemas["Ticket"]["required"]
+                .as_array()
+                .expect("Ticket.required")
+                .iter()
+                .any(|value| value == "root_cause")
+        );
+        assert!(
+            schemas["Ticket"]["properties"]["root_cause"]["oneOf"]
+                .as_array()
+                .expect("root_cause")
+                .iter()
+                .any(|value| value["enum"]
+                    .as_array()
+                    .is_some_and(|values| values.iter().any(|item| item == "hardware")))
+        );
+        assert!(
+            schemas["TransitionTicketRequest"]["properties"]
+                .get("root_cause")
+                .is_some()
+        );
+        // PATCH 内容修改新增的时间线事件类型。
+        assert!(
+            schemas["TicketEventKind"]["enum"]
+                .as_array()
+                .expect("TicketEventKind enum")
+                .iter()
+                .any(|value| value == "updated")
+        );
+        // 详情契约：ticket + events + context。
+        let detail = &schemas["TicketDetail"]["required"];
+        assert!(
+            detail
+                .as_array()
+                .expect("required")
+                .iter()
+                .any(|v| v == "context")
+        );
         assert!(
             spec["tags"]
                 .as_array()
                 .expect("tags")
                 .iter()
                 .any(|tag| tag["name"] == "Schedules")
+        );
+        assert!(
+            spec["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .any(|tag| tag["name"] == "ScheduleBoard")
         );
         assert!(
             spec["tags"]
@@ -2543,6 +4548,30 @@ mod tests {
                 .iter()
                 .any(|tag| tag["name"] == "DeviceEvents")
         );
+        assert!(
+            spec["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .any(|tag| tag["name"] == "Tickets")
+        );
+        assert!(
+            spec["tags"]
+                .as_array()
+                .expect("tags")
+                .iter()
+                .any(|tag| tag["name"] == "TicketInspections")
+        );
+        for tag in ["Terms", "Teachers", "Classes", "Courses", "SchedulePlans"] {
+            assert!(
+                spec["tags"]
+                    .as_array()
+                    .expect("tags")
+                    .iter()
+                    .any(|t| t["name"] == tag),
+                "缺少 tag：{tag}"
+            );
+        }
         assert_eq!(
             spec["components"]["securitySchemes"]["bearerAuth"]["scheme"],
             "bearer"

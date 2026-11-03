@@ -12,8 +12,12 @@ pub async fn ensure_bootstrap_admin(state: &AppState) -> AppResult<()> {
     let granted = state.roles.grant_all_permissions_to_admin().await?;
     if granted > 0 {
         tracing::info!(granted, "已为系统管理员角色补充新权限");
-        authorization::bump_permission_version(state).await;
     }
+    // 迁移（如 0018_tickets.sql）里已经给 admin 全量授权时 `granted == 0`，
+    // 但其它副本/旧进程可能仍持有 5 分钟 TTL 的旧权限缓存（比如只有 21 项权限），
+    // 新权限会在缓存过期前一直 403。这里每次进程启动都 bump 一次权限代际，
+    // 让新权限立即生效；多副本滚动部署时每个副本各失效一次，代价可接受。
+    authorization::bump_permission_version(state).await;
 
     let Some(username) = state.config.bootstrap_admin_username.clone() else {
         return Ok(());

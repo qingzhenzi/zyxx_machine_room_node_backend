@@ -170,6 +170,34 @@ impl StorageService {
     }
 
     /// 服务端读取：内部用预签名 GET + reqwest，返回完整字节（上限 64 MiB）。
+    /// 删除对象（S3 DELETE，预签名）。对象不存在按成功处理（幂等）。
+    pub async fn delete_object(&self, object_key: &str) -> Result<()> {
+        let presigned = self.presign("DELETE", object_key, Utc::now())?;
+        let response = self
+            .client
+            .delete(&presigned.url)
+            .send()
+            .await
+            .map_err(|error| transport_error("删除 S3 对象失败", object_key, error))?;
+        let status = response.status();
+        if !status.is_success() && status.as_u16() != 404 {
+            bail!("删除 S3 对象失败：{object_key}（HTTP {}）", status.as_u16());
+        }
+        Ok(())
+    }
+
+    /// 对象是否存在（预签名 GET + HEAD）。仅用于登记附件时做一次低成本校验。
+    pub async fn object_exists(&self, object_key: &str) -> Result<bool> {
+        let presigned = self.presign_get(object_key)?;
+        let response = self
+            .client
+            .head(&presigned.url)
+            .send()
+            .await
+            .map_err(|error| transport_error("检查 S3 对象失败", object_key, error))?;
+        Ok(response.status().is_success())
+    }
+
     pub async fn get_bytes(&self, object_key: &str) -> Result<Vec<u8>> {
         let presigned = self.presign_get(object_key)?;
         let mut response = self

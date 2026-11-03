@@ -15,8 +15,14 @@ pub mod presence;
 pub mod roles;
 pub mod rows;
 pub mod schedule;
+pub mod schedule_plan;
 pub mod security;
 pub mod storage;
+pub mod ticket_attachments;
+pub mod ticket_inspections;
+pub mod ticket_rules;
+pub mod ticket_scopes;
+pub mod tickets;
 pub mod users;
 
 pub use db::Db;

@@ -19,6 +19,13 @@
 | 资源 | 镜像 `/images`、`/images/:id` | 镜像制品、manifest、验证报告、发布通道、房间分配 |
 | | 存储 `/storage` | 对象预签名/登记、分发任务重试、收集登记 |
 | | 节点配置 `/agent-configs` | global → area → room 策略合并与二次下发 |
+| 运维 | 工单 `/tickets`、`/tickets/:id` | 工单列表/新建、状态流转（认领/解决/关闭/重开/取消）、时间线与评论、关联房间/设备/机器、历史分析入口；顶栏「我的待办工单」 |
+| | 工单分析 `/tickets/insights` | 近 7/30/90 天新增/解决/未关闭/MTTR/超时、纯 CSS 趋势与分类/房间/设备/处理人分布 |
+| | 自动规则 `/tickets/rules` | 自动建单规则配置：阈值、优先级、区域/房间范围、启停；规则变更最迟一个 tick 生效 |
+| | 可见范围 `/tickets/scopes` | 按用户配置工单可见区域（`ticket:scope:all` 不受限） |
+| | 巡检计划 `/tickets/inspections` | 周期巡检机器健康、立即执行、异常自动建单、运行历史 |
+| | 工单详情 P1 | 根因分类、附件上传/下载（≤20MiB）、工单设置；房间/设备/机器页「报修/建单」预填入口 |
+| | 工单实时/导出 | 列表页 SSE「实时」状态与增量刷新、导出 CSV；详情页「工单设置」转派/优先级/分类 |
 | 管理 | 用户 `/users` | 账号、启用状态、角色分配 |
 | | 角色 `/roles` | 自定义角色、权限点 |
 | | 审计 `/audit` | 管理操作日志与明细 |
@@ -33,6 +40,8 @@
 ![总览](docs/screenshots/overview.png)
 
 ![机器总览](docs/screenshots/machines.png)
+
+![工单](<../docs/design/ticket-implementation-list.png>)
 
 其余页面（区域总览、房间总览、设备、课表、事件、镜像、存储、用户、角色、审计、公告、节点配置、账户等）
 的截图见 [`docs/screenshots/`](docs/screenshots/)。

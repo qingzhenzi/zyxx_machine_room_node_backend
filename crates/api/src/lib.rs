@@ -1,4 +1,4 @@
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 pub mod api;
 pub mod auth;
@@ -9,6 +9,7 @@ pub mod error;
 pub mod presence;
 pub mod scheduler;
 pub mod state;
+pub mod ticket_worker;
 
 // qe-api 作为 HTTP/装配层依赖下层 crate，而不是反过来。
 pub use qe_cache as cache;
@@ -55,6 +56,21 @@ pub async fn run() -> anyhow::Result<()> {
         tracing::info!(tick_secs = config.schedule_tick_secs, "课表事件引擎已启动");
     } else {
         tracing::info!("课表事件引擎已禁用（SCHEDULE_ENGINE_ENABLED=false）");
+    }
+
+    // 工单自动建单 worker：规则见 ticket_worker.rs；首轮只建基线，不重放历史。
+    let ticket_worker_config = config.ticket_worker_config()?;
+    if ticket_worker_config.auto_enabled {
+        let _tickets = ticket_worker::spawn(state.clone(), ticket_worker_config.clone());
+        tracing::info!(
+            tick_secs = ticket_worker_config.tick_secs,
+            offline_minutes = ticket_worker_config.device_offline_minutes,
+            health_consecutive = ticket_worker_config.health_consecutive,
+            lookback_hours = ticket_worker_config.lookback_hours,
+            "工单自动建单 worker 已启动"
+        );
+    } else {
+        tracing::info!("工单自动建单 worker 已禁用（TICKETS_AUTO_ENABLED=false）");
     }
 
     if config.device_presence_enabled {

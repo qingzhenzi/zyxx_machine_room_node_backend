@@ -528,7 +528,7 @@ pub struct Config { /* ... */ pub storage: Option<StorageConfig> }
 
 ### 15.1 组成
 
-- 新 crate `crates/node-agent`（包名 `qe-node-agent`，独立二进制），依赖 `qe-device-pki-client`。
+- 新 crate `room_agent/qe-node-agent`（包名 `qe-node-agent`，独立二进制；原 `crates/node-agent`，2026-11-02 迁至 room_agent 项目），依赖 `qe-device-pki-client`。
 - device-pki 服务端（`crates/device-pki`）扩展：
   - 新增业务消息 kind（协议文档同步更新 `docs/device-pki-protocol.md`）；
   - mTLS listener 新增资源预签名端点（见 §15.3），只对已激活设备开放。
@@ -683,12 +683,12 @@ pub async fn enqueue_downlink_for_slot(&self, slot: &str, kind: &str, payload: &
   无槽位/无设备只记 `warn!`，transfer 保持 pending。响应仍为 assignment。
 - 集成测试扩展：房间绑定设备 + 插入 `device_enrollment/device_session` 后分配镜像，断言 `device_downlink.kind='image.pull'`。
 
-### 16.4 node-agent crate（`crates/node-agent`，包名 `qe-node-agent`）
+### 16.4 node-agent crate（`room_agent/qe-node-agent`，包名 `qe-node-agent`）
 
-目录（Lead 会建脚手架与 Cargo.toml）：
+目录（Lead 会建脚手架与 Cargo.toml；2026-11-02 起位于 room_agent 项目）：
 
 ```text
-crates/node-agent/
+room_agent/qe-node-agent/
   Cargo.toml
   src/main.rs          # 读 env、确认证书、订阅 image.pull、轮询下行
   src/lib.rs           # pub mod ...

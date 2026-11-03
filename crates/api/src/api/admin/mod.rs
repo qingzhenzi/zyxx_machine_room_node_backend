@@ -8,9 +8,16 @@ pub mod images;
 pub mod machines;
 pub mod roles;
 pub mod rooms;
+pub mod schedule_board;
 pub mod schedule_events;
+pub mod schedule_plans;
 pub mod schedules;
 pub mod storage;
+pub mod ticket_attachments;
+pub mod ticket_inspections;
+pub mod ticket_rules;
+pub mod ticket_scopes;
+pub mod tickets;
 pub mod users;
 
 use axum::{
@@ -77,6 +84,10 @@ pub fn router() -> Router<AppState> {
             get(schedule_events::list_event_rules).put(schedule_events::replace_event_rules),
         )
         .route("/schedules", get(schedules::list).post(schedules::create))
+        // 静态段 `/schedules/ensure` 必须先于 `/schedules/{id}` 的匹配语义注册：
+        // axum 的 matchit 会优先匹配静态段，这里按可读性放在同组。
+        .route("/schedules/ensure", post(schedule_board::ensure))
+        .route("/schedule-board", get(schedule_board::board))
         .route(
             "/schedules/{id}",
             get(schedules::get)
@@ -94,6 +105,69 @@ pub fn router() -> Router<AppState> {
         )
         .route("/schedules/{id}/occurrences", get(schedules::occurrences))
         .route("/schedules/{id}/rebuild", post(schedules::rebuild))
+        // ---- 排课全局模型（路径 2 Phase A）：主数据 + 排课计划 ----
+        .route(
+            "/terms",
+            get(schedule_plans::term_list).post(schedule_plans::term_create),
+        )
+        .route(
+            "/terms/{id}",
+            get(schedule_plans::term_get)
+                .patch(schedule_plans::term_update)
+                .delete(schedule_plans::term_delete),
+        )
+        .route(
+            "/teachers",
+            get(schedule_plans::teacher_list).post(schedule_plans::teacher_create),
+        )
+        .route(
+            "/teachers/{id}",
+            get(schedule_plans::teacher_get)
+                .patch(schedule_plans::teacher_update)
+                .delete(schedule_plans::teacher_delete),
+        )
+        .route(
+            "/classes",
+            get(schedule_plans::class_list).post(schedule_plans::class_create),
+        )
+        .route(
+            "/classes/{id}",
+            get(schedule_plans::class_get)
+                .patch(schedule_plans::class_update)
+                .delete(schedule_plans::class_delete),
+        )
+        .route(
+            "/courses",
+            get(schedule_plans::course_list).post(schedule_plans::course_create),
+        )
+        .route(
+            "/courses/{id}",
+            get(schedule_plans::course_get)
+                .patch(schedule_plans::course_update)
+                .delete(schedule_plans::course_delete),
+        )
+        .route(
+            "/schedule-plans",
+            get(schedule_plans::plan_list).post(schedule_plans::plan_create),
+        )
+        .route(
+            "/schedule-plans/{id}",
+            get(schedule_plans::plan_get)
+                .patch(schedule_plans::plan_update)
+                .delete(schedule_plans::plan_delete),
+        )
+        .route(
+            "/schedule-plans/{id}/clone",
+            post(schedule_plans::plan_clone),
+        )
+        .route(
+            "/schedule-plans/{id}/entries",
+            get(schedule_plans::plan_entries).put(schedule_plans::plan_replace_entries),
+        )
+        .route(
+            "/schedule-plans/{id}/publish",
+            post(schedule_plans::plan_publish),
+        )
         .route("/schedule-events", get(schedule_events::list_events))
         .route("/schedule-events/{id}", get(schedule_events::get_event))
         .route(
@@ -142,6 +216,64 @@ pub fn router() -> Router<AppState> {
             "/device-presence-deliveries",
             get(device_events::list_deliveries),
         )
+        // ---- 工单（P0）----
+        // 静态段必须在 /tickets/{id} 之前注册（axum matchit 静态优先，这里保持可读顺序）。
+        .route("/tickets", get(tickets::list).post(tickets::create))
+        .route("/tickets/summary", get(tickets::summary))
+        .route("/tickets/stats", get(tickets::stats))
+        .route("/tickets/assignees", get(tickets::assignees))
+        .route("/tickets/export", get(tickets::export))
+        .route("/tickets/stream", get(tickets::stream))
+        .route("/tickets/{id}", get(tickets::get).patch(tickets::update))
+        .route("/tickets/{id}/claim", post(tickets::claim))
+        .route("/tickets/{id}/assign", post(tickets::assign))
+        .route("/tickets/{id}/transition", post(tickets::transition))
+        .route("/tickets/{id}/comments", post(tickets::comments))
+        // ---- 工单自动规则（P1）----
+        .route(
+            "/ticket-rules",
+            get(ticket_rules::list).post(ticket_rules::create),
+        )
+        .route(
+            "/ticket-rules/{id}",
+            patch_route(ticket_rules::update).delete(ticket_rules::delete),
+        )
+        // ---- 工单数据范围（P1 Wave2）----
+        .route("/ticket-scopes", get(ticket_scopes::list))
+        .route("/ticket-scopes/areas", get(ticket_scopes::areas))
+        .route("/ticket-scopes/{user_id}", put(ticket_scopes::replace))
+        // ---- 工单附件（P1 Wave2）----
+        .route(
+            "/tickets/{id}/attachments",
+            get(ticket_attachments::list).post(ticket_attachments::register),
+        )
+        .route(
+            "/tickets/{id}/attachments/upload",
+            post(ticket_attachments::upload),
+        )
+        .route(
+            "/tickets/{id}/attachments/presign",
+            post(ticket_attachments::presign),
+        )
+        .route(
+            "/tickets/{id}/attachments/{attachment_id}/download",
+            get(ticket_attachments::download),
+        )
+        .route(
+            "/tickets/{id}/attachments/{attachment_id}",
+            delete_route(ticket_attachments::delete),
+        )
+        // ---- 巡检计划（Wave 3）----
+        .route(
+            "/inspection-plans",
+            get(ticket_inspections::list).post(ticket_inspections::create),
+        )
+        .route(
+            "/inspection-plans/{id}",
+            patch_route(ticket_inspections::update).delete(ticket_inspections::delete),
+        )
+        .route("/inspection-plans/{id}/run", post(ticket_inspections::run))
+        .route("/inspection-runs", get(ticket_inspections::runs))
 }
 
 /// 反序列化 `Option<Option<T>>`：区分“字段缺失”（`None`）与显式 `null`（`Some(None)`）。

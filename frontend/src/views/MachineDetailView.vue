@@ -23,11 +23,33 @@ import UsageBar from '@/features/machines/UsageBar.vue'
 import { healthScoreClass, machineHealthMeta } from '@/features/machines/machineMeta'
 import { parseMachinePayload } from '@/features/machines/payload'
 import { useMachineStream } from '@/features/machines/useMachineStream'
+import { useAuthStore } from '@/stores/auth'
 import { errorMessage } from '@/utils/errors'
 import { formatFullDateTime, formatRelative, formatSeconds } from '@/utils/format'
+import { PERMISSIONS } from '@/utils/permissions'
 
+const auth = useAuthStore()
 const route = useRoute()
 const router = useRouter()
+
+const canCreateTicket = computed(() => auth.can(PERMISSIONS.ticketCreate))
+
+/** P1 Wave 2 报修入口：带上机器 serial / 槽位 / 房间。 */
+function reportIssue() {
+  const current = detail.value
+  const serialValue = detail.value?.serial || serial.value
+  if (!serialValue) return
+  void router.push({
+    name: 'tickets',
+    query: {
+      new: '1',
+      serial: serialValue,
+      ...(current?.device_slot ? { device_slot: current.device_slot } : {}),
+      ...(current?.room_id ? { room_id: current.room_id } : {}),
+      title: `机器报修：${report.value?.hostname || current?.device_slot || serialValue}`,
+    },
+  })
+}
 
 const detail = ref<MachineDetail | null>(null)
 const loading = ref(false)
@@ -250,6 +272,9 @@ onMounted(() => void load())
           </template>
         </template>
         <template #actions>
+          <AppButton v-if="canCreateTicket" icon="ticket" @click="reportIssue">
+            报修 / 建单
+          </AppButton>
           <StateBadge
             :label="streamMeta.label"
             :tone="streamMeta.tone"

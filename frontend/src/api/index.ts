@@ -1,17 +1,56 @@
 import axios, { type AxiosResponse, type InternalAxiosRequestConfig } from 'axios'
 
 import type {
+  PlanDetail,
+  PlanEntry,
+  PlanListParams,
+  PlanPage,
+  PlanView,
+  PublishResult,
+  Term,
+  TermInput,
+  TermListParams,
+  TermPage,
+  Course,
+  CourseInput,
+  MasterListParams,
+  MasterPage,
+  Teacher,
+  TeacherInput,
+  SchoolClass,
+  ClassInput,
+  NewPlanEntry,
+  CreatePlanRequest,
+  UpdatePlanRequest,
+} from '@/features/schedulePlans/types'
+import { normalizePlanDetail } from '@/features/schedulePlans/types'
+import type {
+  BoardPayload,
+  BoardQuery,
+  EnsureSchedulesReply,
+  EnsureSchedulesRequest,
+} from '@/features/scheduleBoard/boardTypes'
+
+import type {
   Announcement,
+  AttachmentPresignReply,
+  AttachmentPresignRequest,
+  AttachmentRegisterRequest,
   AnnouncementInput,
   Area,
   AssignImageRequest,
+  AssignTicketRequest,
   AuditLogPage,
   CollectionPage,
+  CommentTicketRequest,
   CreateAreaRequest,
   CreateImageRequest,
+  CreateInspectionPlanRequest,
   CreateRoleRequest,
   CreateRoomRequest,
   CreateScheduleRequest,
+  CreateTicketRequest,
+  CreateTicketRuleRequest,
   CreateUserRequest,
   DeviceInfo,
   DevicePage,
@@ -27,6 +66,8 @@ import type {
   ImageAssignment,
   ImageDetail,
   ImagePage,
+  InspectionPlanView,
+  InspectionRun,
   ManifestReply,
   NewEventRule,
   NewWeeklySlot,
@@ -41,6 +82,7 @@ import type {
   ReplayResult,
   RoleSummary,
   Room,
+  ScopeAreaOption,
   RoomDevice,
   RoomMachine,
   RoomPage,
@@ -56,14 +98,31 @@ import type {
   StorageObjectRequest,
   SubmitManifestReply,
   SubmitManifestRequest,
+  Ticket,
+  TicketAssignee,
+  TicketAttachment,
+  TicketDetail,
+  TicketEvent,
+  TicketPage,
+  TicketRule,
+  TicketRuleList,
+  TicketScopeUser,
+  TicketStats,
+  TicketStreamEvent,
+  TicketSummary,
   TokenResponse,
   Transfer,
   TransferPage,
+  TransitionTicketRequest,
   UpdateAgentConfigReply,
   UpdateAgentConfigRequest,
   UpdateAreaRequest,
+  UpdateInspectionPlanRequest,
   UpdateRoomRequest,
   UpdateScheduleRequest,
+  UpdateTicketRequest,
+  UpdateTicketRuleRequest,
+  UpdateTicketScopesRequest,
   UpdateUserRequest,
   UpsertExceptionRequest,
   UserPage,
@@ -100,6 +159,9 @@ import type {
   ScheduleEventListParams,
   ScheduleListParams,
   SearchResults,
+  TicketEventStreamOptions,
+  TicketListParams,
+  TicketStatsParams,
   TransferListParams,
   UserListParams,
 } from './types'
@@ -348,6 +410,14 @@ export const api = {
   listSchedules: (params: ScheduleListParams = {}) =>
     unwrap<SchedulePage>(http.get('/admin/schedules', { params })),
 
+  /** 排课工作台聚合读模型：一次拿到区域/房间/课表/周模板/单日覆盖。 */
+  scheduleBoard: (params: BoardQuery) =>
+    unwrap<BoardPayload>(http.get('/admin/schedule-board', { params })),
+
+  /** 幂等为房间补默认课表（工作台在无课表房间新建课程前调用）。 */
+  ensureSchedules: (input: EnsureSchedulesRequest) =>
+    unwrap<EnsureSchedulesReply>(http.post('/admin/schedules/ensure', input)),
+
   getSchedule: (id: string) =>
     unwrap<Schedule>(http.get(`/admin/schedules/${encodeURIComponent(id)}`)),
 
@@ -393,6 +463,82 @@ export const api = {
 
   rebuildSchedule: (id: string) =>
     unwrap<RebuildResult>(http.post(`/admin/schedules/${encodeURIComponent(id)}/rebuild`)),
+
+  // ---- 排课计划（Phase A：学期 / 主数据 / 计划 / 发布）----
+  listTerms: (params: TermListParams = {}) =>
+    unwrap<TermPage>(http.get('/admin/terms', { params })),
+
+  createTerm: (input: TermInput) => unwrap<Term>(http.post('/admin/terms', input)),
+
+  updateTerm: (id: string, input: Partial<TermInput>) =>
+    unwrap<Term>(http.patch(`/admin/terms/${encodeURIComponent(id)}`, input)),
+
+  deleteTerm: (id: string) => unwrap<void>(http.delete(`/admin/terms/${encodeURIComponent(id)}`)),
+
+  listTeachers: (params: MasterListParams = {}) =>
+    unwrap<MasterPage<Teacher>>(http.get('/admin/teachers', { params })),
+
+  createTeacher: (input: TeacherInput) => unwrap<Teacher>(http.post('/admin/teachers', input)),
+
+  updateTeacher: (id: string, input: Partial<TeacherInput>) =>
+    unwrap<Teacher>(http.patch(`/admin/teachers/${encodeURIComponent(id)}`, input)),
+
+  deleteTeacher: (id: string) =>
+    unwrap<void>(http.delete(`/admin/teachers/${encodeURIComponent(id)}`)),
+
+  listClasses: (params: MasterListParams = {}) =>
+    unwrap<MasterPage<SchoolClass>>(http.get('/admin/classes', { params })),
+
+  createClass: (input: ClassInput) => unwrap<SchoolClass>(http.post('/admin/classes', input)),
+
+  updateClass: (id: string, input: Partial<ClassInput>) =>
+    unwrap<SchoolClass>(http.patch(`/admin/classes/${encodeURIComponent(id)}`, input)),
+
+  deleteClass: (id: string) =>
+    unwrap<void>(http.delete(`/admin/classes/${encodeURIComponent(id)}`)),
+
+  listCourses: (params: MasterListParams = {}) =>
+    unwrap<MasterPage<Course>>(http.get('/admin/courses', { params })),
+
+  createCourse: (input: CourseInput) => unwrap<Course>(http.post('/admin/courses', input)),
+
+  updateCourse: (id: string, input: Partial<CourseInput>) =>
+    unwrap<Course>(http.patch(`/admin/courses/${encodeURIComponent(id)}`, input)),
+
+  deleteCourse: (id: string) =>
+    unwrap<void>(http.delete(`/admin/courses/${encodeURIComponent(id)}`)),
+
+  listSchedulePlans: (params: PlanListParams = {}) =>
+    unwrap<PlanPage>(http.get('/admin/schedule-plans', { params })),
+
+  /** 计划详情（计划 + 条目）；兼容 `{plan,entries}` 与扁平返回。 */
+  getSchedulePlan: async (id: string): Promise<PlanDetail> =>
+    normalizePlanDetail(
+      await unwrap<unknown>(http.get(`/admin/schedule-plans/${encodeURIComponent(id)}`)),
+    ),
+
+  createSchedulePlan: (input: CreatePlanRequest) =>
+    unwrap<PlanView>(http.post('/admin/schedule-plans', input)),
+
+  updateSchedulePlan: (id: string, input: UpdatePlanRequest) =>
+    unwrap<PlanView>(http.patch(`/admin/schedule-plans/${encodeURIComponent(id)}`, input)),
+
+  deleteSchedulePlan: (id: string) =>
+    unwrap<void>(http.delete(`/admin/schedule-plans/${encodeURIComponent(id)}`)),
+
+  cloneSchedulePlan: (id: string) =>
+    unwrap<PlanView>(http.post(`/admin/schedule-plans/${encodeURIComponent(id)}/clone`)),
+
+  schedulePlanEntries: (id: string) =>
+    unwrap<PlanEntry[]>(http.get(`/admin/schedule-plans/${encodeURIComponent(id)}/entries`)),
+
+  replaceSchedulePlanEntries: (id: string, entries: NewPlanEntry[]) =>
+    unwrap<PlanEntry[]>(
+      http.put(`/admin/schedule-plans/${encodeURIComponent(id)}/entries`, { entries }),
+    ),
+
+  publishSchedulePlan: (id: string) =>
+    unwrap<PublishResult>(http.post(`/admin/schedule-plans/${encodeURIComponent(id)}/publish`)),
 
   // ---- 课表事件 / 触发规则 ----
   listScheduleEvents: (params: ScheduleEventListParams = {}) =>
@@ -556,6 +702,128 @@ export const api = {
     unwrap<EffectiveAgentPolicyReply>(
       http.get('/admin/agent-configs/effective', { params: { room_id: roomId } }),
     ),
+
+  // ---- 工单 ----
+  listTickets: (params: TicketListParams = {}) =>
+    unwrap<TicketPage>(http.get('/admin/tickets', { params })),
+
+  ticketSummary: () => unwrap<TicketSummary>(http.get('/admin/tickets/summary')),
+
+  ticketStats: (params: TicketStatsParams = {}) =>
+    unwrap<TicketStats>(http.get('/admin/tickets/stats', { params })),
+
+  ticketAssignees: () => unwrap<TicketAssignee[]>(http.get('/admin/tickets/assignees')),
+
+  getTicket: (id: string) =>
+    unwrap<TicketDetail>(http.get(`/admin/tickets/${encodeURIComponent(id)}`)),
+
+  createTicket: (input: CreateTicketRequest) => unwrap<Ticket>(http.post('/admin/tickets', input)),
+
+  updateTicket: (id: string, input: UpdateTicketRequest) =>
+    unwrap<Ticket>(http.patch(`/admin/tickets/${encodeURIComponent(id)}`, input)),
+
+  claimTicket: (id: string) =>
+    unwrap<Ticket>(http.post(`/admin/tickets/${encodeURIComponent(id)}/claim`)),
+
+  assignTicket: (id: string, input: AssignTicketRequest) =>
+    unwrap<Ticket>(http.post(`/admin/tickets/${encodeURIComponent(id)}/assign`, input)),
+
+  transitionTicket: (id: string, input: TransitionTicketRequest) =>
+    unwrap<Ticket>(http.post(`/admin/tickets/${encodeURIComponent(id)}/transition`, input)),
+
+  commentTicket: (id: string, input: CommentTicketRequest) =>
+    unwrap<TicketEvent>(http.post(`/admin/tickets/${encodeURIComponent(id)}/comments`, input)),
+
+  /** 导出 CSV（同列表筛选；返回 Blob，由页面生成下载）。 */
+  exportTickets: async (params: TicketListParams = {}) => {
+    const response = await http.get('/admin/tickets/export', { params, responseType: 'blob' })
+    return response.data as Blob
+  },
+
+  // ---- 工单自动规则 ----
+  listTicketRules: () => unwrap<TicketRuleList>(http.get('/admin/ticket-rules')),
+
+  createTicketRule: (input: CreateTicketRuleRequest) =>
+    unwrap<TicketRule>(http.post('/admin/ticket-rules', input)),
+
+  updateTicketRule: (id: string, input: UpdateTicketRuleRequest) =>
+    unwrap<TicketRule>(http.patch(`/admin/ticket-rules/${encodeURIComponent(id)}`, input)),
+
+  deleteTicketRule: (id: string) =>
+    unwrap<void>(http.delete(`/admin/ticket-rules/${encodeURIComponent(id)}`)),
+
+  // ---- 工单数据范围（P1 Wave2）----
+  listTicketScopes: () => unwrap<TicketScopeUser[]>(http.get('/admin/ticket-scopes')),
+
+  setTicketScopes: (userId: string, input: UpdateTicketScopesRequest) =>
+    unwrap<TicketScopeUser>(http.put(`/admin/ticket-scopes/${encodeURIComponent(userId)}`, input)),
+
+  // ---- 工单范围区域选项（不要求 area:read）----
+  listTicketScopeAreas: () => unwrap<ScopeAreaOption[]>(http.get('/admin/ticket-scopes/areas')),
+
+  // ---- 工单附件（P1 Wave2）----
+  listTicketAttachments: (ticketId: string) =>
+    unwrap<TicketAttachment[]>(
+      http.get(`/admin/tickets/${encodeURIComponent(ticketId)}/attachments`),
+    ),
+
+  /** 后端代理上传（同源，避免对象存储 CORS；≤20MiB）。 */
+  uploadTicketAttachment: (ticketId: string, file: File) => {
+    const contentType = file.type || 'application/octet-stream'
+    return unwrap<TicketAttachment>(
+      http.post(`/admin/tickets/${encodeURIComponent(ticketId)}/attachments/upload`, file, {
+        params: { filename: file.name, content_type: contentType },
+        headers: { 'Content-Type': contentType },
+        timeout: 120_000,
+      }),
+    )
+  },
+
+  presignTicketAttachment: (ticketId: string, input: AttachmentPresignRequest) =>
+    unwrap<AttachmentPresignReply>(
+      http.post(`/admin/tickets/${encodeURIComponent(ticketId)}/attachments/presign`, input),
+    ),
+
+  registerTicketAttachment: (ticketId: string, input: AttachmentRegisterRequest) =>
+    unwrap<TicketAttachment>(
+      http.post(`/admin/tickets/${encodeURIComponent(ticketId)}/attachments`, input),
+    ),
+
+  /** 后端代理下载附件（同源、Content-Disposition: attachment）。 */
+  downloadTicketAttachment: (ticketId: string, attachmentId: string) =>
+    unwrap<Blob>(
+      http.get(
+        `/admin/tickets/${encodeURIComponent(ticketId)}/attachments/${encodeURIComponent(attachmentId)}/download`,
+        { responseType: 'blob' },
+      ),
+    ),
+
+  deleteTicketAttachment: (ticketId: string, attachmentId: string) =>
+    unwrap<void>(
+      http.delete(
+        `/admin/tickets/${encodeURIComponent(ticketId)}/attachments/${encodeURIComponent(attachmentId)}`,
+      ),
+    ),
+
+  // ---- 巡检计划（P1 Wave3）----
+  listInspectionPlans: () => unwrap<InspectionPlanView[]>(http.get('/admin/inspection-plans')),
+
+  createInspectionPlan: (input: CreateInspectionPlanRequest) =>
+    unwrap<InspectionPlanView>(http.post('/admin/inspection-plans', input)),
+
+  updateInspectionPlan: (id: string, input: UpdateInspectionPlanRequest) =>
+    unwrap<InspectionPlanView>(
+      http.patch(`/admin/inspection-plans/${encodeURIComponent(id)}`, input),
+    ),
+
+  deleteInspectionPlan: (id: string) =>
+    unwrap<void>(http.delete(`/admin/inspection-plans/${encodeURIComponent(id)}`)),
+
+  runInspectionPlan: (id: string) =>
+    unwrap<InspectionRun>(http.post(`/admin/inspection-plans/${encodeURIComponent(id)}/run`)),
+
+  listInspectionRuns: (params?: { plan_id?: string; limit?: number }) =>
+    unwrap<InspectionRun[]>(http.get('/admin/inspection-runs', { params })),
 
   // ---- 全局搜索（命令面板）----
   search: async (keyword: string): Promise<SearchResults> => {
@@ -744,6 +1012,65 @@ function parseMachineSseChunk(chunk: string, options: MachineSnapshotStreamOptio
   if (eventName !== 'machine.snapshot') return
   try {
     options.onSnapshot(JSON.parse(dataLines.join('\n')) as MachineSnapshotPoint)
+  } catch {
+    // 忽略无法解析的帧
+  }
+}
+
+/** 工单事件 SSE 流（列表/详情实时刷新；浏览器 EventSource 不能带 Authorization）。 */
+export async function streamTicketEvents(options: TicketEventStreamOptions): Promise<void> {
+  const params = new URLSearchParams()
+  if (options.afterEventId != null) params.set('after_event_id', String(options.afterEventId))
+  const query = params.size ? `?${params.toString()}` : ''
+  const token = getAccessToken()
+
+  const response = await fetch(`${baseURL}/admin/tickets/stream${query}`, {
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      Accept: 'text/event-stream',
+    },
+    signal: options.signal,
+  })
+
+  if (!response.ok || !response.body) {
+    throw new ApiError('工单事件流连接失败', response.status)
+  }
+
+  options.onOpen?.()
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    let boundary = buffer.indexOf('\n\n')
+    while (boundary >= 0) {
+      const chunk = buffer.slice(0, boundary)
+      buffer = buffer.slice(boundary + 2)
+      boundary = buffer.indexOf('\n\n')
+      parseTicketSseChunk(chunk, options)
+    }
+  }
+}
+
+function parseTicketSseChunk(chunk: string, options: TicketEventStreamOptions) {
+  let eventName = 'message'
+  const dataLines: string[] = []
+  for (const line of chunk.split('\n')) {
+    if (line.startsWith('event:')) eventName = line.slice(6).trim()
+    else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+  }
+  if (eventName === 'heartbeat' || eventName === 'ready') {
+    options.onOpen?.()
+    options.onHeartbeat?.()
+    return
+  }
+  if (!dataLines.length || eventName !== 'ticket.event') return
+  try {
+    options.onEvent(JSON.parse(dataLines.join('\n')) as TicketStreamEvent)
   } catch {
     // 忽略无法解析的帧
   }

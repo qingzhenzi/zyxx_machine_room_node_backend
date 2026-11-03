@@ -70,6 +70,55 @@ impl EmailService {
         .await;
     }
 
+    fn ticket_link(&self, ticket_id: &str) -> String {
+        format!(
+            "{}/tickets/{}",
+            self.base_url.trim_end_matches('/'),
+            ticket_id
+        )
+    }
+
+    /// 工单转派通知（best-effort，收件人可为空由调用方判断）。
+    pub async fn send_ticket_assigned(
+        &self,
+        email: &str,
+        code: &str,
+        title: &str,
+        ticket_id: &str,
+    ) {
+        let link = self.ticket_link(ticket_id);
+        self.send(
+            email,
+            &format!("工单已转派给你：{code}"),
+            &format!(
+                "<p>你被指派处理工单 <strong>{code}</strong>。</p><p>标题：{title}</p><p><a href=\"{link}\">打开工单</a></p>"
+            ),
+            &link,
+        )
+        .await;
+    }
+
+    /// 工单超时提醒（best-effort）。
+    pub async fn send_ticket_overdue(
+        &self,
+        email: &str,
+        code: &str,
+        title: &str,
+        ticket_id: &str,
+        due_at: &str,
+    ) {
+        let link = self.ticket_link(ticket_id);
+        self.send(
+            email,
+            &format!("工单已超时：{code}"),
+            &format!(
+                "<p>工单 <strong>{code}</strong> 已超过时效（截止 {due_at}）仍未解决。</p><p>标题：{title}</p><p><a href=\"{link}\">打开工单</a></p>"
+            ),
+            &link,
+        )
+        .await;
+    }
+
     async fn send(&self, email: &str, subject: &str, html: &str, fallback_link: &str) {
         let Some(mailer) = &self.mailer else {
             // 日志里不默认输出令牌；本地调试时用 RUST_LOG=debug 查看。

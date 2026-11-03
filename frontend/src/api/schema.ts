@@ -26,6 +26,37 @@ export type ImageFormat = 'docker_archive' | 'oci_layout' | 'tar' | 'qcow2' | 'r
 
 export type ImageKind = 'docker' | 'oci' | 'lxc_rootfs' | 'vm_disk'
 
+export type InspectionRunStatus = 'running' | 'ok' | 'issues' | 'failed'
+
+export type InspectionScopeType = 'global' | 'area' | 'room'
+
+export type PlanStatus = 'draft' | 'published'
+
+export type TicketCategory =
+  | 'machine_health'
+  | 'device_offline'
+  | 'delivery_failed'
+  | 'distribution_failed'
+  | 'security'
+  | 'other'
+
+export type TicketEventKind =
+  | 'created'
+  | 'claimed'
+  | 'assigned'
+  | 'status_changed'
+  | 'priority_changed'
+  | 'commented'
+  | 'occurred'
+  | 'updated'
+  | 'reminded'
+
+export type TicketPriority = 'urgent' | 'high' | 'normal' | 'low'
+
+export type TicketSource = 'auto' | 'manual'
+
+export type TicketStatus = 'open' | 'in_progress' | 'resolved' | 'closed' | 'cancelled'
+
 export type TransferStatus = 'pending' | 'running' | 'completed' | 'failed' | 'expired'
 
 export interface AgentConfig {
@@ -110,6 +141,31 @@ export interface AssignImageRequest {
   channel?: ImageChannel
 }
 
+export interface AssignTicketRequest {
+  assignee_id: string | null
+}
+
+export interface AttachmentPresignReply {
+  expires_at: string
+  object_key: string
+  upload_url: string
+}
+
+export interface AttachmentPresignRequest {
+  content_type: string
+  filename: string
+  sha256: string
+  size: number
+}
+
+export interface AttachmentRegisterRequest {
+  content_type: string
+  filename: string
+  object_key: string
+  sha256: string
+  size: number
+}
+
 export interface AuditLog {
   action?: string
   actor_display_name?: string
@@ -128,6 +184,92 @@ export interface AuditLogPage {
   page?: number
   page_size?: number
   total?: number
+}
+
+export interface BoardArea {
+  code: string
+  id: string
+  name: string
+  timezone: string
+}
+
+export interface BoardDevice {
+  online: boolean | null
+  serial: string
+  status: 'pending' | 'issued' | 'active' | 'rejected' | 'revoked' | null
+}
+
+export interface BoardException {
+  exception_date: string
+  id: string
+  kind: 'cancel' | 'replace'
+  note: string
+  schedule_id: string
+  slots: BoardExceptionSlot[]
+}
+
+export interface BoardExceptionSlot {
+  course_name: string
+  end_time: string
+  id: string
+  note: string
+  room_id: string | null
+  start_time: string
+  teacher: string
+}
+
+export interface BoardRoom {
+  area_id: string
+  area_name: string
+  capacity: number
+  code: string
+  device: BoardDevice | null
+  device_slot: string | null
+  id: string
+  is_active: boolean
+  name: string
+  timezone: string
+}
+
+export interface BoardSchedule {
+  end_date: string
+  id: string
+  is_active: boolean
+  name: string
+  room_id: string
+  start_date: string
+  timezone: string
+}
+
+export interface BoardWeeklySlot {
+  course_name: string
+  day_of_week: number
+  end_time: string
+  id: string
+  note: string
+  room_id: string | null
+  schedule_id: string
+  start_time: string
+  teacher: string
+}
+
+export interface ClassPage {
+  items?: ClassView[]
+  page?: number
+  page_size?: number
+  total?: number
+}
+
+export interface ClassView {
+  code: string
+  created_at: string
+  grade: string
+  id: string
+  is_active: boolean
+  metadata: Record<string, unknown>
+  name: string
+  updated_at: string
+  usage: number
 }
 
 export interface Collection {
@@ -149,6 +291,29 @@ export interface CollectionPage {
   total?: number
 }
 
+export interface CommentTicketRequest {
+  body: string
+}
+
+export interface CoursePage {
+  items?: CourseView[]
+  page?: number
+  page_size?: number
+  total?: number
+}
+
+export interface CourseView {
+  code: string
+  color: string
+  created_at: string
+  id: string
+  is_active: boolean
+  metadata: Record<string, unknown>
+  name: string
+  updated_at: string
+  usage: number
+}
+
 export interface CreateAreaRequest {
   code: string
   description?: string
@@ -160,6 +325,22 @@ export interface CreateAreaRequest {
   webhook_url?: string | null
 }
 
+export interface CreateClassRequest {
+  code: string
+  grade?: string
+  is_active?: boolean
+  metadata?: Record<string, unknown>
+  name: string
+}
+
+export interface CreateCourseRequest {
+  code: string
+  color?: string
+  is_active?: boolean
+  metadata?: Record<string, unknown>
+  name: string
+}
+
 export interface CreateImageRequest {
   compression?: Compression
   format: ImageFormat
@@ -167,6 +348,14 @@ export interface CreateImageRequest {
   name: string
   platform: string
   version: string
+}
+
+export interface CreateInspectionPlanRequest {
+  enabled?: boolean
+  interval_hours?: number
+  name: string
+  scope_id?: string | null
+  scope_type?: InspectionScopeType
 }
 
 export interface CreateRoleRequest {
@@ -187,12 +376,61 @@ export interface CreateRoomRequest {
   webhook_url?: string | null
 }
 
+export interface CreateSchedulePlanRequest {
+  name: string
+  term_id: string
+}
+
 export interface CreateScheduleRequest {
   end_date: string
   is_active?: boolean
   name: string
   room_id: string
   start_date: string
+}
+
+export interface CreateTeacherRequest {
+  code: string
+  email?: string
+  is_active?: boolean
+  metadata?: Record<string, unknown>
+  name: string
+  phone?: string
+}
+
+export interface CreateTermRequest {
+  code: string
+  end_date: string
+  is_active?: boolean
+  name: string
+  start_date: string
+}
+
+export interface CreateTicketRequest {
+  area_id?: string | null
+  category?: TicketCategory
+  description?: string
+  device_slot?: string | null
+  priority?: TicketPriority
+  room_id?: string | null
+  serial?: string | null
+  title: string
+}
+
+export interface CreateTicketRuleRequest {
+  enabled?: boolean
+  name: string
+  priority?: TicketPriority
+  scope_id?: string | null
+  scope_type?: 'global' | 'area' | 'room'
+  signal_type:
+    | 'machine_health'
+    | 'device_offline'
+    | 'schedule_delivery'
+    | 'presence_delivery'
+    | 'transfer'
+    | 'image_verify'
+  thresholds?: Record<string, unknown>
 }
 
 export interface CreateUserRequest {
@@ -245,6 +483,18 @@ export interface EffectiveAgentPolicyReply {
   policy: AgentPolicy
   revision: number
   room_id: string
+}
+
+export interface EnsureSchedulesRequest {
+  end_date: string
+  name?: string
+  room_ids: string[]
+  start_date: string
+}
+
+export interface EnsureSchedulesResponse {
+  created: Schedule[]
+  existing: Schedule[]
 }
 
 export interface Error {
@@ -338,6 +588,45 @@ export interface ImageVerification {
   }
   verified_at?: string
   verified_by?: string
+}
+
+export interface InspectionLastRun {
+  issue_machines: number
+  started_at: string
+  status: InspectionRunStatus
+  ticket_id: string | null
+}
+
+export interface InspectionPlan {
+  created_at: string
+  created_by: string | null
+  created_by_name: string | null
+  enabled: boolean
+  id: string
+  interval_hours: number
+  last_run_at: string | null
+  name: string
+  next_run_at: string | null
+  scope_id: string | null
+  scope_type: InspectionScopeType
+  updated_at: string
+}
+
+export interface InspectionPlanView extends InspectionPlan {
+  last_run: InspectionLastRun | null
+}
+
+export interface InspectionRun {
+  checked_machines: number
+  error: string | null
+  finished_at: string | null
+  id: string
+  issue_machines: number
+  plan_id: string
+  started_at: string
+  status: InspectionRunStatus
+  summary: Record<string, unknown>
+  ticket_id: string | null
 }
 
 export interface LoginRequest {
@@ -567,6 +856,43 @@ export interface Permission {
   name?: string
 }
 
+export interface PlanDetailResponse {
+  entries: PlanEntry[]
+  plan: SchedulePlan
+}
+
+export interface PlanEntry {
+  area_id: string
+  area_name: string
+  class_id: string | null
+  class_name: string | null
+  course_code: string
+  course_id: string
+  course_name: string
+  day_of_week: number
+  end_time: string
+  id: string
+  note: string
+  plan_id: string
+  room_code: string
+  room_id: string
+  room_name: string
+  start_time: string
+  teacher_id: string | null
+  teacher_name: string | null
+}
+
+export interface PlanEntryInput {
+  class_id?: string | null
+  course_id: string
+  day_of_week: number
+  end_time: string
+  note?: string
+  room_id: string
+  start_time: string
+  teacher_id?: string | null
+}
+
 export interface PresenceDelivery {
   attempts: number
   event_id: number
@@ -611,6 +937,13 @@ export interface PublishImageRequest {
   channel: ImageChannel
 }
 
+export interface PublishResultResponse {
+  occurrences: number
+  plan: SchedulePlan
+  schedules_rebuilt: number
+  slots_written: number
+}
+
 export interface RebuildResult {
   occurrences?: number
 }
@@ -621,6 +954,10 @@ export interface RefreshRequest {
 
 export interface ReplaceEventRulesRequest {
   rules: NewEventRule[]
+}
+
+export interface ReplacePlanEntriesRequest {
+  entries: PlanEntryInput[]
 }
 
 export interface ReplaceWeeklySlotsRequest {
@@ -699,6 +1036,16 @@ export interface Schedule {
   updated_at: string
 }
 
+export interface ScheduleBoard {
+  areas: BoardArea[]
+  exceptions: BoardException[]
+  from: string
+  rooms: BoardRoom[]
+  schedules: BoardSchedule[]
+  to: string
+  weekly_slots: BoardWeeklySlot[]
+}
+
 export interface ScheduleEvent {
   created_at?: string
   event_key?: string
@@ -769,6 +1116,36 @@ export interface SchedulePage {
   total?: number
 }
 
+export interface SchedulePlan {
+  course_count: number
+  created_at: string
+  created_by: string | null
+  entry_count: number
+  id: string
+  name: string
+  published_at: string | null
+  published_by: string | null
+  room_count: number
+  status: PlanStatus
+  term_id: string
+  term_name: string
+  updated_at: string
+  version: number
+}
+
+export interface SchedulePlanPage {
+  items?: SchedulePlan[]
+  page?: number
+  page_size?: number
+  total?: number
+}
+
+export interface ScopeAreaOption {
+  code: string
+  id: string
+  name: string
+}
+
 export interface SetPermissionsRequest {
   permission_codes?: string[]
 }
@@ -812,6 +1189,250 @@ export interface SubmitManifestRequest {
   total_size: number
 }
 
+export interface TeacherPage {
+  items?: TeacherView[]
+  page?: number
+  page_size?: number
+  total?: number
+}
+
+export interface TeacherView {
+  code: string
+  created_at: string
+  email: string
+  id: string
+  is_active: boolean
+  metadata: Record<string, unknown>
+  name: string
+  phone: string
+  updated_at: string
+  usage: number
+}
+
+export interface TermPage {
+  items?: TermView[]
+  page?: number
+  page_size?: number
+  total?: number
+}
+
+export interface TermView {
+  code: string
+  created_at: string
+  end_date: string
+  id: string
+  is_active: boolean
+  name: string
+  start_date: string
+  updated_at: string
+  usage: number
+}
+
+export interface Ticket {
+  acknowledged_at: string | null
+  area_id: string | null
+  assignee_id: string | null
+  assignee_name: string | null
+  category: TicketCategory
+  closed_at: string | null
+  code: string
+  created_at: string
+  dedupe_key: string | null
+  description: string
+  device_slot: string | null
+  due_at: string | null
+  id: string
+  last_seen_at: string
+  metadata: Record<string, unknown>
+  occurrence_count: number
+  priority: TicketPriority
+  reporter_id: string | null
+  reporter_name: string | null
+  resolution: string | null
+  resolved_at: string | null
+  room_id: string | null
+  root_cause: 'hardware' | 'network' | 'software' | 'config' | 'usage' | 'other' | null
+  serial: string | null
+  source: TicketSource
+  source_id: string | null
+  source_type: string | null
+  status: TicketStatus
+  title: string
+  updated_at: string
+}
+
+export interface TicketAssignee {
+  display_name: string
+  id: string
+  roles: string[]
+}
+
+export interface TicketAssigneeStat {
+  active: number
+  assignee_id: string
+  avg_resolve_secs: number | null
+  display_name: string
+  resolved: number
+}
+
+export interface TicketAttachment {
+  content_type: string
+  created_at: string
+  download_url: string | null
+  filename: string
+  id: string
+  object_key: string
+  sha256: string
+  size: number
+  ticket_id: string
+  uploaded_by: string | null
+  uploaded_by_name: string | null
+}
+
+export interface TicketCategoryStat {
+  category: TicketCategory
+  count: number
+}
+
+export interface TicketContext {
+  area_id: string | null
+  area_name: string | null
+  collected_at: string | null
+  device_slot: string | null
+  health_score: number | null
+  health_status: 'ok' | 'warning' | 'critical' | null
+  online: boolean | null
+  room_code: string | null
+  room_id: string | null
+  room_name: string | null
+  serial: string | null
+}
+
+export interface TicketDayStat {
+  closed: number
+  created: number
+  date: string
+  resolved: number
+}
+
+export interface TicketDetail {
+  context: TicketContext
+  events: TicketEvent[]
+  ticket: Ticket
+}
+
+export interface TicketEvent {
+  actor_id: string | null
+  actor_name: string
+  created_at: string
+  from_status: TicketStatus | null
+  id: number
+  kind: TicketEventKind
+  note: string
+  payload: Record<string, unknown>
+  source_id: string | null
+  source_type: string | null
+  ticket_id: string
+  to_status: TicketStatus | null
+}
+
+export interface TicketPage {
+  items: Ticket[]
+  page: number
+  page_size: number
+  total: number
+}
+
+export interface TicketPriorityStat {
+  count: number
+  priority: TicketPriority
+}
+
+export interface TicketRule {
+  created_at: string
+  enabled: boolean
+  id: string
+  name: string
+  priority: TicketPriority
+  scope_id: string | null
+  scope_type: 'global' | 'area' | 'room'
+  signal_type:
+    | 'machine_health'
+    | 'device_offline'
+    | 'schedule_delivery'
+    | 'presence_delivery'
+    | 'transfer'
+    | 'image_verify'
+  thresholds: Record<string, unknown>
+  updated_at: string
+}
+
+export interface TicketRuleList {
+  items: TicketRule[]
+  total: number
+}
+
+export interface TicketScopeUser {
+  area_ids: string[]
+  display_name: string
+  roles: string[]
+  user_id: string
+}
+
+export interface TicketStats {
+  by_assignee: TicketAssigneeStat[]
+  by_category: TicketCategoryStat[]
+  by_day: TicketDayStat[]
+  by_priority: TicketPriorityStat[]
+  from: string
+  to: string
+  top_devices: TicketTopDevice[]
+  top_rooms: TicketTopRoom[]
+  totals: TicketStatsTotals
+}
+
+export interface TicketStatsTotals {
+  avg_resolve_secs: number | null
+  closed: number
+  created: number
+  median_resolve_secs: number | null
+  open_now: number
+  overdue: number
+  resolved: number
+}
+
+export interface TicketStreamEvent {
+  actor_id: string | null
+  actor_name: string
+  created_at: string
+  id: number
+  kind: TicketEventKind
+  note: string
+  payload: Record<string, unknown>
+  status: TicketStatus
+  ticket_code: string
+  ticket_id: string
+}
+
+export interface TicketSummary {
+  by_status: Record<string, unknown>
+  mine_active: number
+  overdue: number
+  unassigned: number
+}
+
+export interface TicketTopDevice {
+  count: number
+  device_slot: string | null
+  serial: string
+}
+
+export interface TicketTopRoom {
+  count: number
+  room_id: string
+  room_name: string
+}
+
 export interface TokenResponse {
   access_token: string
   expires_in: number
@@ -840,6 +1461,13 @@ export interface TransferPage {
   total?: number
 }
 
+export interface TransitionTicketRequest {
+  note?: string | null
+  resolution?: string | null
+  root_cause?: 'hardware' | 'network' | 'software' | 'config' | 'usage' | 'other' | null
+  to_status: TicketStatus
+}
+
 export interface UpdateAgentConfigReply {
   config: AgentConfig
   pushed_rooms: number
@@ -862,6 +1490,30 @@ export interface UpdateAreaRequest {
   webhook_url?: string | null
 }
 
+export interface UpdateClassRequest {
+  code?: string
+  grade?: string
+  is_active?: boolean
+  metadata?: Record<string, unknown> | null
+  name?: string
+}
+
+export interface UpdateCourseRequest {
+  code?: string
+  color?: string
+  is_active?: boolean
+  metadata?: Record<string, unknown> | null
+  name?: string
+}
+
+export interface UpdateInspectionPlanRequest {
+  enabled?: boolean
+  interval_hours?: number
+  name?: string
+  scope_id?: string | null
+  scope_type?: InspectionScopeType
+}
+
 export interface UpdateRoomRequest {
   area_id?: string
   capacity?: number
@@ -873,11 +1525,52 @@ export interface UpdateRoomRequest {
   webhook_url?: string | null
 }
 
+export interface UpdateSchedulePlanRequest {
+  name: string
+}
+
 export interface UpdateScheduleRequest {
   end_date?: string
   is_active?: boolean
   name?: string
   start_date?: string
+}
+
+export interface UpdateTeacherRequest {
+  code?: string
+  email?: string
+  is_active?: boolean
+  metadata?: Record<string, unknown> | null
+  name?: string
+  phone?: string
+}
+
+export interface UpdateTermRequest {
+  code?: string
+  end_date?: string
+  is_active?: boolean
+  name?: string
+  start_date?: string
+}
+
+export interface UpdateTicketRequest {
+  category?: TicketCategory
+  description?: string | null
+  priority?: TicketPriority
+  title?: string
+}
+
+export interface UpdateTicketRuleRequest {
+  enabled?: boolean
+  name?: string
+  priority?: TicketPriority
+  scope_id?: string | null
+  scope_type?: 'global' | 'area' | 'room'
+  thresholds?: Record<string, unknown>
+}
+
+export interface UpdateTicketScopesRequest {
+  area_ids: string[]
 }
 
 export interface UpdateUserRequest {

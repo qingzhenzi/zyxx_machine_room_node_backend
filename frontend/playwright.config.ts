@@ -24,7 +24,8 @@ export default defineConfig({
   /* Fail the build on CI if you accidentally left test.only in the source code. */
   forbidOnly: !!process.env.CI,
   /* Retry on CI only */
-  retries: process.env.CI ? 2 : 0,
+  // 本地长时间运行的 Vite dev server 偶发冷编译超时，给 1 次重试；CI 仍为 2。
+  retries: process.env.CI ? 2 : 1,
   /* Opt out of parallel tests on CI. */
   workers: process.env.CI ? 1 : undefined,
   /* Reporter to use. See https://playwright.dev/docs/test-reporters */
@@ -34,13 +35,15 @@ export default defineConfig({
     /* Maximum time each action such as `click()` can take. Defaults to 0 (no limit). */
     actionTimeout: 0,
     /* Base URL to use in actions like `await page.goto('/')`. */
-    baseURL: process.env.CI ? 'http://127.0.0.1:4173' : 'http://127.0.0.1:5174',
+    baseURL:
+      process.env.E2E_BASE_URL ||
+      (process.env.CI ? 'http://127.0.0.1:4173' : 'http://127.0.0.1:5174'),
 
     /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
     trace: 'on-first-retry',
 
-    /* Only on CI systems run the tests headless */
-    headless: !!process.env.CI,
+    /* Only on CI systems run the tests headless (本地可用 E2E_HEADLESS=1 强制无头) */
+    headless: process.env.E2E_HEADLESS ? true : !!process.env.CI,
   },
 
   /* Configure projects for major browsers */
@@ -105,7 +108,9 @@ export default defineConfig({
      * Use the preview server on CI for more realistic testing.
      * Playwright will re-use the local server if there is already a dev-server running.
      */
-    command: process.env.CI ? './node_modules/.bin/vite preview --host 127.0.0.1 --port 4173' : './node_modules/.bin/vite --host 127.0.0.1 --port 5174',
+    command: process.env.CI
+      ? './node_modules/.bin/vite preview --host 127.0.0.1 --port 4173'
+      : './node_modules/.bin/vite --host 127.0.0.1 --port 5174',
     port: process.env.CI ? 4173 : 5174,
     reuseExistingServer: !process.env.CI,
   },

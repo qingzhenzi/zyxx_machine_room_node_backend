@@ -16,8 +16,14 @@ use crate::{
         presence::{PresenceEventRecord, PresenceRepo},
         roles::RoleRepo,
         schedule::{AreaRepo, EventRuleRepo, RoomRepo, ScheduleEventRepo, ScheduleRepo},
+        schedule_plan::{ClassRepo, CourseRepo, PlanRepo, TeacherRepo, TermRepo},
         security::SecurityRepo,
         storage::StorageRepo,
+        ticket_attachments::TicketAttachmentRepo,
+        ticket_inspections::TicketInspectionRepo,
+        ticket_rules::TicketRuleRepo,
+        ticket_scopes::TicketScopeRepo,
+        tickets::TicketRepo,
         users::UserRepo,
     },
 };
@@ -41,10 +47,26 @@ pub struct AppState {
     pub schedules: ScheduleRepo,
     pub event_rules: EventRuleRepo,
     pub schedule_events: ScheduleEventRepo,
+    // ---- 排课全局模型（路径 2 Phase A）：主数据 + 排课计划 ----
+    pub terms: TermRepo,
+    pub teachers: TeacherRepo,
+    pub classes: ClassRepo,
+    pub courses: CourseRepo,
+    pub schedule_plans: PlanRepo,
     // ---- 设备 ----
     pub devices: DeviceRepo,
     // ---- 机器遥测（room-agent 上报）----
     pub machines: MachineRepo,
+    // ---- 工单（P0：人工/自动建单、状态机、时间线、统计）----
+    pub tickets: TicketRepo,
+    /// 工单自动建单规则（P1：worker 每 tick 读取启用规则）。
+    pub ticket_rules: TicketRuleRepo,
+    /// 工单数据范围（Wave 2：按区域限制可见/可操作工单）。
+    pub ticket_scopes: TicketScopeRepo,
+    /// 工单附件元数据（对象本体在 S3）。
+    pub ticket_attachments: TicketAttachmentRepo,
+    /// 巡检计划与执行记录（Wave 3）。
+    pub ticket_inspections: TicketInspectionRepo,
     // ---- 设备在线事件与可靠投递（P3）----
     pub presence: PresenceRepo,
     /// 事件落库后的本地广播（SSE 实时推送；跨副本仍以查库为准）。
@@ -82,8 +104,18 @@ impl AppState {
             schedules: ScheduleRepo::new(db.pool().clone()),
             event_rules: EventRuleRepo::new(db.pool().clone()),
             schedule_events: ScheduleEventRepo::new(db.pool().clone()),
+            terms: TermRepo::new(db.pool().clone()),
+            teachers: TeacherRepo::new(db.pool().clone()),
+            classes: ClassRepo::new(db.pool().clone()),
+            courses: CourseRepo::new(db.pool().clone()),
+            schedule_plans: PlanRepo::new(db.pool().clone()),
             devices: DeviceRepo::new(db.pool().clone()),
             machines: MachineRepo::new(db.pool().clone()),
+            tickets: TicketRepo::new(db.pool().clone()),
+            ticket_rules: TicketRuleRepo::new(db.pool().clone()),
+            ticket_scopes: TicketScopeRepo::new(db.pool().clone()),
+            ticket_attachments: TicketAttachmentRepo::new(db.pool().clone()),
+            ticket_inspections: TicketInspectionRepo::new(db.pool().clone()),
             presence: PresenceRepo::new(db.pool().clone()),
             presence_events,
             agent_configs: AgentConfigRepo::new(db.pool().clone()),

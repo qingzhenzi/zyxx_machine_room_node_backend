@@ -10,6 +10,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+AGENT_ROOT="$(cd "$ROOT/../../room_agent" && pwd)"
 cd "$ROOT"
 
 DB_URL="${TEST_DATABASE_URL:-postgres://qestudio:qestudio@127.0.0.1:5432/qestudio_test}"
@@ -49,7 +50,8 @@ command -v python3 >/dev/null 2>&1 || fail "缺少 python3"
 psql "$DB_URL" -tAc 'select 1' >/dev/null 2>&1 || fail "连不上 PostgreSQL: $DB_URL（可先 scripts/test-integration.sh 准备）"
 
 log "构建 qe-device-pki / qe-agent"
-cargo build -q -p qe-device-pki -p qe-agent
+cargo build -q -p qe-device-pki
+cargo build -q --manifest-path "$AGENT_ROOT/Cargo.toml" -p qe-agent
 
 log "生成临时 CA 与服务端证书"
 cargo run -q -p qe-device-pki --example gen_test_ca -- "$TMP_DIR/certs" >/dev/null
@@ -80,7 +82,7 @@ TOKEN_JSON="$(curl -sk -X POST "https://localhost:$ENROLL_PORT/admin/tokens" \
     -d "{\"kind\":\"auto\",\"slot\":\"$SLOT\",\"ttl_secs\":600}")"
 LINK="$(printf '%s' "$TOKEN_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["link"])')"
 DATA_DIR="$TMP_DIR/agent-data"
-./target/debug/qe-agent --data-dir "$DATA_DIR" enroll "$LINK" --trust >"$TMP_DIR/enroll.log" 2>&1 || fail "enroll 失败（见 $TMP_DIR/enroll.log）"
+"$AGENT_ROOT/target/debug/qe-agent" --data-dir "$DATA_DIR" enroll "$LINK" --trust >"$TMP_DIR/enroll.log" 2>&1 || fail "enroll 失败（见 $TMP_DIR/enroll.log）"
 SERIAL="$(python3 - "$DATA_DIR" <<'PY'
 import json, pathlib, sys
 meta = json.loads((pathlib.Path(sys.argv[1]) / "creds" / next((pathlib.Path(sys.argv[1]) / "creds").iterdir()).name / "meta.json").read_text())

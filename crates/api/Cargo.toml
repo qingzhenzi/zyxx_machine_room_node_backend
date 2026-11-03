@@ -15,6 +15,7 @@ chrono = { version = "0.4", features = ["serde"] }
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 dotenvy = "0.15"
 futures-util = "0.3"
+hex = "0.4"
 qe-auth = { path = "../auth" }
 qe-cache = { path = "../cache" }
 qe-db = { path = "../db" }
@@ -23,6 +24,7 @@ qe-storage = { path = "../storage" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = [
     "macros",
@@ -59,8 +61,6 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-sha2 = "0.10"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

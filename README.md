@@ -72,14 +72,15 @@
 │   ├── cache/                 # qe-cache：Redis 刷新令牌与权限缓存
 │   │   └── src/auth_ports.rs  # 实现 TokenStore / PermissionCache（Cache）
 │   ├── device-pki/            # qe-device-pki：设备注册、证书与 mTLS 通讯服务
-│   ├── device-pki-client/     # qe-device-pki-client：设备侧注册/凭证/传输
-│   ├── agent/                 # qe-agent：统一 agent 入口（enroll / run --role node|machine / status）
-│   ├── node-agent/            # qe-node-agent：镜像拉取/校验/导入库（统一入口的 node 角色）
-│   └── room-agent/            # qe-room-agent：机器遥测库（统一入口的 machine 角色）
 ├── migrations/
 ├── deploy/
 └── compose*.yaml / Dockerfile
 ```
+
+> **2026-11-02 调整**：agent 侧 crate 已迁出本仓库、归入 `room_agent` 项目（机器/客户端侧）：
+> `qe-agent`（统一 agent 入口）、`qe-node-agent`（镜像拉取/校验/导入库）、`qe-room-agent`（机器遥测库）、
+> `qe-device-pki-client`（设备侧注册/凭证/传输）。本仓库只保留服务端：`qe-api` / `qe-auth` / `qe-domain` /
+> `qe-db` / `qe-cache` / `qe-storage` / `qe-device-pki`。构建 agent 见 `room_agent/Cargo.toml`。
 
 依赖方向：
 
@@ -121,7 +122,8 @@ qe-api ──► qe-db ──► qe-domain ──► qe-auth
 - 工作台总览：设备在线、房间、今日课表事件、镜像、最近事件/审计、系统健康
 - 区域 / 房间 / 设备：区域总览与房间总览、CRUD、设备槽位绑定与迁移、设备注册 token、在线状态
 - 机器总览：room-agent 上报的主机清单、健康评分、诊断结论、容器/虚拟机/安全核查与历史快照
-- 课表：周模板、单日覆盖、排课实例、手动重建；触发事件、投递重放/重试、房间触发规则
+- 课表：**排课工作台**（跨房间周网格 / 资源时间轴 / 编排矩阵，可视化新建、拖拽调课、冲突提示）、课表列表、
+  单房间周模板 / 单日覆盖 / 排课实例 / 手动重建；触发事件、投递重放/重试、房间触发规则
 - 镜像：manifest、验证、发布通道、房间分配；存储：对象预签名/登记、分发任务、收集登记
 - 节点配置（global → area → room）、用户/角色/权限、审计日志、公告、账户会话
 
@@ -324,6 +326,9 @@ audit:read
 
 课表能力按「区域 → 房间 → 课表 → 排课实例 → 触发规则 → 事件/投递」组织，当前只实现**房间节点**。
 设计契约见 [`docs/schedule-design.md`](docs/schedule-design.md)，数据库迁移为 `migrations/0009_schedule.sql`。
+管理端在 `/schedules` 提供**排课工作台**（跨全部房间可视化编排），实现契约见
+[`docs/design/schedule-board-implementation-contract.md`](docs/design/schedule-board-implementation-contract.md)，
+产品方案见 [`docs/schedule-board-redesign.md`](docs/schedule-board-redesign.md)。
 
 时间约定：所有具体时间点（实例 `start_at` / `end_at`、事件 `triggered_at`）一律以 **UTC** 存储并返回 RFC3339；
 展示时按**区域（area）的 IANA 时区**转换成本地时间。房间/课表继承区域时区，周模板与单日覆盖的 `TIME`
@@ -389,6 +394,8 @@ schedule_events（事件，event_key 唯一保证幂等）──< schedule_event
 | DELETE | `/rooms/{id}` | `room:manage` | 删除房间，级联课表、覆盖、实例与触发规则 |
 | GET | `/schedules?room_id=&page=&page_size=` | `schedule:read` | 课表分页 |
 | POST | `/schedules` | `schedule:manage` | 创建课表 |
+| GET | `/schedule-board?from=&to=&area_id=` | `schedule:read` | 排课工作台聚合读模型：一次返回区域/房间/课表/周模板/单日覆盖（`from`/`to` 必填，跨度 ≤62 天；`area_id` 只过滤房间） |
+| POST | `/schedules/ensure` | `schedule:manage` | 幂等为一批房间补默认课表（body `{room_ids,start_date,end_date,name?}`；已有交集课表则归入 `existing`）；写审计 `schedule.ensure` |
 | GET | `/schedules/{id}` | `schedule:read` | 课表详情 |
 | PATCH | `/schedules/{id}` | `schedule:manage` | 局部更新；成功后自动重建未来实例 |
 | DELETE | `/schedules/{id}` | `schedule:manage` | 删除课表并级联实例 |
@@ -412,12 +419,63 @@ schedule_events（事件，event_key 唯一保证幂等）──< schedule_event
 时区由所属区域继承。`TIME` 字段统一为 `"HH:MM"`（也接受 `"HH:MM:SS"`），日期为 `"YYYY-MM-DD"`。
 
 写操作成功后写审计日志，动作名：`area.create/update/delete`、`room.create/update/delete`、
-`schedule.create/update/delete`、`schedule.set_weekly_slots`、`schedule.set_exception`、
+`schedule.create/update/delete`、`schedule.ensure`、`schedule.set_weekly_slots`、`schedule.set_exception`、
 `schedule.delete_exception`、`room.set_event_rules`、`schedule_event.replay`、`schedule_event.retry`。
 
 `PATCH /schedules/{id}`、`PUT weekly-slots`、`PUT exception`、`DELETE exception` 在写成功后调用
 `rebuild_occurrences` 重建未来实例；重建在事务外进行，失败时写操作已提交、接口返回 500 并记录日志，
 可稍后用 `POST /schedules/{id}/rebuild` 或后台重建任务补齐。
+
+### 排课工作台（前端 `/schedules`）
+
+`/schedules` 是跨全部房间的排课工作台，三个视图共享同一份数据与筛选：
+
+- **周网格**（默认）：列 = 周一~周日，行 = 5 个固定节次；全部房间的课块聚合显示，超 3 个折叠 `+N`；
+  点击课块打开右侧检查器，点空白新建，课块可拖拽改星期/节次。
+- **资源时间轴**：行 = 房间（按区域分组），X = 08:00–21:00 单日视图；课块可拖拽跨房间/改时间（吸附 10 分钟）。
+- **编排矩阵**：行 = 房间，列 = 周一~周日 × 节次（横向滚动、房间列粘性）；点空格新建、拖拽换房间/跨天/跨节次。
+
+编辑语义分两种作用域：
+
+- **周模板（A/C 固定，B 可切换）**：写 `PUT /schedules/{id}/weekly-slots`（全量替换）+ 重建，影响课表整个生效区间；
+- **单日调整（B 默认「本次」）**：只影响当天，写 `PUT /schedules/{id}/exceptions/{date}`
+  （`cancel` 整天停课 / `replace` 当天完整时段），删除覆盖即恢复为周模板；B 视图拖拽、点空白新建、抽屉「本次停课」
+  「恢复本次」都走这条链路；跨房间单日移动会同时写源/目标两张课表的当天覆盖，恢复时两边一起还原。
+  过去日期不允许单日调整。
+
+房间没有课表时，前端会调用 `POST /schedules/ensure` 自动补一张「默认课表」。冲突在前端由
+`docs/design/schedule-board-implementation-contract.md` 约定的展开算法计算：同房间同时间 = 房间冲突（红），
+同教师跨房间同时间 = 教师冲突（琥珀）。旧列表页保留在 `/schedules/list`，单房间详情仍在 `/schedules/{id}`。
+
+所有写操作（模板编辑与单日调整）支持**撤销/重做**：工具栏撤销/重做按钮，或 `Ctrl/Cmd+Z`、
+`Ctrl/Cmd+Shift+Z`（`Ctrl/Cmd+Y`）；纯前端最多保留 50 步，撤销/重做按操作前快照恢复并刷新画布。
+
+C 编排矩阵支持**拖拽框选**多个格子（可跨房间/跨天/跨节次），框选后可用「批量应用课程」一次填充所选节次
+（可选仅填空格或覆盖已有课）或「批量清除」所选格子的课程；一次批量操作只记一条撤销历史。
+框选后也可**复制**（`Ctrl/Cmd+C`，或点击房间行头选中整周行），再点「粘贴」后点目标格按相对矩形粘贴
+（覆盖目标格同节次课程、越界跳过、确认前预览节数）；一次粘贴同样只记一条撤销历史。
+
+### 排课计划与主数据（Phase A）
+
+在「按房间维护课表」之上新增一层**全局排课模型**，页面入口 `/schedules/plans`（侧栏「排课计划」）：
+
+- **学期** `/admin/terms`：`code/name/start_date/end_date/is_active` 的增删改查；
+- **主数据** `/admin/teachers`、`/admin/classes`、`/admin/courses`：编码 + 名称（教师含手机/邮箱，班级含年级，
+  课程含颜色）+ `is_active/metadata` 的增删改查；被计划条目引用时删除返回 409；
+- **排课计划** `/admin/schedule-plans`：按学期创建草稿计划（`status=draft/published`、`version`、发布人/时间），
+  支持 `GET/PATCH/DELETE`、`POST /{id}/clone`（复制为新草稿）、`GET/PUT /{id}/entries`（条目全量替换）、
+  `POST /{id}/publish`；同一学期只允许一个已发布计划；
+- **条目**：房间 + 星期 + 起止时间 + 课程/教师/班级（+备注），同一房间同一天时段不得重叠。
+
+**发布语义（Phase A 桥接）**：发布时在一个事务里把计划条目写入 legacy 课表——按房间复用/创建
+`schedules`（`schedules.plan_id` 标记来源、名称=计划名、起止=学期），全量替换其 `schedule_weekly_slots`
+（课程名/教师名快照，班级本期不写入槽位），接管此前已发布计划或同房间历史 legacy 课表以免重复；
+提交后重建未来排课实例，因此事件引擎与 `/schedules` 工作台无需改动即可看到发布结果。
+同一学期再次发布会自动把旧计划降为草稿；已发布计划只读，可「克隆为新版本」继续编辑。
+
+> 注意：发布**覆盖**排课工作台对该学期课表的修改；单日调课仍走 legacy 工作台的 exception，
+> 下一次发布会覆盖。主数据/计划/发布接口已在 `openapi.rs` 注册（5 个 tag、13 条路径、26 个 schema），
+> 可重新生成 `frontend/docs/openapi.json` 与 `frontend/src/api/schema.ts`。
 
 ### 权限点
 
@@ -738,7 +796,7 @@ image:read      image:manage
 
 ### P1（已实现）
 
-- 节点 agent（独立 crate `crates/node-agent`）：复用 **device-pki 认证服务端 + 客户端**
+- 节点 agent（独立 crate `room_agent/qe-node-agent`）：复用 **device-pki 认证服务端 + 客户端**
   （`qe-device-pki-client` 的证书/mTLS/上下行），不新增认证体系；大文件仍走 S3 预签名直连。
 - device-pki 新增 mTLS 端点 `POST /resources/presign`（按设备证书身份签发 manifest/分片/签名 URL），
   以及上行 kind `transfer.progress` / `transfer.completed`（回写 `transfers` 与房间发布状态）。
@@ -748,7 +806,7 @@ image:read      image:manage
   - LXC/Incus：`incus image import`，plain LXC 解包 rootfs；
   - VM：`virsh vol-create-as/vol-upload` 到 libvirt storage pool。
 - 详见 [`docs/storage-design.md`](docs/storage-design.md) §15–§16 与
-  [`crates/node-agent/README.md`](crates/node-agent/README.md)。
+  [`room_agent/qe-node-agent/README.md`](../../room_agent/qe-node-agent/README.md)。
 
 P2 待做：zstd/gzip 压缩与解压校验、chunk 复用/增量、S3 Event 兜底、收集上传、配额/保留期/GC、
 `transfers`/`collections` 状态过滤、只读 Registry（Zot facade）、Trivy 扫描、真实 RustFS/Incus/libvirt 环境联调。
@@ -883,7 +941,7 @@ data: {}
 房间内的机器由 `qe-agent run --role machine`（旧二进制 `qe-room-agent` 仍可用）周期采集，
 **默认经 device-pki mTLS** 上报；控制台「机器总览」展示每台机器的实时健康、诊断与历史快照。
 契约见 [`docs/machine-telemetry.md`](docs/machine-telemetry.md)，入口见
-[`crates/agent/README.md`](crates/agent/README.md)。
+[`room_agent/qe-agent/README.md`](../../room_agent/qe-agent/README.md)。
 
 ```text
 qe-agent (machine) ──mTLS POST /machine/report──▶ device-pki ──▶ machine_snapshots (PG)
@@ -896,7 +954,7 @@ qe-agent (machine) ──mTLS POST /machine/report──▶ device-pki ──▶
   `REPORT_MODE=bearer` 只作过渡，保留 `MACHINE_API_BASE` + `MACHINE_AGENT_TOKEN` 旧路径；
   服务端未配置 token 时 Bearer 端点仍返回 503。**退场计划**：v0.2 删除旧
   `qe-node-agent`/`qe-room-agent` 二进制；设备全部迁 mTLS 后删除 Bearer 端点
-  （见 [`crates/agent/README.md`](crates/agent/README.md#退场时间表p4)）。
+  （见 [`room_agent/qe-agent/README.md`](../../room_agent/qe-agent/README.md#退场时间表p4)）。
 - **两档采集**：`fast`（内置指标，默认 10s，5..=60s）/ `full`（含外部工具，默认 300s，
   60..=3600s）。机器上报带 `tier`，落 `machine_snapshots.tier`；`--once` 发一份 full，
   `--print` 只打印 JSON。
@@ -911,12 +969,12 @@ qe-agent (machine) ──mTLS POST /machine/report──▶ device-pki ──▶
   机器详情的 `session_online` 保留 device-pki 原始会话状态用于排障。
 - 外部采集工具缺失时 agent 仍能上报内置指标，缺失/跳过项记录在 `sections.agent.tools`。
 - **桌面客户端（agent-client）**：Tauri GUI 默认隐藏、托盘常驻，通过本机 Unix socket IPC
-  读取 daemon 的状态/日志/注册，协议见 [`docs/agent-ipc.md`](docs/agent-ipc.md)；
-  代码在独立仓库 `~/Projects/QEStudio/agent-client`（从 client-app 模板改造）。
+  读取 daemon 的状态/日志/注册，协议见 [`room_agent/docs/agent-ipc.md`](../../room_agent/docs/agent-ipc.md)；
+  代码在 `room_agent/agent-client`（从 client-app 模板改造）。
 
 ```bash
-# 构建统一入口
-cargo build -p qe-agent
+# 构建统一入口（agent 侧 crate 已迁至 room_agent 工作区）
+cd ../../room_agent && cargo build -p qe-agent
 
 # 1) 用管理端房间页签发的注册链接注册（一次性，证书由 device-pki 签发）
 DEVICE_DATA_DIR=/var/lib/qe-agent ./target/debug/qe-agent enroll "<link>" --trust
@@ -930,10 +988,92 @@ DEVICE_PKI_MTLS_URL=https://node:4441 DEVICE_SLOT=room-101 DEVICE_DATA_DIR=/var/
 ```
 
 systemd（`qe-agent.service`，`--role both` + IPC）与更多参数见
-[`crates/agent/README.md`](crates/agent/README.md) 与 [`crates/agent/deploy/`](crates/agent/deploy)；
-机器端完整部署（daemon + GUI + 子机 + 升级排障）见 [`docs/agent-deploy.md`](docs/agent-deploy.md)；
+[`room_agent/qe-agent/README.md`](../../room_agent/qe-agent/README.md) 与 [`room_agent/qe-agent/deploy/`](../../room_agent/qe-agent/deploy)；
+机器端完整部署（daemon + GUI + 子机 + 升级排障）见 [`room_agent/docs/agent-deploy.md`](../../room_agent/docs/agent-deploy.md)；
 旧 room-agent 部署说明见
-[`crates/room-agent/README.md`](crates/room-agent/README.md)。
+[`room_agent/qe-room-agent/README.md`](../../room_agent/qe-room-agent/README.md)。
+
+## 工单（Ticket / P0 + P1 Wave 1/2/3）
+
+把已有的“信号”变成可认领、可跟踪、可复盘的人工闭环。设计文档见
+[`docs/design/ticket-system-analysis.md`](docs/design/ticket-system-analysis.md)，
+实现契约见 [`docs/design/ticket-implementation-contract.md`](docs/design/ticket-implementation-contract.md)，
+可交互原型见 [`prototype/tickets/`](prototype/tickets/)。
+
+- **工单来源**：机器健康连续 N 次非 ok、设备离线超过阈值、课表事件投递进入 `failed` 终态（后端 worker，`TICKET*` 环境变量可配）；以及人工在 `/tickets` 新建。
+- **状态机**：`open → in_progress → resolved → closed`，另有 `cancelled` 与 `reopened`（重开回 open）。解决必须填写说明；关闭后再发生会开新单。
+- **权限（P1 起可独立授权）**：`ticket:read/create/claim/comment/transition/assign/update/rule:manage/export/scope:manage/scope:all/attachment/inspection:manage`；P0 的 `ticket:handle`（≈claim+comment+transition）与 `ticket:manage`（≈assign+update+rule:manage）保留作兼容（接口按“新权限 OR 旧权限”判定）。迁移播种 `operator`（值班运维，含设备只读）与 `ticket_operator`（工单处理员，**不含** device/area/room 权限）两个角色，`admin` 启动自动补齐全部权限。
+- **页面**：控制台「运维」分组下的 `/tickets`（列表 + 新建 + 导出 CSV + SSE 实时）、`/tickets/:id`（详情/时间线/评论/关联上下文/工单设置）、`/tickets/insights`（历史分析：趋势/分类/房间/设备/处理人/MTTR/超时）、`/tickets/rules`（自动规则配置）、`/tickets/scopes`（按区域的数据可见范围）、`/tickets/inspections`（巡检计划：周期执行、异常自动建单、运行历史）；详情页支持根因分类与附件（≤20MiB，后端代理上传/可选预签名）；房间/设备/机器详情页有「报修/建单」入口；顶栏通知中心含「我的待办工单」。
+
+### API（`/api/v1/admin`，均需登录）
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/tickets` | `ticket:read` | 列表；`status/category/priority/source/assignee_id/unassigned/mine/active/overdue/area_id/room_id/serial/keyword/from/to/page/page_size` |
+| GET | `/tickets/summary` | `ticket:read` | 状态计数 / 未分配 / 超时 / 我的待办 |
+| GET | `/tickets/stats` | `ticket:read` | 历史分析聚合（`from/to`，默认近 30 天） |
+| GET | `/tickets/assignees` | `ticket:handle` | 可转派人员（拥有 `ticket:handle` 的用户） |
+| POST | `/tickets` | `ticket:create` | 人工建单 |
+| GET | `/tickets/{id}` | `ticket:read` | 详情（`ticket + events + context`） |
+| PATCH | `/tickets/{id}` | `ticket:update` 或 `ticket:manage` | 改标题/描述/优先级/分类 |
+| POST | `/tickets/{id}/claim` | `ticket:claim` 或 `ticket:handle` | 认领给自己并进入处理中 |
+| POST | `/tickets/{id}/assign` | `ticket:assign` 或 `ticket:manage` | 转派 / 释放 |
+| POST | `/tickets/{id}/transition` | `ticket:transition` 或 `ticket:handle` | 状态流转（409 表示非法流转） |
+| POST | `/tickets/{id}/comments` | `ticket:comment` 或 `ticket:handle` | 评论（返回时间线事件） |
+| GET | `/tickets/stream` | `ticket:read` | SSE 实时事件流（`after_event_id` 补发 + 2s 增量） |
+| GET | `/tickets/export` | `ticket:export` 或 `ticket:read` | 导出 CSV（UTF-8 BOM、中文表头、≤5000 行） |
+| GET | `/ticket-rules` | `ticket:rule:manage` 或 `ticket:manage` | 自动建单规则列表 |
+| POST | `/ticket-rules` | 同上 | 新建规则 |
+| PATCH | `/ticket-rules/{id}` | 同上 | 修改规则（signal_type 不可改） |
+| DELETE | `/ticket-rules/{id}` | 同上 | 删除规则 |
+| GET | `/ticket-scopes` | `ticket:scope:manage` 或 `ticket:manage` | 用户工单区域范围列表 |
+| GET | `/ticket-scopes/areas` | 同上 | 范围配置用区域选项（不要求 `area:read`） |
+| PUT | `/ticket-scopes/{user_id}` | 同上 | 整体替换用户区域范围（空数组 = 不限制） |
+| POST | `/tickets/{id}/attachments/upload` | `ticket:attachment` 或 `ticket:handle` | **代理上传**（原始字节，≤20MiB，同源免 CORS；未配置对象存储 503） |
+| POST | `/tickets/{id}/attachments/presign` | `ticket:attachment` 或 `ticket:handle` | 附件预签名直传（可选；需 bucket CORS） |
+| POST | `/tickets/{id}/attachments` | 同上 | 登记附件元数据（审计） |
+| GET | `/tickets/{id}/attachments` | `ticket:read` | 附件列表（含下载预签名） |
+| GET | `/tickets/{id}/attachments/{attachment_id}/download` | `ticket:read` | 代理下载附件（`Content-Disposition: attachment`，不依赖对象存储 CORS） |
+| DELETE | `/tickets/{id}/attachments/{attachment_id}` | 上传者或 `ticket:manage` | 删除附件（同时尽力清理对象存储对象） |
+| GET | `/inspection-plans` | `ticket:inspection:manage` 或 `ticket:manage` | 巡检计划列表（含最近一次执行摘要） |
+| POST | `/inspection-plans` | 同上 | 新建巡检计划（名称/范围/间隔 1–168h/启停） |
+| PATCH | `/inspection-plans/{id}` | 同上 | 修改巡检计划 |
+| DELETE | `/inspection-plans/{id}` | 同上 | 删除巡检计划（级联运行记录） |
+| POST | `/inspection-plans/{id}/run` | 同上 | 立即执行一次（异常自动建工单） |
+| GET | `/inspection-runs` | 同上 | 执行历史（`plan_id`、`limit` 1–100） |
+
+### 自动建单配置（环境变量）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `TICKETS_AUTO_ENABLED` | `true` | 自动建单 worker 开关 |
+| `TICKET_TICK_SECONDS` | `60` | 扫描周期（10–600） |
+| `TICKET_DEVICE_OFFLINE_MINUTES` | `10` | 设备离线多久建单（1–1440） |
+| `TICKET_HEALTH_CONSECUTIVE` | `2` | 机器健康连续非 ok 次数（1–10） |
+| `TICKET_LOOKBACK_HOURS` | `24` | 投递失败回溯窗口（1–168） |
+| `TICKET_EMAIL_ENABLED` | `true` | 转派/超时邮件通知（无 SMTP 时走 log driver） |
+| `TICKET_OVERDUE_REMIND_HOURS` | `24` | 同一工单超时提醒最小间隔（1–168） |
+
+Wave 2 起：解决/关闭可填「根因分类」（hardware/network/software/config/usage/other）；`ticket:scope:all` 可看全部区域（否则按 `ticket_scopes` 授权区域过滤，无授权 = 不限制）；附件默认走**后端代理上传**（同源，不依赖对象存储 CORS；`MAX_BODY_BYTES` 需 ≥ 20MiB，默认示例 25MiB），也保留 S3 预签名直传（需 bucket CORS）。
+
+同一 `dedupe_key` 在“未结束”状态只保留一张工单（部分唯一索引），重复发生只累加 `occurrence_count` 并追加 `occurred` 时间线；多副本安全，不依赖 Redis 锁。
+
+P1 起规则改由「运维 → 自动规则」页面维护（`ticket_rules` 表，支持阈值/优先级/global·area·room 范围/启停）；上面的 `TICKET_*` 阈值仅作规则缺失时的兜底默认值。P1 新增三个自动信号源：在线事件 webhook 投递失败、存储分发失败/过期、镜像验证失败。
+
+### 验证
+
+```bash
+cargo test -p qe-domain
+cargo test -p qe-api --lib
+TEST_DATABASE_URL=postgres://qestudio:qestudio@127.0.0.1:5432/qestudio_test \
+TEST_REDIS_URL=redis://127.0.0.1:6379 \
+  cargo test -p qe-api --test tickets -- --ignored
+cd frontend && ./node_modules/.bin/vue-tsc --build && ./node_modules/.bin/vitest run
+E2E_BASE_URL=http://127.0.0.1:5174 E2E_HEADLESS=1 ./node_modules/.bin/playwright test e2e/tickets.spec.ts --project=chromium
+# OpenAPI 导出 → 前端类型
+cargo run -q -p qe-api --example dump_openapi > frontend/docs/openapi.json
+cd frontend && python3 docs/openapi-types.py
+```
 
 ## 请求追踪与日志
 

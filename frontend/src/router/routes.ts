@@ -65,8 +65,24 @@ export const routes: RouteRecordRaw[] = [
       {
         path: 'schedules',
         name: 'schedules',
-        component: () => import('@/views/SchedulesView.vue'),
+        component: () => import('@/views/ScheduleBoardView.vue'),
         meta: { title: '课表', permission: PERMISSIONS.scheduleRead },
+      },
+      {
+        path: 'schedules/list',
+        name: 'schedule-list',
+        component: () => import('@/views/SchedulesView.vue'),
+        meta: { title: '课表列表', permission: PERMISSIONS.scheduleRead, activeName: 'schedules' },
+      },
+      {
+        path: 'schedules/plans',
+        name: 'schedule-plans',
+        component: () => import('@/views/SchedulePlansView.vue'),
+        meta: {
+          title: '排课计划',
+          permission: PERMISSIONS.scheduleRead,
+          activeName: 'schedule-plans',
+        },
       },
       {
         path: 'schedules/:id',
@@ -115,6 +131,54 @@ export const routes: RouteRecordRaw[] = [
         name: 'agent-configs',
         component: () => import('@/views/AgentConfigsView.vue'),
         meta: { title: '节点配置', permission: PERMISSIONS.deviceRead },
+      },
+      {
+        path: 'tickets',
+        name: 'tickets',
+        component: () => import('@/views/TicketsView.vue'),
+        meta: { title: '工单', permission: PERMISSIONS.ticketRead },
+      },
+      {
+        path: 'tickets/insights',
+        name: 'ticket-insights',
+        component: () => import('@/views/TicketInsightsView.vue'),
+        meta: { title: '工单分析', permission: PERMISSIONS.ticketRead, activeName: 'tickets' },
+      },
+      {
+        path: 'tickets/rules',
+        name: 'ticket-rules',
+        component: () => import('@/views/TicketRulesView.vue'),
+        meta: {
+          title: '自动规则',
+          permissionAny: [PERMISSIONS.ticketRuleManage, PERMISSIONS.ticketManage],
+          activeName: 'tickets',
+        },
+      },
+      {
+        path: 'tickets/inspections',
+        name: 'ticket-inspections',
+        component: () => import('@/views/TicketInspectionsView.vue'),
+        meta: {
+          title: '巡检计划',
+          permissionAny: [PERMISSIONS.ticketInspectionManage, PERMISSIONS.ticketManage],
+          activeName: 'tickets',
+        },
+      },
+      {
+        path: 'tickets/scopes',
+        name: 'ticket-scopes',
+        component: () => import('@/views/TicketScopesView.vue'),
+        meta: {
+          title: '工单可见范围',
+          permissionAny: [PERMISSIONS.ticketScopeManage, PERMISSIONS.ticketManage],
+          activeName: 'tickets',
+        },
+      },
+      {
+        path: 'tickets/:id',
+        name: 'ticket-detail',
+        component: () => import('@/views/TicketDetailView.vue'),
+        meta: { title: '工单详情', permission: PERMISSIONS.ticketRead, activeName: 'tickets' },
       },
       {
         path: 'users',

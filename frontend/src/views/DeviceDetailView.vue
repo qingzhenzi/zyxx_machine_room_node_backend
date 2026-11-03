@@ -14,11 +14,32 @@ import PageHeader from '@/components/ui/PageHeader.vue'
 import PageSection from '@/components/ui/PageSection.vue'
 import StateBadge from '@/components/ui/StateBadge.vue'
 import { deviceOnlineMeta, deviceStatusMeta } from '@/features/devices/deviceMeta'
+import { useAuthStore } from '@/stores/auth'
 import { errorMessage } from '@/utils/errors'
 import { formatFullDateTime, formatRelative, shortId } from '@/utils/format'
+import { PERMISSIONS } from '@/utils/permissions'
 
+const auth = useAuthStore()
 const route = useRoute()
 const router = useRouter()
+
+const canCreateTicket = computed(() => auth.can(PERMISSIONS.ticketCreate))
+
+/** P1 Wave 2 报修入口：带上设备序列号 / 槽位 / 房间。 */
+function reportIssue() {
+  const current = device.value
+  if (!current) return
+  void router.push({
+    name: 'tickets',
+    query: {
+      new: '1',
+      serial: current.serial,
+      device_slot: current.device_slot,
+      ...(current.room_id ? { room_id: current.room_id } : {}),
+      title: `设备报修：${current.device_slot || current.serial}`,
+    },
+  })
+}
 
 const device = ref<DeviceInfo | null>(null)
 const loading = ref(false)
@@ -96,6 +117,9 @@ onMounted(() => void load())
           :loading="loading"
           @click="load"
         />
+        <AppButton v-if="canCreateTicket && device" icon="ticket" @click="reportIssue">
+          报修 / 建单
+        </AppButton>
         <AppButton icon="wifi" @click="openEvents">查看在线事件</AppButton>
       </template>
     </PageHeader>

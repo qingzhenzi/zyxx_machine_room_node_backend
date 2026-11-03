@@ -6,6 +6,11 @@ import type {
   ImageArtifact,
   Room,
   Schedule,
+  TicketCategory,
+  TicketPriority,
+  TicketSource,
+  TicketStatus,
+  TicketStreamEvent,
   UserProfile,
 } from './schema'
 
@@ -108,6 +113,41 @@ export interface MachineDetailParams {
 export interface PresenceDeliveryParams {
   status?: 'pending' | 'delivered' | 'failed'
   limit?: number
+}
+
+/** 工单列表筛选参数；`mine`/`active`/`overdue` 是后端快捷条件。 */
+export interface TicketListParams extends PageParams {
+  status?: TicketStatus
+  priority?: TicketPriority
+  category?: TicketCategory
+  source?: TicketSource
+  assignee_id?: string
+  unassigned?: boolean
+  mine?: boolean
+  active?: boolean
+  overdue?: boolean
+  area_id?: string
+  room_id?: string
+  serial?: string
+  keyword?: string
+  from?: string
+  to?: string
+}
+
+/** 工单历史分析时间范围（默认近 30 天）。 */
+export interface TicketStatsParams {
+  from?: string
+  to?: string
+}
+
+/** 工单 SSE（fetch 流式读取；浏览器 EventSource 不能带 Authorization）。 */
+export interface TicketEventStreamOptions {
+  /** 从该 ticket_events.id 之后补发；缺省 = 只接收连接之后的新事件。 */
+  afterEventId?: number | null
+  signal: AbortSignal
+  onEvent: (event: TicketStreamEvent) => void
+  onOpen?: () => void
+  onHeartbeat?: () => void
 }
 
 /** 服务存活探针：/healthz。 */
