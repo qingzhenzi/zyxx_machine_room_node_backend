@@ -3,7 +3,7 @@
 //! 契约见 `docs/storage-design.md` §17.3 与 `docs/machine-telemetry.md` v1.1：
 //! - `PeerCert` serial → `device_enrollment`（`issued` / `active`）→ `device_slot`；
 //! - `device_slot` → `rooms.device_slot`（房间主设备）或 `room_devices`（子机）→ room + area；
-//! - 合并顺序 **global → area → room → device**，device 行用证书 CN（= `device_slot`）
+//! - 合并顺序 **global → area → room → device**，device 行用证书身份解析出的 `device_slot`（展示名）
 //!   匹配 `agent_configs.scope_key`；
 //! - 未绑定房间时只应用 global（+device）；`revision` 取实际应用行的最大值（无行 0）；
 //! - 鉴权失败 401，数据库错误 500。

@@ -42,12 +42,18 @@ pub struct ChallengeRow {
     pub challenge: Vec<u8>,
     pub token_hash: Vec<u8>,
     pub device_slot: String,
+    pub device_id: Option<Uuid>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
     pub consumed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// 签发挑战值，绑定 token 与 slot。
-pub async fn issue(db: &PgPool, token_hash: &[u8], device_slot: &str) -> Result<IssuedChallenge> {
+pub async fn issue(
+    db: &PgPool,
+    token_hash: &[u8],
+    device_slot: &str,
+    device_id: Option<Uuid>,
+) -> Result<IssuedChallenge> {
     let mut challenge = [0u8; 32];
     rand::rng().fill_bytes(&mut challenge);
     let challenge_id = Uuid::new_v4();
@@ -55,13 +61,14 @@ pub async fn issue(db: &PgPool, token_hash: &[u8], device_slot: &str) -> Result<
 
     sqlx::query(
         "INSERT INTO device_enroll_challenge
-           (challenge_id, challenge, token_hash, device_slot, expires_at)
-         VALUES ($1, $2, $3, $4, $5)",
+           (challenge_id, challenge, token_hash, device_slot, device_id, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(challenge_id)
     .bind(challenge.as_slice())
     .bind(token_hash)
     .bind(device_slot)
+    .bind(device_id)
     .bind(expires_at)
     .execute(db)
     .await?;
@@ -81,7 +88,7 @@ pub async fn verify(
     device_slot: &str,
 ) -> Result<ChallengeRow> {
     let row: Option<ChallengeRow> = sqlx::query_as(
-        "SELECT challenge_id, challenge, token_hash, device_slot, expires_at, consumed_at
+        "SELECT challenge_id, challenge, token_hash, device_slot, device_id, expires_at, consumed_at
          FROM device_enroll_challenge WHERE challenge_id = $1",
     )
     .bind(challenge_id)

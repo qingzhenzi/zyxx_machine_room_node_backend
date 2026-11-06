@@ -29,7 +29,7 @@
 //! 业务分发 → 成功才推水位），下行走同一个 `downlink_fetch`/`downlink_ack`。
 //! HTTP 端点保留作为兜底（设备无法维持长连接时仍能收发）。
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::routes::{self, AppState};
 use crate::tls::PeerCert;
 use axum::extract::ws::{Message as WsMessage, WebSocket};
@@ -101,7 +101,8 @@ pub async fn channel_upgrade(
     peer: PeerCert,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
-    let slot = peer.common_name().ok_or(Error::Unauthorized)?.to_owned();
+    // 身份来自证书：新证书 CN=device_id，旧证书 CN=slot；解析出展示 slot 用于激活
+    let (_device_id, slot) = routes::resolve_identity(&st, &peer).await?;
     // 连上即注册完成：能建立这条证书认证的连接，本身就证明证书可用
     let activated = routes::activate_enrollment(&st, &slot).await?;
     tracing::info!(slot = %slot, serial = %activated.serial, "设备通道建立，注册已激活");

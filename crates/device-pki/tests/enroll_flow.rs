@@ -27,6 +27,7 @@ use qe_device_pki::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const ADMIN_TOKEN: &str = "integration-admin-token";
 
@@ -448,6 +449,21 @@ async fn approval_flow_survives_retries_and_delivers_mtls_endpoint() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "issued 期间应可重取: {body}");
+
+    // 新语义：签发的证书 CN 必须是 device_id（UUID），slot 只作展示/房间绑定
+    let (cert_device_id, subject_cn): (Option<Uuid>, String) = sqlx::query_as(
+        "SELECT device_id, subject_cn FROM device_enrollment WHERE device_slot = $1 LIMIT 1",
+    )
+    .bind(&slot)
+    .fetch_one(&db)
+    .await
+    .expect("enrollment row");
+    let cert_device_id = cert_device_id.expect("新注册必须分配 device_id");
+    assert_eq!(
+        subject_cn,
+        cert_device_id.to_string(),
+        "证书 subject CN 应写入 device_id"
+    );
 
     // confirm（mTLS 路由；对端证书由测试注入）
     let cert_der = {

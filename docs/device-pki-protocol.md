@@ -1,4 +1,4 @@
-# 设备注册与 mTLS 通讯协议契约（草案 v0.1）
+# 设备注册与 mTLS 通讯协议契约（草案 v0.2）
 
 ## 1. 总览
 
@@ -8,6 +8,17 @@
 2. **阶段 2（业务）**：mTLS 双向验证。`POST /enroll/confirm` 握手成功 ⇔ 通讯真正打通
 
 注册成功 ≠ 通讯打通。`issued` → `active` 以首次 mTLS `confirm` 为准。
+
+## 1.1 身份模型：device_id 与 device_slot
+
+- **`device_id`（全局唯一，UUID）**：设备真正的身份。签发设备注册 token 时由服务端生成，
+  并写入证书 Subject CN。所有 mTLS 业务接口（`/machine/report`、`/messages`、`/channel` 等）
+  的身份判断都以证书 CN（= `device_id`）为准。
+- **`device_slot`（房间内绑定名/展示名）**：管理端预分配时指定，仅用于房间归属、运维展示和
+  注册链接绑定。**不再作为全局唯一身份**。
+- **兼容**：历史证书的 CN 仍是 `slot`。服务端解析身份时优先按 CN 为 UUID 处理；否则用
+  serial/slot 反查 `device_enrollment.device_id`（迁移 0027/0028 已回填存量数据）。
+- `serial` 仍是证书序列号，用于吊销与 CRL。
 
 ## 2. 角色
 

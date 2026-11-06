@@ -112,7 +112,7 @@ pub async fn enroll_challenge(
         return Err(Error::SlotConflict);
     }
 
-    let issued = challenge::issue(&st.db, &token_row.token_hash, &req.slot).await?;
+    let issued = challenge::issue(&st.db, &token_row.token_hash, &req.slot, token_row.device_id).await?;
 
     // approval 型：落一条 pending（或复用已有的），供 GET /enroll/{id} 轮询
     let mut enroll_id = None;
@@ -134,11 +134,12 @@ pub async fn enroll_challenge(
             let id = Uuid::new_v4();
             sqlx::query(
                 "INSERT INTO device_enrollment
-                   (serial, device_slot, subject_cn, csr_sha256, cert_pem, status, client_info, enroll_id)
-                 VALUES ($1, $2, $3, $4, '', 'pending', $5, $6)",
+                   (serial, device_slot, device_id, subject_cn, csr_sha256, cert_pem, status, client_info, enroll_id)
+                 VALUES ($1, $2, $3, $4, $5, '', 'pending', $6, $7)",
             )
             .bind(format!("pending-{id}"))
             .bind(&req.slot)
+            .bind(token_row.device_id)
             .bind(&req.slot)
             .bind(Vec::<u8>::new())
             .bind(info)
@@ -256,7 +257,8 @@ pub async fn enroll(
     // 先签发（纯计算，无副作用），再把「消费 challenge + 消费 token + 顶掉旧证书 +
     // 落库」放进**同一个事务**：任何一步失败都整体回滚，token 不会被烧掉，
     // 客户端可以拿同一张链接重试。之前消费事务与落库分离，落库失败 = 链接作废。
-    let issued = st.ca.sign_csr(&csr_der, &req.slot, CLIENT_CERT_DAYS)?;
+    let device_id = chal.device_id.or(token_row.device_id).unwrap_or_else(Uuid::new_v4);
+    let issued = st.ca.sign_csr(&csr_der, &device_id.to_string(), CLIENT_CERT_DAYS)?;
 
     let mut tx = st.db.begin().await?;
     if !challenge::consume(&mut *tx, req.challenge_id).await? {
@@ -283,13 +285,14 @@ pub async fn enroll(
         TokenKind::Auto => {
             sqlx::query(
                 "INSERT INTO device_enrollment
-                   (serial, device_slot, subject_cn, csr_sha256, cert_pem, status, issued_at, downloaded_at)
-                 VALUES ($1, $2, $3, $4, $5, 'issued', now(), now())
+                   (serial, device_slot, device_id, subject_cn, csr_sha256, cert_pem, status, issued_at, downloaded_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'issued', now(), now())
                  ON CONFLICT (serial) DO UPDATE SET cert_pem = EXCLUDED.cert_pem",
             )
             .bind(&issued.serial_hex)
             .bind(&req.slot)
-            .bind(&req.slot)
+            .bind(device_id)
+            .bind(&device_id.to_string())
             .bind(csr_sha.as_slice())
             .bind(&issued.cert_pem)
             .execute(&mut *tx)
@@ -310,7 +313,8 @@ pub async fn enroll(
 
             sqlx::query(
                 "UPDATE device_enrollment
-                 SET serial = $1, csr_sha256 = $2, cert_pem = $3, enroll_id = $4
+                 SET serial = $1, device_id = $6, subject_cn = $7,
+                     csr_sha256 = $2, cert_pem = $3, enroll_id = $4
                  WHERE device_slot = $5 AND status = 'pending'",
             )
             .bind(&issued.serial_hex)
@@ -318,6 +322,8 @@ pub async fn enroll(
             .bind(&issued.cert_pem)
             .bind(enroll_id)
             .bind(&req.slot)
+            .bind(device_id)
+            .bind(device_id.to_string())
             .execute(&mut *tx)
             .await?
             .rows_affected()
@@ -513,12 +519,13 @@ pub async fn confirm(
     peer: crate::tls::PeerCert,
     Json(req): Json<ConfirmRequest>,
 ) -> Result<Json<ConfirmReply>> {
-    // 身份来自 mTLS 证书中的 CN，而不是请求体
-    let subject = peer.common_name().ok_or(Error::Unauthorized)?;
-    if subject != req.slot {
+    // 身份来自 mTLS 证书：新证书 CN=device_id，旧证书 CN=slot。
+    // 统一解析出展示 slot，再和请求体（客户端仍传注册时的 slot）比对。
+    let (_device_id, slot) = resolve_identity(&st, &peer).await?;
+    if slot != req.slot {
         return Err(Error::Unauthorized);
     }
-    Ok(Json(activate_enrollment(&st, &req.slot).await?))
+    Ok(Json(activate_enrollment(&st, &slot).await?))
 }
 
 /// 把 enrollment 从 `issued` 推进到 `active`（幂等）。
@@ -792,10 +799,87 @@ pub async fn delete_enrollment(
 
 // ---------------- /machine/report（mTLS listener） ----------------
 
+/// 从 mTLS peer cert 解析设备身份：`(device_id, display_slot)`。
+///
+/// - 新证书：CN 是 `device_id`（UUID），slot 从 DB 取（仅展示/房间绑定用）；
+/// - 旧证书：CN 是 slot，用 serial/slot 反查 `device_id` 兼容过渡。
+pub(crate) async fn resolve_identity(
+    st: &AppState,
+    peer: &crate::tls::PeerCert,
+) -> Result<(Uuid, String)> {
+    let cn = peer.common_name().ok_or(Error::Unauthorized)?;
+    let serial = peer.serial_hex.as_deref();
+
+    // 新证书：CN 就是 device_id
+    if let Ok(id) = Uuid::parse_str(cn) {
+        let Some(s) = serial else {
+            return Err(Error::Unauthorized);
+        };
+        let slot = sqlx::query_scalar::<_, String>(
+            "SELECT device_slot FROM device_enrollment
+             WHERE serial = $1 AND status IN ('issued','active') LIMIT 1",
+        )
+        .bind(s)
+        .fetch_optional(&st.db)
+        .await?
+        .ok_or(Error::Unauthorized)?;
+        return Ok((id, slot));
+    }
+
+    // 旧证书：先按 serial 反查
+    if let Some(s) = serial
+        && let Some((id, slot)) = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT device_id, device_slot FROM device_enrollment
+             WHERE serial = $1 AND device_id IS NOT NULL
+               AND status IN ('issued','active') LIMIT 1",
+        )
+        .bind(s)
+        .fetch_optional(&st.db)
+        .await?
+    {
+        return Ok((id, slot));
+    }
+
+    // 再按 slot 反查（取最新一条存活记录）
+    if let Some((id, slot)) = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT device_id, device_slot FROM device_enrollment
+         WHERE device_slot = $1 AND device_id IS NOT NULL
+           AND status IN ('issued','active')
+         ORDER BY activated_at DESC NULLS LAST, issued_at DESC NULLS LAST LIMIT 1",
+    )
+    .bind(cn)
+    .fetch_optional(&st.db)
+    .await?
+    {
+        return Ok((id, slot));
+    }
+
+    // 过渡兼容：旧数据还没回填 device_id 时，用 serial 派生一个稳定 UUID。
+    if let Some(row) = sqlx::query_as::<_, (String, String)>(
+        "SELECT device_slot, serial FROM device_enrollment
+         WHERE device_slot = $1 AND status IN ('issued','active')
+         ORDER BY activated_at DESC NULLS LAST, issued_at DESC NULLS LAST LIMIT 1",
+    )
+    .bind(cn)
+    .fetch_optional(&st.db)
+    .await?
+    {
+        let derived = Uuid::new_v5(&device_identity_namespace(), row.1.as_bytes());
+        return Ok((derived, row.0));
+    }
+
+    Err(Error::Unauthorized)
+}
+
+/// 派生 device_id 的命名空间（固定常量，保证同一 serial 派生结果稳定）。
+fn device_identity_namespace() -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, b"qestudio-device-identity-v1")
+}
+
 /// `POST /machine/report` —— 机器遥测的**默认入口**（身份来自设备证书）。
 ///
 /// 与 `qe-api` 的 Bearer 入口共用 `qe_domain::machine` 的请求体与校验；区别是：
-/// - `device_slot` / `serial` 来自证书，请求体可省略 `device_slot`；
+/// - `device_id` / `device_slot` / `serial` 来自证书，请求体可省略 `device_slot`；
 /// - 上报同时刷新 mTLS 会话活动，10s 级上报可以替代独立心跳，避免被离线判定误伤。
 pub async fn machine_report(
     State(st): State<AppState>,
@@ -803,16 +887,17 @@ pub async fn machine_report(
     Json(request): Json<qe_domain::machine::MachineReportRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
     let serial = peer.serial_hex.clone().ok_or(Error::Unauthorized)?;
-    let device_slot = peer.common_name().ok_or(Error::Unauthorized)?.to_owned();
+    let (device_id, device_slot) = resolve_identity(&st, &peer).await?;
 
     let validated = request
         .validate()
         .map_err(|error| Error::BadRequest(error.to_string()))?;
+    // 请求体里的 device_slot 只做展示一致校验（新证书 CN 是 UUID，不能用 CN 比较）
     if let Some(body_slot) = validated.device_slot.as_deref()
         && body_slot != device_slot
     {
         return Err(Error::BadRequest(format!(
-            "device_slot（{body_slot}）与证书 CN（{device_slot}）不一致"
+            "device_slot（{body_slot}）与设备身份（{device_slot}）不一致"
         )));
     }
 
@@ -825,6 +910,7 @@ pub async fn machine_report(
 
     let mut payload = validated.payload;
     payload["device_slot"] = serde_json::json!(device_slot);
+    payload["device_id"] = serde_json::json!(device_id.to_string());
 
     let snapshot = NewMachineSnapshot {
         serial: serial.clone(),
@@ -851,6 +937,7 @@ pub async fn machine_report(
 
     tracing::info!(
         serial = %meta.serial,
+        device_id = %device_id,
         slot = %meta.device_slot,
         tier = validated.tier.as_str(),
         health = %meta.health_status,
@@ -862,6 +949,7 @@ pub async fn machine_report(
         Json(serde_json::json!({
             "snapshot_id": meta.id,
             "serial": meta.serial,
+            "device_id": device_id.to_string(),
             "device_slot": meta.device_slot,
             "received_at": meta.received_at,
         })),
@@ -936,7 +1024,7 @@ pub async fn process_incoming(
 
     // 身份来自 mTLS 证书，不信任请求体
     let serial = peer.serial_hex.clone().ok_or(Error::Unauthorized)?;
-    let slot = peer.common_name().ok_or(Error::Unauthorized)?.to_owned();
+    let (_device_id, slot) = resolve_identity(st, peer).await?;
 
     if seq <= 0 {
         return Err(Error::BadRequest("seq 必须为正整数".into()));

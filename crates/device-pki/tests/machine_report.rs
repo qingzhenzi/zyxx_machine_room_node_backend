@@ -75,7 +75,7 @@ async fn post_report(app: &Router, peer: PeerCert, body: Value) -> (u16, Value) 
     (status, value)
 }
 
-async fn setup() -> Option<(PgPool, String, String)> {
+async fn setup() -> Option<(PgPool, String, String, Uuid)> {
     let url = match std::env::var("TEST_DATABASE_URL") {
         Ok(value) => value,
         Err(_) => {
@@ -102,19 +102,22 @@ async fn setup() -> Option<(PgPool, String, String)> {
     let suffix = Uuid::new_v4().simple().to_string();
     let serial = format!("mr-serial-{suffix}");
     let slot = format!("mr-slot-{suffix}");
+    let device_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO device_enrollment
-            (serial, device_slot, subject_cn, csr_sha256, cert_pem, status, issued_at, activated_at)
-         VALUES ($1, $2, $2, $3, 'test-cert', 'active', now(), now())",
+            (serial, device_slot, device_id, subject_cn, csr_sha256, cert_pem, status, issued_at, activated_at)
+         VALUES ($1, $2, $3, $4, $5, 'test-cert', 'active', now(), now())",
     )
     .bind(&serial)
+    .bind(&slot)
+    .bind(device_id)
     .bind(&slot)
     .bind(vec![0u8; 32])
     .execute(&db)
     .await
     .expect("insert enrollment");
 
-    Some((db, serial, slot))
+    Some((db, serial, slot, device_id))
 }
 
 fn report_body() -> Value {
@@ -131,18 +134,19 @@ fn report_body() -> Value {
 #[tokio::test]
 #[ignore = "requires PostgreSQL; run via scripts/test-integration.sh"]
 async fn mtls_report_uses_cert_identity_and_persists_tier() {
-    let Some((db, serial, slot)) = setup().await else {
+    let Some((db, serial, slot, device_id)) = setup().await else {
         return;
     };
     let state = app_state(db.clone());
     let sessions = Arc::clone(&state.sessions);
     let app = routes::mtls_router(state);
 
-    // 1) 请求体不带 device_slot：身份取证书。
+    // 1) 旧证书（CN=slot）：请求体不带 device_slot，身份取证书 + DB 里的 device_id。
     let (status, body) = post_report(&app, peer(&serial, &slot), report_body()).await;
     assert_eq!(status, 202, "{body}");
     assert_eq!(body["serial"], serial);
     assert_eq!(body["device_slot"], slot);
+    assert_eq!(body["device_id"], device_id.to_string());
 
     let (tier, payload_slot): (String, String) = sqlx::query_as(
         "SELECT tier, payload->>'device_slot' FROM machine_snapshots WHERE serial = $1",
@@ -194,4 +198,41 @@ async fn mtls_report_uses_cert_identity_and_persists_tier() {
         .execute(&db)
         .await
         .expect("cleanup enrollment");
+}
+
+/// 新证书：CN 就是 device_id（UUID），slot 需要从 DB 解析。
+#[tokio::test]
+#[ignore = "requires PostgreSQL; run via scripts/test-integration.sh"]
+async fn mtls_report_accepts_device_id_cn() {
+    let Some((db, serial, slot, device_id)) = setup().await else {
+        return;
+    };
+    let state = app_state(db.clone());
+    let app = routes::mtls_router(state);
+
+    // CN 用 device_id，而不是 slot。
+    let (status, body) = post_report(&app, peer(&serial, &device_id.to_string()), report_body()).await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["serial"], serial);
+    assert_eq!(body["device_id"], device_id.to_string());
+    assert_eq!(body["device_slot"], slot, "slot 应从 DB 解析出来");
+
+    // 请求体若带正确的 device_slot，也能通过；带错误值仍然 400。
+    let mut ok_body = report_body();
+    ok_body["device_slot"] = json!(slot);
+    let (status, _) = post_report(&app, peer(&serial, &device_id.to_string()), ok_body).await;
+    assert_eq!(status, 202);
+
+    let mut bad = report_body();
+    bad["device_slot"] = json!("other-slot");
+    let (status, body) = post_report(&app, peer(&serial, &device_id.to_string()), bad).await;
+    assert_eq!(status, 400, "{body}");
+
+    for sql in [
+        "DELETE FROM machine_snapshots WHERE serial = $1",
+        "DELETE FROM device_session WHERE serial = $1",
+        "DELETE FROM device_enrollment WHERE serial = $1",
+    ] {
+        sqlx::query(sql).bind(&serial).execute(&db).await.expect("cleanup");
+    }
 }

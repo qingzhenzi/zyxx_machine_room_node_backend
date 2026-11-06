@@ -42,6 +42,7 @@ pub struct IssuedToken {
     pub token_hash: [u8; 32],
     pub kind: TokenKind,
     pub device_slot: String,
+    pub device_id: Uuid,
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -50,6 +51,7 @@ pub struct TokenRow {
     pub token_hash: Vec<u8>,
     pub kind: String,
     pub device_slot: String,
+    pub device_id: Option<Uuid>,
     pub used_at: Option<chrono::DateTime<chrono::Utc>>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
@@ -73,14 +75,16 @@ pub async fn issue(
     let token = hex::encode(raw);
     let token_hash = hash_token(&token);
     let expires_at = chrono::Utc::now() + ttl;
+    let device_id = Uuid::new_v4();
 
     sqlx::query(
-        "INSERT INTO device_bootstrap_token (token_hash, kind, device_slot, created_by, expires_at)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO device_bootstrap_token (token_hash, kind, device_slot, device_id, created_by, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(token_hash.as_slice())
     .bind(kind.as_str())
     .bind(device_slot)
+    .bind(device_id)
     .bind(created_by)
     .bind(expires_at)
     .execute(db)
@@ -91,6 +95,7 @@ pub async fn issue(
         token_hash,
         kind,
         device_slot: device_slot.to_owned(),
+        device_id,
         expires_at,
     })
 }
@@ -100,7 +105,7 @@ pub async fn issue(
 pub async fn verify(db: &PgPool, token: &str, device_slot: &str) -> Result<(TokenRow, TokenKind)> {
     let token_hash = hash_token(token);
     let row: Option<TokenRow> = sqlx::query_as(
-        "SELECT token_hash, kind, device_slot, used_at, expires_at
+        "SELECT token_hash, kind, device_slot, device_id, used_at, expires_at
          FROM device_bootstrap_token WHERE token_hash = $1",
     )
     .bind(token_hash.as_slice())

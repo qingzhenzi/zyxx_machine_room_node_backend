@@ -53,7 +53,7 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub struct Message {
     /// 设备证书 serial（规范化 hex），服务端身份来源，不可伪造
     pub serial: String,
-    /// 设备 slot（证书 CN）
+    /// 设备展示名（房间内绑定名，来自 DB；不是证书 CN）
     pub slot: String,
     pub seq: i64,
     pub kind: String,
