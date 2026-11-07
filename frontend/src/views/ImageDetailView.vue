@@ -13,6 +13,7 @@ import PageSection from '@/components/ui/PageSection.vue'
 import AssignmentPanel from '@/features/images/AssignmentPanel.vue'
 import ImageChannelsTable from '@/features/images/ImageChannelsTable.vue'
 import ImageChunksTable from '@/features/images/ImageChunksTable.vue'
+import ImageLifecycleActions from '@/features/images/ImageLifecycleActions.vue'
 import ImageSummaryCard from '@/features/images/ImageSummaryCard.vue'
 import ManifestPanel from '@/features/images/ManifestPanel.vue'
 import PublishPanel from '@/features/images/PublishPanel.vue'
@@ -138,6 +139,17 @@ async function onPublished(artifact: ImageArtifact) {
   await loadDetail(true)
 }
 
+/** 下架成功：用后端返回的最新 artifact 覆盖页面状态。 */
+async function onDeprecated(artifact: ImageArtifact) {
+  image.value = image.value ? { ...image.value, ...artifact } : image.value
+  await loadDetail(true)
+}
+
+/** 删除成功：镜像已不存在，回到列表页。 */
+function onDeleted() {
+  void router.push({ name: 'images' })
+}
+
 async function onManifestSubmitted() {
   verification.value = null
   await loadDetail(true)
@@ -167,6 +179,12 @@ async function onManifestSubmitted() {
           <AppButton variant="primary" icon="upload" @click="submitOpen = true">
             提交 manifest
           </AppButton>
+          <ImageLifecycleActions
+            :image="image"
+            @deprecated="onDeprecated"
+            @deleted="onDeleted"
+            @refresh="loadDetail()"
+          />
         </template>
       </template>
     </PageHeader>

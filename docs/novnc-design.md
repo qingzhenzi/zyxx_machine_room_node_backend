@@ -89,3 +89,52 @@ qe-api 与 device-pki 是同一网络内的两个进程（compose 同网段）�
 - 不做浏览器直连 agent 的 VNC 端口（安全）；
 - 不在本阶段做音频/剪贴板/USB 重定向（noVNC 支持但非教学必需）；
 - 不替代 `lan_video` 的低延迟视频采集链路（那是教学广播场景，另一条链路）。
+
+## 5. 实施定稿（2026-11-08，阶段 2 落地版本）
+
+为避开浏览器直连设备自签证书/房间网络不可达的问题，采用 **qe-api 代理 + device-pki 内部中转**：
+
+```
+浏览器 noVNC (RFB over WebSocket)
+  └─ ws://control/api/v1/admin/machines/{serial}/vnc/ws?session&ticket   (qe-api，JWT 会话)
+       └─ qe-api 内存 session 表（ticket/过期/一次性），升级后作为 WS 中继
+            └─ device-pki 内部明文监听 127.0.0.1:4442 /internal/vnc/{session}
+                 └─ device-pki VNC 中继表（session 配对）
+                      └─ agent mTLS WS /vnc/{serial}?session   （agent 主动连出）
+                           └─ agent → 127.0.0.1:<libvirt VNC 端口> TCP 桥
+```
+
+- **agent**：新增 `vm.command vnc.info {name}`（返回 vnc host/port/password）；
+  新增 downlink kind `vnc.open {session_id, vm}`：解析 libvirt graphics → 用设备证书连
+  `wss://<DEVICE_PKI_MTLS>/vnc/<serial>?session=<id>` → 本地 TCP 127.0.0.1:port →
+  WS 二进制帧双向泵；空闲 30min/错误即关闭。
+- **device-pki**：`mtls_router` 加 `GET /vnc/{serial}`（证书 serial 必须等于路径 serial）；
+  新增内部明文监听 `INTERNAL_ADDR`（默认 127.0.0.1:4442）提供 `GET /internal/vnc/{session}`
+  （header/query `x-internal-token` 与 env `INTERNAL_TOKEN` 比对）；按 session 配对
+  agent/internal 两端，30s 配对超时、30min 空闲超时，二进制帧透传。
+- **qe-api**：env `DEVICE_PKI_INTERNAL_URL`、`DEVICE_PKI_INTERNAL_TOKEN`；
+  `POST /admin/machines/{serial}/vnc/session`（vm:control）→ 下发 vnc.info 命令拿密码/端口
+  → 生成 session_id+ticket（内存 TTL 60s）→ 返回 `{session_id,ticket,ws_url,password,vm}`；
+  `GET /admin/machines/{serial}/vnc/ws?session&ticket`：校验 ticket（一次性）→ 升级 WS →
+  连 device-pki internal WS → 双向中继（WS 会话与中继任务同生命周期）。
+- **前端**：`@novnc/novnc@1.7`；VM 行「控制台」→ session API → 新建 RFB(canvas, ws_url,
+  {credentials:{password}})；弹窗内 canvas 自适应；关闭/断线/权限错误 toast。
+- **验收**：本机 session VM（qemu:///session，VNC 随机端口）全链路：API 建 session →
+  浏览器/脚本完成 RFB 握手并收到 ServerInit/MsgServerCutText 帧；输入帧能回传（键鼠）；
+  跨用户/跨机器仍走同一链路（真机验收待环境）。
+
+## 6. 实现状态（2026-11-08）
+
+阶段 2 控制节点侧已落地（agent 侧由 teammate 并行实现）：
+
+| 组件 | 实现 | 测试 |
+| --- | --- | --- |
+| device-pki agent 隧道 | `mtls_router` `GET /vnc/{serial}?session=`（证书 serial 必须等于路径 serial；session `[A-Za-z0-9_-]{16,64}`） | 配对状态机单测（先到等待/后到交接/同端重复/过期清理/session 校验/token 常量时间比较） |
+| device-pki 内部中继 | 内部明文 listener `INTERNAL_ADDR`（默认 127.0.0.1:4442，未配置 `INTERNAL_TOKEN` 则不启动并 warn）`GET /internal/vnc/{session}?token=` | 同上 |
+| VNC 配对/透传 | `AppState.vnc` 配对表；30s 配对超时、30min 空闲超时；二进制帧双向透传（≤2MiB/帧，文本帧丢弃）；同一 session 仅一对 | 状态机单测 |
+| qe-api 会话 | `POST /api/v1/admin/machines/{serial}/vnc/session`（`vm:control`）→ 下发 `vm.command vnc.info`（≤5s）→ 一次性 session/ticket（TTL 60s）→ `{session_id,ticket,vm,password,expires_at}` | ticket 一次性/过期/serial 绑定、URL 构造单测 |
+| qe-api WS 代理 | `GET /api/v1/admin/machines/{serial}/vnc/ws?session=&ticket=`（ticket 鉴权）→ downlink `vnc.open` → 连 `ws://DEVICE_PKI_INTERNAL_URL/internal/vnc/{session}` → 双向中继；连接失败 502 | 同上 |
+| 环境变量 | device-pki：`INTERNAL_ADDR`、`INTERNAL_TOKEN`；qe-api：`DEVICE_PKI_INTERNAL_URL`、`DEVICE_PKI_INTERNAL_TOKEN`（compose/.env.example 已补） | — |
+
+**本机可在无真实 agent 的机器上验证**：启动 device-pki 后 `GET http://127.0.0.1:4442/internal/vnc/{session}?token=wrong` → 403；
+token 正确但未升级 WS → 400/426（listener 正常）。真实 RFB 全链路需 agent + libvirt VNC 环境（见 §5 验收）。

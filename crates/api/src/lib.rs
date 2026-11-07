@@ -10,6 +10,7 @@ pub mod presence;
 pub mod scheduler;
 pub mod state;
 pub mod ticket_worker;
+pub mod vnc;
 
 // qe-api 作为 HTTP/装配层依赖下层 crate，而不是反过来。
 pub use qe_cache as cache;

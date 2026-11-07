@@ -51,6 +51,10 @@ pub struct AppState {
     /// S3 适配器：未配置 / 初始化失败时为 `None`，`/resources/presign` 回 503
     /// （契约 §16.2；main 从 `S3_*` 环境变量构建）
     pub storage: Option<Arc<qe_storage::StorageService>>,
+    /// VNC 中继配对表（noVNC 阶段 2，见 `docs/novnc-design.md` §5）。
+    pub vnc: Arc<crate::vnc::VncHub<axum::extract::ws::WebSocket>>,
+    /// 内部 VNC 明文监听 token；`None` = 未启用内部监听。
+    pub vnc_internal_token: Option<Arc<str>>,
 }
 
 // ---------------- /enroll/challenge ----------------
@@ -1345,6 +1349,11 @@ pub fn enroll_router(st: AppState) -> Router {
         .with_state(st)
 }
 
+/// 内部明文 listener 路由（noVNC 阶段 2）：qe-api 中继用，token 校验。
+pub fn internal_router(st: AppState) -> Router {
+    crate::vnc::internal_router(st)
+}
+
 /// mTLS 端点路由。
 pub fn mtls_router(st: AppState) -> Router {
     Router::new()
@@ -1373,6 +1382,8 @@ pub fn mtls_router(st: AppState) -> Router {
             post(crate::images::presign_upload),
         )
         .route("/machine/images/register", post(crate::images::register))
+        // noVNC 阶段 2：agent 侧 VNC 隧道（证书 serial 必须等于路径 serial）
+        .route("/vnc/{serial}", get(crate::vnc::agent_tunnel))
         .route("/revoke", post(revoke))
         .with_state(st)
 }
@@ -1417,6 +1428,8 @@ mod tests {
             mtls_endpoint: Arc::from("https://mtls.test:4441"),
             enroll_endpoint: Arc::from("https://enroll.test:4440"),
             storage: None,
+            vnc: Arc::new(crate::vnc::VncHub::new(crate::vnc::VNC_PAIR_TIMEOUT)),
+            vnc_internal_token: None,
         };
         let mut h = HeaderMap::new();
         h.insert(

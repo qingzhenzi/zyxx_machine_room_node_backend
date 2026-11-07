@@ -77,6 +77,107 @@ fn storage_service(state: &AppState) -> Result<&Arc<StorageService>> {
 }
 
 // ---------------------------------------------------------------------------
+// 上传限流（每设备滑窗）：presign 120 次/分钟、register 20 次/分钟。
+// 内容寻址对象天然幂等，但预签名与 HEAD 校验有成本；限流避免单设备刷爆控制面。
+// ---------------------------------------------------------------------------
+
+/// presign 每分钟上限。
+pub const PRESIGN_PER_MINUTE: usize = 120;
+/// register 每分钟上限。
+pub const REGISTER_PER_MINUTE: usize = 20;
+/// 限流窗口。
+pub const RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 一个设备的滑动窗口。
+#[derive(Debug, Default)]
+pub struct SlidingWindow {
+    events: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl SlidingWindow {
+    /// 记录一次请求；超限返回建议重试秒数（不记录本次）。
+    pub fn check(&mut self, now: std::time::Instant, max: usize) -> Option<u64> {
+        while let Some(front) = self.events.front() {
+            if now.duration_since(*front) >= RATE_WINDOW {
+                self.events.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.events.len() >= max {
+            let retry = self
+                .events
+                .front()
+                .map(|front| {
+                    RATE_WINDOW
+                        .saturating_sub(now.duration_since(*front))
+                        .as_secs()
+                        .max(1)
+                })
+                .unwrap_or(1);
+            return Some(retry);
+        }
+        self.events.push_back(now);
+        None
+    }
+}
+
+/// 每设备限流表。
+#[derive(Debug, Default)]
+pub struct UploadLimiters {
+    presign: std::collections::HashMap<String, SlidingWindow>,
+    register: std::collections::HashMap<String, SlidingWindow>,
+}
+
+impl UploadLimiters {
+    /// 检查并记录一次预签名请求。
+    pub fn check_presign(&mut self, serial: &str, now: std::time::Instant) -> Option<u64> {
+        self.presign
+            .entry(serial.to_owned())
+            .or_default()
+            .check(now, PRESIGN_PER_MINUTE)
+    }
+
+    /// 检查并记录一次 register 请求。
+    pub fn check_register(&mut self, serial: &str, now: std::time::Instant) -> Option<u64> {
+        self.register
+            .entry(serial.to_owned())
+            .or_default()
+            .check(now, REGISTER_PER_MINUTE)
+    }
+}
+
+fn upload_limiters() -> &'static std::sync::Mutex<UploadLimiters> {
+    static LIMITERS: std::sync::OnceLock<std::sync::Mutex<UploadLimiters>> =
+        std::sync::OnceLock::new();
+    LIMITERS.get_or_init(|| std::sync::Mutex::new(UploadLimiters::default()))
+}
+
+fn enforce_presign_limit(serial: &str) -> Result<()> {
+    let now = std::time::Instant::now();
+    let retry = upload_limiters()
+        .lock()
+        .map_err(|_| Error::Internal(anyhow::anyhow!("上传限流器锁中毒")))?
+        .check_presign(serial, now);
+    match retry {
+        Some(seconds) => Err(Error::RateLimited(seconds)),
+        None => Ok(()),
+    }
+}
+
+fn enforce_register_limit(serial: &str) -> Result<()> {
+    let now = std::time::Instant::now();
+    let retry = upload_limiters()
+        .lock()
+        .map_err(|_| Error::Internal(anyhow::anyhow!("上传限流器锁中毒")))?
+        .check_register(serial, now);
+    match retry {
+        Some(seconds) => Err(Error::RateLimited(seconds)),
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // POST /machine/images/presign-upload
 // ---------------------------------------------------------------------------
 
@@ -119,6 +220,8 @@ pub async fn presign_upload(
 ) -> Result<Json<PresignUploadReply>> {
     // 只接受存活的已注册设备（与其它 mTLS 业务端点同一套 fail-closed 身份校验）。
     let _ = resolve_identity(&st, &peer).await?;
+    let serial = peer.serial_hex.clone().ok_or(Error::Unauthorized)?;
+    enforce_presign_limit(serial.trim())?;
     let sha256 = validate_sha256_hex(&request.sha256).map_err(domain_bad_request)?;
     validate_upload_size(request.size_bytes)?;
 
@@ -321,6 +424,7 @@ pub async fn register(
         .clone()
         .unwrap_or_else(|| device_id.to_string());
     let annotations = merge_annotations(request.annotations.clone(), &serial)?;
+    enforce_register_limit(serial.trim())?;
 
     let service = storage_service(&st)?;
 
@@ -538,5 +642,53 @@ mod tests {
             serde_json::json!("vm-export")
         );
         assert!(merge_annotations(Some(serde_json::json!("nope")), "abc").is_err());
+    }
+}
+
+#[cfg(test)]
+mod image_rate_limit_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn window_blocks_after_limit_and_recovers_after_window() {
+        let base = Instant::now();
+        let mut window = SlidingWindow::default();
+        for i in 0..PRESIGN_PER_MINUTE {
+            assert!(
+                window
+                    .check(base + Duration::from_millis(i as u64), PRESIGN_PER_MINUTE)
+                    .is_none(),
+                "第 {i} 次不应被限流"
+            );
+        }
+        let retry = window
+            .check(base + Duration::from_secs(1), PRESIGN_PER_MINUTE)
+            .expect("达到上限后应被限流");
+        assert!((1..=60).contains(&retry), "重试秒数应合理: {retry}");
+
+        // 窗口滑过后恢复。
+        assert!(
+            window
+                .check(
+                    base + RATE_WINDOW + Duration::from_secs(1),
+                    PRESIGN_PER_MINUTE
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn limiters_are_per_serial_and_per_action() {
+        let base = Instant::now();
+        let mut limiters = UploadLimiters::default();
+        for _ in 0..REGISTER_PER_MINUTE {
+            assert!(limiters.check_register("device-a", base).is_none());
+        }
+        assert!(limiters.check_register("device-a", base).is_some());
+        // 其它设备不受影响。
+        assert!(limiters.check_register("device-b", base).is_none());
+        // presign 与 register 分开计数。
+        assert!(limiters.check_presign("device-a", base).is_none());
     }
 }

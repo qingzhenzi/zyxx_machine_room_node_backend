@@ -231,6 +231,10 @@ async fn ws_channel_connects_and_activates_enrollment() {
         enroll_endpoint: Arc::from("https://localhost:1"),
         // 预签名端点未配置 S3：本测试不覆盖对象存储
         storage: None,
+        vnc: Arc::new(qe_device_pki::vnc::VncHub::new(
+            qe_device_pki::vnc::VNC_PAIR_TIMEOUT,
+        )),
+        vnc_internal_token: None,
     };
     let enroll_app = routes::enroll_router(state.clone());
     let mtls_app = routes::mtls_router(state.clone());

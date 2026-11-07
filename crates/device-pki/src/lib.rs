@@ -12,7 +12,9 @@
 //!   `POST /machine/p2p/seed` / `GET /machine/p2p/peers`（P2P 镜像分发种子）、
 //!   `POST /machine/command/result`（机器命令结果回传）、
 //!   `POST /machine/images/presign-upload` / `POST /machine/images/register`（VM 导出镜像上传/登记，
-//!   契约 `docs/vm-base-image-and-diff-disk.md` §8.5）、`POST /revoke`
+//!   契约 `docs/vm-base-image-and-diff-disk.md` §8.5）、
+//!   `GET /vnc/{serial}`（noVNC agent 隧道）、`POST /revoke`
+//! - 内部明文 listener（`INTERNAL_ADDR`，默认 127.0.0.1:4442）：`GET /internal/vnc/{session}`（qe-api 中继）
 
 pub mod agent_config;
 pub mod ca;
@@ -34,5 +36,6 @@ pub mod session;
 pub mod tls;
 pub mod token;
 pub mod transfer;
+pub mod vnc;
 
 pub use error::{Error, Result};

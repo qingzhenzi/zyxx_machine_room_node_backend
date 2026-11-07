@@ -353,6 +353,7 @@ const VM_COMMAND_OPS: &[&str] = &[
     "disk.info",
     "export",
     "image.make",
+    "vnc.info",
 ];
 
 /// VM 名/snapshot 名的通用约束（防路径注入）：`[A-Za-z0-9._-]{1,64}`。
@@ -513,7 +514,7 @@ fn expect_string_array(
 }
 
 /// 校验 `[A-Za-z0-9._-]{1,max}`，返回 trim 后的规范值。
-fn validate_name_token(raw: &str, field: &str, max_chars: usize) -> AppResult<String> {
+pub(crate) fn validate_name_token(raw: &str, field: &str, max_chars: usize) -> AppResult<String> {
     let value = raw.trim();
     if value.is_empty() {
         return Err(bad_arg(format!("{field} 不能为空")));
@@ -1033,6 +1034,102 @@ async fn resolve_live_serial(state: &AppState, slot: &str) -> AppResult<Option<S
     .map_err(|error| AppError::internal(format!("查询设备槽位失败: {error}")))
 }
 
+/// 向设备槽位入队一条普通下行（非命令结果类，如 `vnc.open`），并尽力唤醒长连接。
+pub(crate) async fn enqueue_device_downlink(
+    state: &AppState,
+    slot: &str,
+    kind: &str,
+    payload: &serde_json::Value,
+) -> AppResult<()> {
+    let text = payload.to_string();
+    match state
+        .storage_repo
+        .enqueue_downlink_for_slot(slot, kind, &text)
+        .await
+    {
+        Ok(Some(serial)) => {
+            if let Err(error) = state
+                .cache
+                .publish(&state.config.schedule_downlink_notify_channel, &serial)
+                .await
+            {
+                tracing::warn!(%error, %serial, kind, "发布设备下行通知失败，下行已入队");
+            }
+            Ok(())
+        }
+        Ok(None) => Err(AppError::service_unavailable(
+            "设备当前没有存活证书，无法建立 VNC 隧道",
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// 下发一条 `vm.command` 并同步等待终态（VNC 会话等需要立即拿结果的场景）。
+///
+/// `wait` 内未收到终态返回 502；pending 行保留（agent 之后仍可回写结果）。
+pub(crate) async fn execute_vm_command(
+    state: &AppState,
+    serial: &str,
+    device_slot: &str,
+    op: &str,
+    args: serde_json::Value,
+    wait: Duration,
+) -> AppResult<VmCommandReply> {
+    let request_id = Uuid::new_v4();
+    let command = ValidatedVmCommand {
+        op: op.to_owned(),
+        args: args.as_object().cloned().unwrap_or_default(),
+    };
+    let downlink = vm_command_downlink_payload(request_id, &command);
+    insert_pending_vm_command(state, request_id, serial, &downlink).await?;
+    match enqueue_vm_downlink(state, device_slot, &downlink.to_string()).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            cleanup_pending_vm_command(state, request_id).await;
+            return Err(AppError::service_unavailable(
+                "设备当前没有存活证书，命令未下发",
+            ));
+        }
+        Err(error) => {
+            cleanup_pending_vm_command(state, request_id).await;
+            return Err(error);
+        }
+    }
+
+    let deadline = Instant::now() + wait;
+    loop {
+        let row = sqlx::query_as::<_, MachineCommandRow>(
+            "SELECT request_id, status, result, error, created_at, updated_at, payload
+               FROM machine_command_results
+              WHERE request_id = $1 AND serial = $2",
+        )
+        .bind(request_id)
+        .bind(serial)
+        .fetch_optional(state.db.pool())
+        .await
+        .map_err(|error| AppError::internal(format!("查询 VM 命令失败: {error}")))?;
+        if let Some(row) = row {
+            if row.status != "pending" {
+                return Ok(VmCommandReply {
+                    request_id: row.request_id,
+                    status: row.status,
+                    data: row.result,
+                    error: row.error,
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                });
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(AppError::bad_gateway(format!(
+                "机器在 {}s 内未返回 {op} 结果",
+                wait.as_secs()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 // ---- HTTP handlers ----
 
 /// `POST /api/v1/admin/machines/{serial}/vm/commands` —— 下发 VM 远程控制命令。
@@ -1405,6 +1502,7 @@ mod tests {
             "disk.info",
             "export",
             "image.make",
+            "vnc.info",
         ] {
             assert!(VM_COMMAND_OPS.contains(&op), "缺少 op：{op}");
         }

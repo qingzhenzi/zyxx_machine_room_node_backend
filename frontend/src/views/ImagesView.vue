@@ -13,6 +13,7 @@ import SearchInput from '@/components/ui/SearchInput.vue'
 import StateBadge from '@/components/ui/StateBadge.vue'
 import { useDebounceFn } from '@/composables/useDebounceFn'
 import CreateImageModal from '@/features/images/CreateImageModal.vue'
+import ImageLifecycleActions from '@/features/images/ImageLifecycleActions.vue'
 import {
   ARTIFACT_STATUS_OPTIONS,
   IMAGE_FORMAT_LABELS,
@@ -100,6 +101,13 @@ function openCreate() {
   createOpen.value = true
 }
 
+/** 下架成功后原地更新状态（后端返回最新 artifact），无需整页刷新。 */
+function onImageDeprecated(artifact: ImageArtifact) {
+  items.value = items.value.map((item) =>
+    item.id === artifact.id ? { ...item, ...artifact } : item,
+  )
+}
+
 onMounted(() => void load())
 </script>
 
@@ -181,17 +189,18 @@ onMounted(() => void load())
               <th class="table-th">格式 / 压缩</th>
               <th class="table-th">状态</th>
               <th class="table-th">总大小</th>
-              <th class="table-th pr-5">更新时间</th>
+              <th class="table-th" :class="canManage ? '' : 'pr-5'">更新时间</th>
+              <th v-if="canManage" class="table-th pr-5">操作</th>
             </tr>
           </thead>
 
           <tbody v-if="loading">
             <tr v-for="row in 6" :key="row" class="border-b border-line/70 last:border-b-0">
               <td
-                v-for="cell in 7"
+                v-for="cell in canManage ? 8 : 7"
                 :key="cell"
                 class="table-td"
-                :class="cell === 1 ? 'pl-5' : cell === 7 ? 'pr-5' : ''"
+                :class="cell === 1 ? 'pl-5' : cell === (canManage ? 8 : 7) ? 'pr-5' : ''"
               >
                 <div class="h-3 w-24 animate-pulse rounded bg-line" />
               </td>
@@ -223,7 +232,18 @@ onMounted(() => void load())
                 />
               </td>
               <td class="table-td text-[11px]">{{ formatBytes(image.total_size) }}</td>
-              <td class="table-td pr-5 text-[11px]">{{ formatDateTime(image.updated_at) }}</td>
+              <td class="table-td text-[11px]" :class="canManage ? '' : 'pr-5'">
+                {{ formatDateTime(image.updated_at) }}
+              </td>
+              <td v-if="canManage" class="table-td pr-5" @click.stop>
+                <ImageLifecycleActions
+                  :image="image"
+                  size="sm"
+                  @deprecated="onImageDeprecated"
+                  @deleted="load"
+                  @refresh="load"
+                />
+              </td>
             </tr>
           </tbody>
         </table>

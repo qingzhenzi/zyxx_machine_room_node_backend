@@ -19,6 +19,7 @@ pub mod ticket_rules;
 pub mod ticket_scopes;
 pub mod tickets;
 pub mod users;
+pub mod vnc;
 
 use axum::{
     Router,
@@ -186,7 +187,8 @@ pub fn router() -> Router<AppState> {
         .route("/transfers/{id}/retry", post(storage::retry_transfer))
         .route("/collections", get(storage::list_collections))
         .route("/images", get(images::list).post(images::create))
-        .route("/images/{id}", get(images::get))
+        .route("/images/{id}", get(images::get).delete(images::remove))
+        .route("/images/{id}/deprecate", post(images::deprecate))
         .route(
             "/images/{id}/manifest",
             get(images::get_manifest).post(images::submit_manifest),
@@ -219,6 +221,9 @@ pub fn router() -> Router<AppState> {
             "/rooms/{room_id}/vm/environments",
             post(machines::create_room_vm_environment),
         )
+        // noVNC 阶段 2：VNC 控制台会话 + 浏览器 WS 代理（vm:control）。
+        .route("/machines/{serial}/vnc/session", post(vnc::create_session))
+        .route("/machines/{serial}/vnc/ws", get(vnc::ws_proxy))
         // ---- 节点配置（P2）----
         .route(
             "/agent-configs",

@@ -33,6 +33,12 @@ async fn main() -> Result<()> {
     let mtls_cert_path = std::env::var("MTLS_TLS_CERT").context("MTLS_TLS_CERT required")?;
     let mtls_key_path = std::env::var("MTLS_TLS_KEY").context("MTLS_TLS_KEY required")?;
     let admin_token = std::env::var("ADMIN_TOKEN").context("ADMIN_TOKEN required")?;
+    // noVNC 阶段 2：内部明文 VNC 中继监听（默认只绑本机；qe-api 作为唯一客户端）。
+    let internal_addr = std::env::var("INTERNAL_ADDR").unwrap_or_else(|_| "127.0.0.1:4442".into());
+    let internal_token = std::env::var("INTERNAL_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
     // 管理端限速：每 IP 每分钟预算；0 = 关闭（只有在前面已有反代限速时才该这么配）
     let admin_rate_limit_per_min: u32 = std::env::var("ADMIN_RATE_LIMIT")
         .ok()
@@ -210,12 +216,20 @@ async fn main() -> Result<()> {
         mtls_endpoint: Arc::from(public_mtls.as_str()),
         enroll_endpoint: Arc::from(public_enroll.as_str()),
         storage,
+        vnc: Arc::new(qe_device_pki::vnc::VncHub::new(
+            qe_device_pki::vnc::VNC_PAIR_TIMEOUT,
+        )),
+        vnc_internal_token: internal_token.as_deref().map(Arc::from),
     };
 
     let enroll_cfg = tls::server_config_enroll(&enroll_cert, &enroll_key)?;
     let mtls_cfg = tls::server_config_mtls(&mtls_cert, &mtls_key, Arc::clone(&ca), cert_status)?;
 
     let enroll_app = routes::enroll_router(state.clone());
+    let internal_app = state
+        .vnc_internal_token
+        .as_ref()
+        .map(|_| routes::internal_router(state.clone()));
     let mtls_app = routes::mtls_router(state);
 
     let enroll_listener = tokio::net::TcpListener::bind(&enroll_addr).await?;
@@ -225,6 +239,26 @@ async fn main() -> Result<()> {
 
     let enroll_task = axum_server_with_tls(enroll_listener, enroll_cfg, enroll_app);
     let mtls_task = axum_server_with_tls(mtls_listener, mtls_cfg, mtls_app);
+
+    // 内部 VNC 中继 listener：未配置 INTERNAL_TOKEN 时只 warn 不启动（其它端点不受影响）。
+    match internal_app {
+        Some(app) => {
+            let listener = tokio::net::TcpListener::bind(&internal_addr)
+                .await
+                .with_context(|| format!("绑定 INTERNAL_ADDR {internal_addr} 失败"))?;
+            tracing::info!(addr = %internal_addr, "internal VNC relay listener (plain HTTP)");
+            tokio::spawn(async move {
+                if let Err(error) = axum::serve(listener, app).await {
+                    tracing::error!(%error, "内部 VNC 中继 listener 退出");
+                }
+            });
+        }
+        None => {
+            tracing::warn!(
+                "未配置 INTERNAL_TOKEN，内部 VNC 中继 listener 不启动（noVNC 控制台不可用）"
+            );
+        }
+    }
 
     tokio::try_join!(enroll_task, mtls_task)?;
     Ok(())

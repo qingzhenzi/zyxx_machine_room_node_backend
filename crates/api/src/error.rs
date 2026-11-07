@@ -30,6 +30,8 @@ pub enum AppError {
     #[error("{0}")]
     TooManyRequests(String),
     #[error("{0}")]
+    BadGateway(String),
+    #[error("{0}")]
     ServiceUnavailable(String),
     #[error("{0}")]
     Internal(String),
@@ -69,6 +71,11 @@ impl AppError {
         Self::TooManyRequests(message.into())
     }
 
+    /// 502：上游（device-pki 内部中继 / 机器 agent）不可用或握手失败。
+    pub fn bad_gateway(message: impl Into<String>) -> Self {
+        Self::BadGateway(message.into())
+    }
+
     pub fn service_unavailable(message: impl Into<String>) -> Self {
         Self::ServiceUnavailable(message.into())
     }
@@ -87,6 +94,7 @@ impl AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -102,6 +110,7 @@ impl AppError {
             Self::Conflict(_) => "conflict",
             Self::UnprocessableEntity(_) => "unprocessable_entity",
             Self::TooManyRequests(_) => "too_many_requests",
+            Self::BadGateway(_) => "bad_gateway",
             Self::ServiceUnavailable(_) => "service_unavailable",
             Self::Internal(_) => "internal_error",
         }

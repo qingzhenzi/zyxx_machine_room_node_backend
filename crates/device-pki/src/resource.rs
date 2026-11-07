@@ -377,6 +377,8 @@ mod tests {
             mtls_endpoint: Arc::from("https://mtls.test:4441"),
             enroll_endpoint: Arc::from("https://enroll.test:4440"),
             storage,
+            vnc: Arc::new(crate::vnc::VncHub::new(crate::vnc::VNC_PAIR_TIMEOUT)),
+            vnc_internal_token: None,
         }
     }
 

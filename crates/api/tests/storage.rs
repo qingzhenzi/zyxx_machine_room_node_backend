@@ -91,6 +91,8 @@ fn test_config(s3_endpoint: String) -> Config {
         device_presence_webhook_max_attempts: 5,
         device_presence_webhook_batch: 20,
         device_presence_retry_base_seconds: 5,
+        device_pki_internal_url: "http://127.0.0.1:4442".to_owned(),
+        device_pki_internal_token: None,
         public_enroll_endpoint: "https://enroll.test:4440".to_owned(),
         storage: Some(StorageConfig {
             endpoint: s3_endpoint,

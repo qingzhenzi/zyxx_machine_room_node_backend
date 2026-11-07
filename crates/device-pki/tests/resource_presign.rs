@@ -83,6 +83,10 @@ fn app_state(db: PgPool, storage: Option<Arc<StorageService>>) -> AppState {
         mtls_endpoint: Arc::from("https://localhost:1"),
         enroll_endpoint: Arc::from("https://localhost:1"),
         storage,
+        vnc: Arc::new(qe_device_pki::vnc::VncHub::new(
+            qe_device_pki::vnc::VNC_PAIR_TIMEOUT,
+        )),
+        vnc_internal_token: None,
     }
 }
 

@@ -83,6 +83,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// 用于在 `/healthz` 中区分负载均衡后的不同副本。
     pub instance_id: String,
+    /// noVNC 阶段 2：一次性 VNC 会话/ticket（内存、单副本）。
+    pub vnc_sessions: Arc<crate::vnc::VncSessionStore>,
 }
 
 impl AppState {
@@ -127,6 +129,7 @@ impl AppState {
             jwt,
             config: Arc::new(config),
             instance_id,
+            vnc_sessions: Arc::new(crate::vnc::VncSessionStore::new()),
         }
     }
 }

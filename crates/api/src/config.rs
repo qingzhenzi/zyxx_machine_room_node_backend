@@ -64,6 +64,11 @@ pub struct Config {
     // ---- 设备 ----
     /// 设备注册服务对外地址，用于拼装注册链接（如 `https://node:4440`）。
     pub public_enroll_endpoint: String,
+    // ---- noVNC 阶段 2（device-pki 内部 VNC 中继）----
+    /// device-pki 内部明文 VNC 中继地址（默认 `http://127.0.0.1:4442`）。
+    pub device_pki_internal_url: String,
+    /// device-pki 内部中继 token；`None` = noVNC 代理不可用（503）。
+    pub device_pki_internal_token: Option<String>,
     // ---- 设备在线状态通知（device.offline / device.online webhook）----
     /// 是否启用在 qe-api 侧扫描 `device_session` 并投递状态变化 webhook。
     pub device_presence_enabled: bool,
@@ -307,6 +312,11 @@ impl Config {
             device_presence_retry_base_seconds,
             machine_agent_token,
             machine_snapshot_keep,
+            device_pki_internal_url: env_optional("DEVICE_PKI_INTERNAL_URL")
+                .unwrap_or_else(|| "http://127.0.0.1:4442".to_owned())
+                .trim_end_matches('/')
+                .to_owned(),
+            device_pki_internal_token: env_optional("DEVICE_PKI_INTERNAL_TOKEN"),
             public_enroll_endpoint: env_optional("PUBLIC_ENROLL_ENDPOINT")
                 .unwrap_or_else(|| "https://localhost:4440".to_owned())
                 .trim_end_matches('/')

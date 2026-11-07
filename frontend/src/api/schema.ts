@@ -698,6 +698,26 @@ export interface WakeReply {
   warnings: string[]
 }
 
+/** `POST /admin/machines/{serial}/vnc/session` 请求体（需要 vm:control）。 */
+export interface VncSessionRequest {
+  /** libvirt 虚拟机名（与 `sections.vms[].name` 一致）。 */
+  vm: string
+}
+
+/** 一次性 noVNC 会话：VNC 密码只下发给当前浏览器，不落库。 */
+export interface VncSessionReply {
+  session_id: string
+  /** 一次性 WS 握手票据（用一次即失效）。 */
+  ticket: string
+  vm: string
+  /** libvirt 图形设备的一次性 VNC 密码。 */
+  password?: string | null
+  /** 可选 WS 端点；缺省前端使用 `/api/v1/admin/machines/{serial}/vnc/ws`。 */
+  ws_url?: string | null
+  /** 会话过期时间（ISO8601）。 */
+  expires_at: string
+}
+
 /** VM 远程控制命令（与后端 op 白名单一致）。 */
 export type VmCommandOp =
   | 'list'

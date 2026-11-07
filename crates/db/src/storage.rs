@@ -1216,3 +1216,51 @@ mod tests {
         );
     }
 }
+
+/// 镜像中心收尾（2026-11-08）：删除镜像与对象引用清理辅助。
+impl StorageRepo {
+    /// 删除镜像（含分片/分配/校验/通道等级联行与 p2p seed），返回被删的 artifact。
+    ///
+    /// `image_verifications` / `image_channels` / `image_assignments` 由外键级联删除；
+    /// `image_chunks` / `image_p2p_seeds` 以 manifest_digest 关联，需要显式删除。
+    pub async fn delete_image_cascade(&self, id: Uuid) -> DbResult<Option<ImageArtifact>> {
+        let Some(artifact) = self.get_image(id).await? else {
+            return Ok(None);
+        };
+        let mut tx = self.db.begin().await?;
+        if let Some(digest) = artifact.manifest_digest.as_deref() {
+            sqlx::query("DELETE FROM image_p2p_seeds WHERE manifest_digest = $1")
+                .bind(digest)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM image_chunks WHERE manifest_digest = $1")
+                .bind(digest)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("DELETE FROM image_artifacts WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(artifact))
+    }
+
+    /// 该 sha256 分片仍被多少个镜像 manifest 引用（用于判断能否删除 S3 对象）。
+    pub async fn chunk_reference_count(&self, sha256: &str) -> DbResult<i64> {
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM image_chunks WHERE sha256 = $1")
+            .bind(sha256)
+            .fetch_one(&self.db)
+            .await?;
+        Ok(count)
+    }
+
+    /// 删除 `storage_objects` 登记行（对象本体由调用方按引用计数删除）。
+    pub async fn delete_storage_object_row(&self, sha256: &str) -> DbResult<()> {
+        sqlx::query("DELETE FROM storage_objects WHERE sha256 = $1")
+            .bind(sha256)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+}

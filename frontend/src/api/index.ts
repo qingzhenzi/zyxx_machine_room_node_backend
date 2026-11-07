@@ -130,6 +130,8 @@ import type {
   VmEnvironmentRequest,
   VmCommandReply,
   VmCommandRequest,
+  VncSessionReply,
+  VncSessionRequest,
   UserPage,
   UserProfile,
   UserSession,
@@ -589,6 +591,12 @@ export const api = {
   wakeMachine: (serial: string) =>
     unwrap<WakeReply>(http.post(`/admin/machines/${encodeURIComponent(serial)}/wake`)),
 
+  /** noVNC 控制台：申请一次性 VNC 会话（需要 vm:control；返回一次性密码 + WS 票据）。 */
+  createVncSession: (serial: string, input: VncSessionRequest) =>
+    unwrap<VncSessionReply>(
+      http.post(`/admin/machines/${encodeURIComponent(serial)}/vnc/session`, input),
+    ),
+
   /** VM 远程控制：下发命令（202 返回 request_id，前端轮询结果）。 */
   vmCommand: (serial: string, input: VmCommandRequest) =>
     unwrap<VmCommandAccepted>(
@@ -639,6 +647,13 @@ export const api = {
 
   publishImage: (id: string, input: PublishImageRequest) =>
     unwrap<ImageArtifact>(http.post(`/admin/images/${encodeURIComponent(id)}/publish`, input)),
+
+  /** 下架已发布镜像（published → deprecated，幂等；其它状态 409；需要 image:manage）。 */
+  deprecateImage: (id: string) =>
+    unwrap<ImageArtifact>(http.post(`/admin/images/${encodeURIComponent(id)}/deprecate`)),
+
+  /** 删除镜像（204 成功；需要 image:manage；published 时 409 需先下架）。 */
+  deleteImage: (id: string) => unwrap<void>(http.delete(`/admin/images/${encodeURIComponent(id)}`)),
 
   assignImage: (roomId: string, imageId: string, input: AssignImageRequest = {}) =>
     unwrap<ImageAssignment>(

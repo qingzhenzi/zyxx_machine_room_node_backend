@@ -81,6 +81,10 @@ async fn setup_with_limit(admin_limit: u32) -> Option<(AppState, Router, Router)
         enroll_endpoint: Arc::from("https://enroll.integration.test:4440"),
         // 预签名端点未配置 S3：本测试不覆盖对象存储
         storage: None,
+        vnc: Arc::new(qe_device_pki::vnc::VncHub::new(
+            qe_device_pki::vnc::VNC_PAIR_TIMEOUT,
+        )),
+        vnc_internal_token: None,
     };
     Some((
         state.clone(),

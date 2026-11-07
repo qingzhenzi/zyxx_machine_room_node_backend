@@ -1066,3 +1066,147 @@ pub async fn unassign_room(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+// ---------------------------------------------------------------------------
+// 镜像中心收尾：下架 / 删除（含 S3 对象按引用计数清理）
+// ---------------------------------------------------------------------------
+
+/// `POST /images/{id}/deprecate`：已发布镜像下架（`published → deprecated`）。
+///
+/// 已下架镜像幂等返回；其它状态 409（尚未发布，无需下架）。
+pub async fn deprecate(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    ClientIp(ip): ClientIp,
+    Path(image_id): Path<Uuid>,
+) -> AppResult<Json<ImageArtifact>> {
+    authorization::require_permission(&state, id, permissions::IMAGE_MANAGE).await?;
+
+    let artifact = state
+        .storage_repo
+        .get_image(image_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+
+    let artifact = match artifact.status {
+        ArtifactStatus::Deprecated => artifact,
+        ArtifactStatus::Published => state
+            .storage_repo
+            .set_status(image_id, ArtifactStatus::Deprecated)
+            .await?
+            .ok_or_else(|| AppError::not_found("镜像不存在"))?,
+        _ => {
+            return Err(AppError::conflict("仅已发布（published）的镜像可以下架"));
+        }
+    };
+
+    super::audit::record_or_log(
+        &state,
+        id,
+        "image.deprecate",
+        "image",
+        Some(image_id.to_string()),
+        json!({ "manifest_digest": artifact.manifest_digest }),
+        ip.as_deref(),
+    )
+    .await;
+
+    Ok(Json(artifact))
+}
+
+/// `DELETE /images/{id}`：删除镜像（已发布需先下架）。
+///
+/// 删除 DB 行（级联校验/通道/分配；显式删分片与 p2p seed），并对每个分片做
+/// **引用计数清理 S3 对象**：仍被其它 manifest 引用则保留；manifest 与签名对象一并删除。
+/// S3 清理是 best-effort（失败只记日志，不回滚 DB——避免对象残留阻塞删除）。
+pub async fn remove(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    ClientIp(ip): ClientIp,
+    Path(image_id): Path<Uuid>,
+) -> AppResult<StatusCode> {
+    authorization::require_permission(&state, id, permissions::IMAGE_MANAGE).await?;
+    let service = super::storage::service(&state)?;
+
+    let artifact = state
+        .storage_repo
+        .get_image(image_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    if artifact.status == ArtifactStatus::Published {
+        return Err(AppError::conflict(
+            "已发布镜像不能直接删除，请先下架（POST /images/{id}/deprecate）",
+        ));
+    }
+
+    let manifest_digest = artifact.manifest_digest.clone();
+    let chunks = match manifest_digest.as_deref() {
+        Some(digest) => state.storage_repo.chunks(digest).await?,
+        None => Vec::new(),
+    };
+
+    let deleted = state
+        .storage_repo
+        .delete_image_cascade(image_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+
+    // ---- S3 对象清理（best-effort）----
+    for chunk in &chunks {
+        match state
+            .storage_repo
+            .chunk_reference_count(&chunk.sha256)
+            .await
+        {
+            Ok(0) => {
+                if let Err(error) = service.delete_object(&chunk.object_key).await {
+                    tracing::warn!(%error, key = %chunk.object_key, "删除镜像分片对象失败（保留登记行）");
+                } else if let Err(error) = state
+                    .storage_repo
+                    .delete_storage_object_row(&chunk.sha256)
+                    .await
+                {
+                    tracing::warn!(%error, sha256 = %chunk.sha256, "删除 storage_objects 登记失败");
+                }
+            }
+            Ok(other) => {
+                tracing::info!(
+                    sha256 = %chunk.sha256,
+                    references = other,
+                    "分片仍被其它镜像引用，保留 S3 对象"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, sha256 = %chunk.sha256, "查询分片引用失败，保留 S3 对象");
+            }
+        }
+    }
+    if let Some(digest) = manifest_digest.as_deref() {
+        for key in [
+            super::storage::manifest_key(digest),
+            super::storage::signature_key(digest),
+        ] {
+            if let Err(error) = service.delete_object(&key).await {
+                tracing::warn!(%error, %key, "删除镜像 manifest/签名对象失败");
+            }
+        }
+    }
+
+    super::audit::record_or_log(
+        &state,
+        id,
+        "image.delete",
+        "image",
+        Some(image_id.to_string()),
+        json!({
+            "name": deleted.name,
+            "version": deleted.version,
+            "platform": deleted.platform,
+            "manifest_digest": deleted.manifest_digest,
+        }),
+        ip.as_deref(),
+    )
+    .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}

@@ -47,6 +47,8 @@ import {
   type VmSnapshotRow,
 } from '@/features/machines/vmCommand'
 import { useMachineStream } from '@/features/machines/useMachineStream'
+import VncConsoleModal from '@/features/machines/VncConsoleModal.vue'
+import { vncRuntimeHint } from '@/features/machines/vncSession'
 import { useAuthStore } from '@/stores/auth'
 import { useToastStore } from '@/stores/toast'
 import { errorMessage } from '@/utils/errors'
@@ -295,6 +297,8 @@ const vmBusyName = ref('')
 const vmConfirm = ref<{ op: VmCommandOp; name: string; snapshot?: string } | null>(null)
 // 截图
 const vmScreenshot = ref<{ name: string; src: string } | null>(null)
+// noVNC 实时控制台（需要 vm:control；仅运行中的虚拟机可连接）
+const vncTarget = ref<{ vm: string } | null>(null)
 // 新建虚拟机
 const vmCreateOpen = ref(false)
 const vmCreateError = ref('')
@@ -459,6 +463,16 @@ function refreshVmList() {
 
 function screenshotVm(name: string) {
   void runVmCommand('screenshot', { name })
+}
+
+/** 打开 noVNC 实时控制台；libvirt 只在虚拟机运行时提供 VNC 显示。 */
+function openVncConsole(name: string) {
+  const state = vmRows.value.find((vm) => vm.name === name)?.state
+  if (!isVmRunningState(state)) {
+    toast.error('虚拟机未运行', `当前状态为 ${state ?? '未上报'}，请先启动后再打开控制台`)
+    return
+  }
+  vncTarget.value = { vm: name }
 }
 
 // ---- 新建虚拟机（底包 + 差分盘） ----
@@ -959,6 +973,15 @@ onMounted(() => void load())
                     </AppButton>
                     <AppButton size="sm" :disabled="vmBusy" @click="screenshotVm(vm.name)">
                       截图
+                    </AppButton>
+                    <AppButton
+                      size="sm"
+                      icon="terminal"
+                      :disabled="vmBusy || !isVmRunningState(vm.state)"
+                      :title="vncRuntimeHint(vm.state)"
+                      @click="openVncConsole(vm.name)"
+                    >
+                      控制台
                     </AppButton>
                     <AppButton size="sm" :disabled="vmBusy" @click="openVmSnapshots(vm.name)">
                       快照
@@ -1490,6 +1513,14 @@ onMounted(() => void load())
           </AppButton>
         </template>
       </AppModal>
+
+      <VncConsoleModal
+        v-if="vncTarget"
+        :serial="serial"
+        :vm="vncTarget.vm"
+        :open="vncTarget !== null"
+        @close="vncTarget = null"
+      />
 
       <ConfirmDialog
         :open="wakeOpen"
