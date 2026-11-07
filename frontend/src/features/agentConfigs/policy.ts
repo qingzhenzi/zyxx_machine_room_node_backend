@@ -9,6 +9,8 @@ export const POLICY_DEFAULTS: AgentPolicy = {
   poll_interval_secs: 2,
   download_concurrency: 4,
   cache_max_bytes: 10 * 1024 * 1024 * 1024,
+  telemetry_fast_interval_secs: 10,
+  telemetry_full_interval_secs: 300,
 }
 
 export const MAX_CACHE_BYTES = 1024 * 1024 * 1024 * 1024
@@ -57,6 +59,24 @@ export const POLICY_FIELDS: PolicyField[] = [
     max: MAX_CACHE_BYTES,
     unit: '字节',
   },
+  {
+    key: 'telemetry_fast_interval_secs',
+    label: '遥测 fast 间隔',
+    hint: '1-60 秒，默认 10 秒（CPU/内存/磁盘轻量快照）',
+    type: 'number',
+    min: 1,
+    max: 60,
+    unit: '秒',
+  },
+  {
+    key: 'telemetry_full_interval_secs',
+    label: '遥测 full 间隔',
+    hint: '60-3600 秒，默认 300 秒（含虚拟机/容器/安全/诊断）',
+    type: 'number',
+    min: 60,
+    max: 3600,
+    unit: '秒',
+  },
 ]
 
 export const SCOPE_ORDER: ScopeType[] = ['global', 'area', 'room']
@@ -72,6 +92,7 @@ export function formatPolicyValue(key: keyof AgentPolicy, value: unknown): strin
   if (typeof value !== 'number') return '—'
   if (key === 'cache_max_bytes') return formatBytes(value)
   if (key === 'poll_interval_secs') return `${value} 秒`
+  if (key === 'telemetry_fast_interval_secs' || key === 'telemetry_full_interval_secs') return `${value} 秒`
   return String(value)
 }
 

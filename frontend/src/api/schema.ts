@@ -80,6 +80,8 @@ export interface AgentPolicy {
   download_concurrency: number
   lxc_auto_start: boolean
   poll_interval_secs: number
+  telemetry_fast_interval_secs: number
+  telemetry_full_interval_secs: number
 }
 
 export interface AgentPolicyPatch {
@@ -87,6 +89,8 @@ export interface AgentPolicyPatch {
   download_concurrency?: number
   lxc_auto_start?: boolean
   poll_interval_secs?: number
+  telemetry_fast_interval_secs?: number
+  telemetry_full_interval_secs?: number
 }
 
 export interface Announcement {

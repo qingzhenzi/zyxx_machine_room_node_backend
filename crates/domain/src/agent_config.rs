@@ -28,7 +28,7 @@ pub const MAX_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 /// 机器遥测 fast 档上报间隔默认值（秒）。
 pub const DEFAULT_TELEMETRY_FAST_INTERVAL_SECS: u64 = 10;
 /// 机器遥测 fast 档上报间隔范围（秒）。
-pub const TELEMETRY_FAST_INTERVAL_SECS_RANGE: std::ops::RangeInclusive<u64> = 5..=60;
+pub const TELEMETRY_FAST_INTERVAL_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=60;
 /// 机器遥测 full 档上报间隔默认值（秒）。
 pub const DEFAULT_TELEMETRY_FULL_INTERVAL_SECS: u64 = 300;
 /// 机器遥测 full 档上报间隔范围（秒）。
@@ -365,7 +365,7 @@ mod tests {
                 poll_interval_secs: Some(1),
                 download_concurrency: Some(32),
                 cache_max_bytes: Some(0),
-                telemetry_fast_interval_secs: Some(5),
+                telemetry_fast_interval_secs: Some(1),
                 telemetry_full_interval_secs: Some(60),
                 ..Default::default()
             })
@@ -409,7 +409,7 @@ mod tests {
                 ..Default::default()
             },
             AgentPolicyPatch {
-                telemetry_fast_interval_secs: Some(4),
+                telemetry_fast_interval_secs: Some(0),
                 ..Default::default()
             },
             AgentPolicyPatch {

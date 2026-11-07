@@ -46,11 +46,15 @@ const override = ref<Record<PolicyKey, boolean>>({
   poll_interval_secs: true,
   download_concurrency: true,
   cache_max_bytes: true,
+  telemetry_fast_interval_secs: true,
+  telemetry_full_interval_secs: true,
 })
 const lxcAutoStart = ref(POLICY_DEFAULTS.lxc_auto_start)
 const pollInterval = ref(String(POLICY_DEFAULTS.poll_interval_secs))
 const downloadConcurrency = ref(String(POLICY_DEFAULTS.download_concurrency))
 const cacheBytes = ref(String(POLICY_DEFAULTS.cache_max_bytes))
+const telemetryFast = ref(String(POLICY_DEFAULTS.telemetry_fast_interval_secs))
+const telemetryFull = ref(String(POLICY_DEFAULTS.telemetry_full_interval_secs))
 const submitting = ref(false)
 const error = ref('')
 
@@ -78,6 +82,12 @@ watch(
       poll_interval_secs: isEdit ? patch?.poll_interval_secs !== undefined : true,
       download_concurrency: isEdit ? patch?.download_concurrency !== undefined : true,
       cache_max_bytes: isEdit ? patch?.cache_max_bytes !== undefined : true,
+      telemetry_fast_interval_secs: isEdit
+        ? patch?.telemetry_fast_interval_secs !== undefined
+        : true,
+      telemetry_full_interval_secs: isEdit
+        ? patch?.telemetry_full_interval_secs !== undefined
+        : true,
     }
     lxcAutoStart.value = patch?.lxc_auto_start ?? POLICY_DEFAULTS.lxc_auto_start
     pollInterval.value = String(patch?.poll_interval_secs ?? POLICY_DEFAULTS.poll_interval_secs)
@@ -85,6 +95,12 @@ watch(
       patch?.download_concurrency ?? POLICY_DEFAULTS.download_concurrency,
     )
     cacheBytes.value = String(patch?.cache_max_bytes ?? POLICY_DEFAULTS.cache_max_bytes)
+    telemetryFast.value = String(
+      patch?.telemetry_fast_interval_secs ?? POLICY_DEFAULTS.telemetry_fast_interval_secs,
+    )
+    telemetryFull.value = String(
+      patch?.telemetry_full_interval_secs ?? POLICY_DEFAULTS.telemetry_full_interval_secs,
+    )
     submitting.value = false
     error.value = ''
   },
@@ -123,6 +139,31 @@ function buildPolicy(): AgentPolicyPatch | null {
       return null
     }
     patch.cache_max_bytes = value
+  }
+
+  if (override.value.telemetry_fast_interval_secs) {
+    const value = Number(telemetryFast.value)
+    if (!Number.isInteger(value) || value < 1 || value > 60) {
+      error.value = '遥测 fast 间隔必须是 1-60 的整数（秒）'
+      return null
+    }
+    patch.telemetry_fast_interval_secs = value
+  }
+  if (override.value.telemetry_full_interval_secs) {
+    const value = Number(telemetryFull.value)
+    if (!Number.isInteger(value) || value < 60 || value > 3600) {
+      error.value = '遥测 full 间隔必须是 60-3600 的整数（秒）'
+      return null
+    }
+    patch.telemetry_full_interval_secs = value
+  }
+  if (
+    patch.telemetry_fast_interval_secs !== undefined &&
+    patch.telemetry_full_interval_secs !== undefined &&
+    patch.telemetry_full_interval_secs < patch.telemetry_fast_interval_secs
+  ) {
+    error.value = 'full 间隔不能小于 fast 间隔'
+    return null
   }
 
   return patch
@@ -303,6 +344,64 @@ async function submit() {
             </div>
           </div>
 
+          <div class="flex items-center justify-between gap-4 px-3 py-2.5">
+            <div class="min-w-0">
+              <p class="text-[11.5px] text-ink">遥测 fast 间隔</p>
+              <p class="text-[10.5px] text-faint">1-60 秒，默认 10 秒；控制 CPU/内存/磁盘刷新频率</p>
+            </div>
+            <div class="flex shrink-0 items-center gap-3">
+              <label class="flex items-center gap-1.5 text-[10.5px] text-muted">
+                <input
+                  v-model="override.telemetry_fast_interval_secs"
+                  type="checkbox"
+                  class="h-3.5 w-3.5 rounded border-line text-accent focus:ring-accent/25"
+                />
+                覆盖
+              </label>
+              <div class="flex items-center gap-1.5">
+                <input
+                  v-model="telemetryFast"
+                  type="number"
+                  min="1"
+                  max="60"
+                  step="1"
+                  :disabled="!override.telemetry_fast_interval_secs"
+                  class="input h-8 w-[88px] text-right"
+                />
+                <span class="text-[10.5px] text-muted">秒</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="flex items-center justify-between gap-4 px-3 py-2.5">
+            <div class="min-w-0">
+              <p class="text-[11.5px] text-ink">遥测 full 间隔</p>
+              <p class="text-[10.5px] text-faint">60-3600 秒，默认 300 秒；含虚拟机/容器/安全/诊断</p>
+            </div>
+            <div class="flex shrink-0 items-center gap-3">
+              <label class="flex items-center gap-1.5 text-[10.5px] text-muted">
+                <input
+                  v-model="override.telemetry_full_interval_secs"
+                  type="checkbox"
+                  class="h-3.5 w-3.5 rounded border-line text-accent focus:ring-accent/25"
+                />
+                覆盖
+              </label>
+              <div class="flex items-center gap-1.5">
+                <input
+                  v-model="telemetryFull"
+                  type="number"
+                  min="60"
+                  max="3600"
+                  step="1"
+                  :disabled="!override.telemetry_full_interval_secs"
+                  class="input h-8 w-[88px] text-right"
+                />
+                <span class="text-[10.5px] text-muted">秒</span>
+              </div>
+            </div>
+          </div>
+
           <div class="flex items-start justify-between gap-4 px-3 py-2.5">
             <div class="min-w-0">
               <p class="text-[11.5px] text-ink">缓存上限</p>
@@ -334,7 +433,7 @@ async function submit() {
       <p
         class="rounded-md border border-line bg-canvas/60 px-3 py-2 text-[10.5px] leading-5 text-muted"
       >
-        默认策略：LXC 不自动启动 · 轮询 2 秒 · 下载并发 4 · 缓存上限 10 GiB。 保存后返回
+        默认策略：LXC 不自动启动 · 轮询 2 秒 · 下载并发 4 · 缓存上限 10 GiB · 遥测 fast 10 秒 / full 300 秒。 保存后返回
         `pushed_rooms` 表示成功下发到设备槽位的房间数。
       </p>
     </div>
