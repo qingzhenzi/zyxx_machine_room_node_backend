@@ -142,3 +142,29 @@
 - [ ] 同一镜像第二次制作命中 `already_exists`，不重复上传；
 - [ ] 非 qcow2/size 不符/非法 sha 的 register 被拒绝；
 - [ ] 审计记录 制作/上传/发布 三个动作；失败可重试且幂等。
+
+### 8.5 实施定稿（2026-11-07 深夜，阶段 2 落地版本）
+
+- **分片**：agent 把导出 qcow2 按 **32 MiB** 切分（远小于 S3/verify 的 64 MiB get_bytes 上限），
+  每片独立 `objects/<sha256>`；manifest 由 device-pki 在 register 时构造并签名，
+  因此复用现有 `image.chunks` + `images/{id}/verify` + `publish` 全链路。
+- **设备侧端点**（mTLS，agent 调用）：
+  - `POST /machine/images/presign-upload` body `{sha256,size_bytes}` →
+    `{object_key, upload_url, expires_at, already_exists}`；对象已存在时跳过上传。
+  - `POST /machine/images/register` body
+    `{name,version,platform,kind:"vm_disk",format:"qcow2",compression:"none",
+      total_size, parts:[{sha256,size}], annotations?}` →
+    `{image_id, manifest_digest, status:"manifest_ready"}`；
+    校验每个 part 对象存在且 HEAD 大小一致、parts 总数 ≤2048、单 part ≤64 MiB、
+    sum(part.size)==total_size；name/version/platform 复用 domain 校验；
+    (name,version,platform) 重复 → 409。
+- **agent 命令**：`vm.command` 新增 op `image.make`
+  args `{vm_name, name, version, platform?, base_volume?, description?}`；
+  要求 VM shut off；流程 = qemu-img 导出 → 32MiB 分片 → 逐片 presign/PUT（已存在跳过）
+  → register（device-pki 签名 manifest）→ 返回 `{image_id, manifest_digest, total_size, chunks}`；
+  超时 600s；失败清理本地导出文件。
+- **控制台**：「制作镜像」按钮在 VM 行内（关机才可用）→ 弹窗填镜像名/版本 →
+  下发 image.make → 成功后自动调用 `POST /admin/images/{id}/verify` 与
+  `POST /admin/images/{id}/publish`，展示最终状态与镜像列表入口。
+- **验收（本轮）**：本机 session VM 导出 → 上传 rustfs → register → verify → publish →
+  `/images` 可见且可分配；失败用例：qcow2 非镜像/magic 错误在 verify 阶段被拒。

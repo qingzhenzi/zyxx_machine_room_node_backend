@@ -186,9 +186,73 @@ impl StorageService {
         Ok(())
     }
 
+    /// 对象大小（HEAD 的 Content-Length）。对象不存在返回 `None`；其它失败返回错误。
+    ///
+    /// 用于阶段 2 镜像登记：agent 上传分片后，服务端必须逐个核对对象大小，
+    /// 不能只信 agent 上报的 `parts[].size`。
+    pub async fn object_len(&self, object_key: &str) -> Result<Option<u64>> {
+        // HEAD 必须用 HEAD 方法签名：用 GET 预签名 URL 发 HEAD 会被 S3 按
+        // "签名方法不匹配" 拒绝（rustfs 实测 HTTP 403）。
+        let presigned = self.presign("HEAD", object_key, Utc::now())?;
+        let response = self
+            .client
+            .head(&presigned.url)
+            .send()
+            .await
+            .map_err(|error| transport_error("读取 S3 对象大小失败", object_key, error))?;
+        let status = response.status();
+        if status.as_u16() == 404 {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            bail!(
+                "读取 S3 对象大小失败：{object_key}（HTTP {}）",
+                status.as_u16()
+            );
+        }
+        // rustfs 实测 HEAD 返回 `Content-Length: 0`（而非缺失），不能直接采信；
+        // 只有 >0 的值才作为对象大小，否则走 Range 回退拿真实总大小。
+        if let Some(length) = response.content_length() {
+            if length > 0 {
+                return Ok(Some(length));
+            }
+        }
+        // 部分 S3 兼容实现（rustfs 实测）对 HEAD 不返回 Content-Length：
+        // 回退为 GET Range bytes=0-0，从 `Content-Range: bytes 0-0/<total>` 解析总大小。
+        let ranged = self.presign("GET", object_key, Utc::now())?;
+        let response = self
+            .client
+            .get(&ranged.url)
+            .header(reqwest::header::RANGE, "bytes=0-0")
+            .send()
+            .await
+            .map_err(|error| transport_error("读取 S3 对象大小失败（range 回退）", object_key, error))?;
+        let status = response.status();
+        if status.as_u16() == 404 {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            bail!(
+                "读取 S3 对象大小失败（range 回退）：{object_key}（HTTP {}）",
+                status.as_u16()
+            );
+        }
+        if let Some(total) = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.rsplit('/').next())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            return Ok(Some(total));
+        }
+        Ok(Some(0))
+    }
+
     /// 对象是否存在（预签名 GET + HEAD）。仅用于登记附件时做一次低成本校验。
     pub async fn object_exists(&self, object_key: &str) -> Result<bool> {
-        let presigned = self.presign_get(object_key)?;
+        // 同上：HEAD 请求必须使用 HEAD 预签名。
+        let presigned = self.presign("HEAD", object_key, Utc::now())?;
         let response = self
             .client
             .head(&presigned.url)

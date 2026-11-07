@@ -54,6 +54,7 @@
 | `snapshot.restore` / `snapshot.delete` | `{name, snapshot}` | 关机状态下恢复/删除 |
 | `disk.info` | `{name}` | data `{disks:[{path, format, virtual_size, backing_path, backing_format}], chain:[...]}` |
 | `export` | `{name, format="qcow2"}` | 导出完整 qcow2；data `{path, sha256, size_bytes}`（上传发布 = 阶段 2） |
+| `image.make` | `{vm_name, name, version, platform?, base_volume?, description?}` | **阶段 2**：把关机 VM 导出为镜像并登记（agent 执行导出→分片上传→device-pki register）；data `{image_id, manifest_digest, total_size, chunks}`；pending 超时 600s |
 
 **校验规则**（后端强制，前端同规则预校验）：
 
@@ -106,6 +107,42 @@
   `status`: `pending` / `ok` / `error` / `timeout`；`data` 为 agent 回传 `result`。
 - **pending 超过 120s**：读取时顺手把表更新为 `timeout` 并返回（多副本并发更新幂等）。
 
+### 2.4 「从 VM 制作镜像」链路（阶段 2）
+
+控制台点「制作镜像」后，控制面下发 `vm.command {op:"image.make", args}`（权限 `vm:control`），
+agent 执行「导出 qcow2 → 32 MiB 分片 → 逐片 presign/PUT → register」，具体协议见
+[`vm-base-image-and-diff-disk.md`](vm-base-image-and-diff-disk.md) §8.5。
+
+**device-pki 设备 mTLS 端点**（agent 调用，身份来自设备证书）：
+
+| 方法/路径 | 请求体 | 响应 | 错误 |
+| --- | --- | --- | --- |
+| `POST /machine/images/presign-upload` | `{sha256, size_bytes}` | `{object_key:"objects/<sha256>", upload_url, expires_at, already_exists}` | 400（sha/大小非法）、401/403（证书无存活注册）、503（未配置 S3） |
+| `POST /machine/images/register` | `{name, version, platform, kind:"vm_disk", format:"qcow2", compression:"none", total_size, parts:[{sha256,size}], annotations?}` | `{image_id, manifest_digest, status:"manifest_ready"}` | 400（参数/分片对象缺失或大小不符）、409（同名/同版本/同平台已存在）、503（S3 不可用） |
+
+register 校验（服务端不信任 agent）：
+
+- `parts` 1..=2048，单 part 1..=64 MiB，`sum(part.size)==total_size`（≤32 GiB），sha256 必须 64 位小写 hex；
+- 每个 part 的 `objects/<sha256>` 必须已上传，且服务端 `HEAD content-length == part.size`；
+- `kind=vm_disk` / `format=qcow2` / `compression=none`（其它 400）；
+- `name/version/platform` 复用 `qe_domain::storage` 校验；`name` 只允许小写字母/数字/`-_.`；
+- annotations 保留调用方字段，并强制 `source="vm-export"` + `serial=<设备证书 serial>`；
+- 服务端构造并 Ed25519 签名 manifest（`manifests/<digest>.json`、`signatures/<digest>.sig`），
+  写 `image_artifacts`（status=`manifest_ready`，created_by=NULL）+ `image_chunks`；
+  `(name,version,platform)` 重复 → 409；失败时清理本次写入的 manifest/签名对象与记录。
+
+**控制台编排**：`image.make` 成功后（data 含 `image_id`/`manifest_digest`）前端串行调用
+`POST /admin/images/{id}/verify` → `POST /admin/images/{id}/publish`（发布通道 dev/test/prod），
+展示 verify 检查项与最终状态，成功后可从 `/images` 分配/发布。
+
+**边界**：
+
+- VM 必须 **shut off**（运行中按钮禁用；agent 侧也会拒绝）；
+- 导出/上传/登记耗时较长：`image.make` 的 pending 超时阈值为 **600s**（普通命令 120s）；
+- 分片 32 MiB 是 agent 侧切割大小，远低于 `get_bytes` 64 MiB 上限，复用现有 `verify` 全链路；
+- 同一 sha 对象内容寻址，`presign-upload` 命中 `already_exists=true` 时 agent 跳过上传；
+- 若上传/register 中途失败，agent 重试即可（presign/register 幂等；同名镜像重复 register 返回 409）。
+
 ## 3. 控制台交互
 
 机器详情页「虚拟机」面板（`vm:control` 才显示操作，否则只读）：
@@ -118,6 +155,8 @@
 - **磁盘链**：`disk.info` 展示 底包 → 差分盘 → 快照 的关系与每个磁盘的 backing 信息。
 - **导出**：展示机器本地导出路径与 sha256，并注明「上传为镜像 = 阶段 2」。
 - 命令下发后 1s × 60 次轮询；成功 toast、agent 错误/超时提示；启停/创建后自动刷新列表。
+- **制作镜像**：关机 VM 行内「制作镜像」按钮（需 `vm:control` + `image:manage`）→ 填镜像名/版本/平台/发布通道 →
+  `image.make`（最长等 10 分钟）→ 自动 verify + publish，弹窗展示三步状态与 verify 结果，成功后链接 `/images`。
 
 教师工作台新增「下发环境配置」卡：选房间 + 底包 + 规格 → 批量下发 →
 展示每槽位的 VM 名预览、request_id 与轮询状态（已创建/失败/超时/未下发）。

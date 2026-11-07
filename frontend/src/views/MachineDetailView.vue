@@ -34,9 +34,14 @@ import {
   isValidVmName,
   parseDiskInfo,
   parseExportResult,
+  buildMakeImageArgs,
+  isVmRunningState,
+  parseMakeImageResult,
   parseSnapshotList,
+  validateMakeImageForm,
   validateVmCreateForm,
   type VmCreateForm,
+  type VmMakeImageForm,
   type VmDiskInfoView,
   type VmExportView,
   type VmSnapshotRow,
@@ -345,8 +350,11 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function pollVmCommand(requestId: string): Promise<VmCommandReply> {
-  for (let attempt = 0; attempt < VM_POLL_MAX_ATTEMPTS; attempt += 1) {
+async function pollVmCommand(
+  requestId: string,
+  maxAttempts: number = VM_POLL_MAX_ATTEMPTS,
+): Promise<VmCommandReply> {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const reply = await api.vmCommandResult(serial.value, requestId)
     if (reply.status !== 'pending') return reply
     await sleep(VM_POLL_INTERVAL_MS)
@@ -368,13 +376,14 @@ async function sendVmCommand(
   op: VmCommandOp,
   args: Record<string, unknown>,
   label: string,
+  pollAttempts: number = VM_POLL_MAX_ATTEMPTS,
 ): Promise<VmCommandReply | null> {
   if (!serial.value || vmBusy.value) return null
   vmBusy.value = true
   vmBusyName.value = label
   try {
     const accepted = await api.vmCommand(serial.value, { op, args })
-    const reply = await pollVmCommand(accepted.request_id)
+    const reply = await pollVmCommand(accepted.request_id, pollAttempts)
     if (reply.status === 'ok') return reply
     if (reply.status === 'timeout') {
       toast.error(`${label}超时`, '60s 内未收到机器回报，请确认机器在线且 agent 正常')
@@ -581,6 +590,152 @@ async function openVmExport(name: string) {
     const parsed = parseExportResult(reply.data)
     if (parsed) vmExportResult.value = parsed
     else toast.error('导出结果无法解析', 'agent 没有返回 path/sha256')
+  }
+}
+
+// ---- 制作镜像（image.make → verify → publish；设计与 agent 契约见 §8.5） ----
+
+const VM_IMAGE_MAKE_POLL_ATTEMPTS = 600
+const canMakeImage = computed(() => auth.can(PERMISSIONS.imageManage) && canVmControl.value)
+
+type MakeStepStatus = 'pending' | 'running' | 'ok' | 'error'
+interface MakeStep {
+  key: string
+  label: string
+  status: MakeStepStatus
+  detail: string
+}
+interface MakeImageDone {
+  imageId: string
+  manifestDigest: string
+  channel: string
+  status: string
+}
+
+const vmMakeOpen = ref(false)
+const vmMakeVm = ref('')
+const vmMakeBusy = ref(false)
+const vmMakeError = ref('')
+const vmMakeDone = ref<MakeImageDone | null>(null)
+const vmMakeSteps = ref<MakeStep[]>([])
+const vmMakeForm = ref<VmMakeImageForm>({
+  name: '',
+  version: '1.0.0',
+  platform: 'linux/amd64',
+  baseVolume: '',
+  description: '',
+  channel: 'prod',
+})
+
+/** VM 名 → 合法镜像名（小写 + 白名单字符；仅用于预填，可编辑）。 */
+function defaultImageName(vmName: string): string {
+  const normalized = vmName
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^[._-]+|[._-]+$/g, '')
+    .slice(0, 64)
+  return normalized || 'vm-image'
+}
+
+function setMakeStep(key: string, status: MakeStepStatus, detail = '') {
+  vmMakeSteps.value = vmMakeSteps.value.map((step) =>
+    step.key === key ? { ...step, status, detail } : step,
+  )
+}
+
+function openVmMake(vmName: string) {
+  vmMakeVm.value = vmName
+  vmMakeForm.value = {
+    name: defaultImageName(vmName),
+    version: '1.0.0',
+    platform: 'linux/amd64',
+    baseVolume: '',
+    description: '',
+    channel: 'prod',
+  }
+  vmMakeError.value = ''
+  vmMakeDone.value = null
+  vmMakeSteps.value = []
+  vmMakeOpen.value = true
+}
+
+async function submitVmMake() {
+  const error = validateMakeImageForm(vmMakeForm.value)
+  vmMakeError.value = error ?? ''
+  if (error) return
+  vmMakeBusy.value = true
+  vmMakeDone.value = null
+  vmMakeError.value = ''
+  vmMakeSteps.value = [
+    {
+      key: 'make',
+      label: '导出并上传（image.make）',
+      status: 'running',
+      detail: '等待机器执行，最长 10 分钟',
+    },
+    { key: 'verify', label: '校验镜像（verify）', status: 'pending', detail: '' },
+    { key: 'publish', label: '发布镜像（publish）', status: 'pending', detail: '' },
+  ]
+  try {
+    const reply = await sendVmCommand(
+      'image.make',
+      buildMakeImageArgs(vmMakeVm.value, vmMakeForm.value),
+      '制作镜像',
+      VM_IMAGE_MAKE_POLL_ATTEMPTS,
+    )
+    if (!reply || reply.status !== 'ok') {
+      setMakeStep('make', 'error', reply?.error ?? '命令未成功')
+      return
+    }
+    const parsed = parseMakeImageResult(reply.data)
+    if (!parsed) {
+      setMakeStep('make', 'error', 'agent 没有返回 image_id/manifest_digest')
+      return
+    }
+    setMakeStep('make', 'ok', `image_id=${parsed.imageId}`)
+
+    setMakeStep('verify', 'running', '')
+    const verifyReply = await api.verifyImage(parsed.imageId)
+    const checks = verifyReply.verification?.report?.checks ?? []
+    const failedChecks = checks.filter((check) => check.ok === false)
+    if (verifyReply.verification?.ok !== true) {
+      const detail =
+        verifyReply.verification?.report?.errors?.join('；') ||
+        failedChecks
+          .map((check) => check.name ?? '')
+          .filter(Boolean)
+          .join('；') ||
+        'verify 未通过'
+      setMakeStep('verify', 'error', detail)
+      vmMakeError.value = detail
+      return
+    }
+    setMakeStep('verify', 'ok', `${checks.length} 项检查通过`)
+
+    setMakeStep('publish', 'running', '')
+    const artifact = await api.publishImage(parsed.imageId, {
+      channel: vmMakeForm.value.channel,
+    })
+    setMakeStep('publish', 'ok', `status=${artifact.status}`)
+    vmMakeDone.value = {
+      imageId: parsed.imageId,
+      manifestDigest: parsed.manifestDigest,
+      channel: vmMakeForm.value.channel,
+      status: artifact.status,
+    }
+    toast.success(
+      '镜像制作完成',
+      `${vmMakeForm.value.name}:${vmMakeForm.value.version} → ${artifact.status}`,
+    )
+    // 新镜像可能作为底包出现在「新建虚拟机 / 下发环境」下拉里。
+    void loadVmBaseImages()
+  } catch (caught) {
+    const message = errorMessage(caught, '制作镜像失败')
+    vmMakeError.value = message
+    const running = vmMakeSteps.value.find((step) => step.status === 'running')
+    if (running) setMakeStep(running.key, 'error', message)
+  } finally {
+    vmMakeBusy.value = false
   }
 }
 
@@ -813,6 +968,20 @@ onMounted(() => void load())
                     </AppButton>
                     <AppButton size="sm" :disabled="vmBusy" @click="openVmExport(vm.name)">
                       导出
+                    </AppButton>
+                    <AppButton
+                      v-if="canMakeImage"
+                      size="sm"
+                      icon="package"
+                      :disabled="vmBusy || isVmRunningState(vm.state)"
+                      :title="
+                        isVmRunningState(vm.state)
+                          ? '请先关机再制作镜像（导出要求 shut off）'
+                          : '把该虚拟机导出为镜像并发布'
+                      "
+                      @click="openVmMake(vm.name)"
+                    >
+                      制作镜像
                     </AppButton>
                   </template>
                 </div>
@@ -1197,6 +1366,128 @@ onMounted(() => void load())
             >重新导出</AppButton
           >
           <AppButton variant="primary" @click="vmExportOpen = false">关闭</AppButton>
+        </template>
+      </AppModal>
+
+      <AppModal
+        :open="vmMakeOpen"
+        title="制作镜像"
+        :description="
+          vmMakeVm ? `从 ${vmMakeVm} 导出 qcow2 → 分片上传 → verify → publish（虚拟机需关机）` : ''
+        "
+        size="lg"
+        @close="vmMakeOpen = false"
+      >
+        <div class="grid grid-cols-2 gap-3">
+          <label class="flex flex-col gap-1 text-[11px] text-muted">
+            镜像名（小写字母/数字/`-_.`）
+            <input
+              v-model="vmMakeForm.name"
+              placeholder="lab-base"
+              class="h-9 rounded-md border border-line bg-surface px-3 text-[12px] text-ink outline-none focus:border-accent"
+            />
+          </label>
+          <label class="flex flex-col gap-1 text-[11px] text-muted">
+            版本
+            <input
+              v-model="vmMakeForm.version"
+              placeholder="1.0.0"
+              class="h-9 rounded-md border border-line bg-surface px-3 text-[12px] text-ink outline-none focus:border-accent"
+            />
+          </label>
+          <label class="flex flex-col gap-1 text-[11px] text-muted">
+            平台（{os}/{arch}）
+            <input
+              v-model="vmMakeForm.platform"
+              placeholder="linux/amd64"
+              class="h-9 rounded-md border border-line bg-surface px-3 text-[12px] text-ink outline-none focus:border-accent"
+            />
+          </label>
+          <label class="flex flex-col gap-1 text-[11px] text-muted">
+            发布通道
+            <select
+              v-model="vmMakeForm.channel"
+              class="h-9 rounded-md border border-line bg-surface px-2 text-[12px] text-ink outline-none focus:border-accent"
+            >
+              <option value="dev">dev</option>
+              <option value="test">test</option>
+              <option value="prod">prod</option>
+            </select>
+          </label>
+          <label class="col-span-2 flex flex-col gap-1 text-[11px] text-muted">
+            底包卷名（可选，写入 manifest annotations 作来源信息）
+            <input
+              v-model="vmMakeForm.baseVolume"
+              placeholder="ubuntu-22.04（可留空）"
+              class="h-9 rounded-md border border-line bg-surface px-3 text-[12px] text-ink outline-none focus:border-accent"
+            />
+          </label>
+          <label class="col-span-2 flex flex-col gap-1 text-[11px] text-muted">
+            说明（可选）
+            <textarea
+              v-model="vmMakeForm.description"
+              rows="2"
+              class="rounded-md border border-line bg-surface px-3 py-2 text-[12px] text-ink outline-none focus:border-accent"
+            />
+          </label>
+        </div>
+
+        <p v-if="vmMakeError" class="mt-2 text-[11px] text-rose-600">{{ vmMakeError }}</p>
+
+        <ol v-if="vmMakeSteps.length" class="mt-3 flex flex-col gap-1.5">
+          <li
+            v-for="step in vmMakeSteps"
+            :key="step.key"
+            class="flex items-start gap-2 rounded-md border border-line bg-canvas/40 px-3 py-2 text-[11px]"
+          >
+            <StateBadge
+              :label="
+                step.status === 'ok'
+                  ? '完成'
+                  : step.status === 'error'
+                    ? '失败'
+                    : step.status === 'running'
+                      ? '进行中'
+                      : '等待'
+              "
+              :tone="
+                step.status === 'ok'
+                  ? 'emerald'
+                  : step.status === 'error'
+                    ? 'rose'
+                    : step.status === 'running'
+                      ? 'amber'
+                      : 'slate'
+              "
+            />
+            <div class="min-w-0">
+              <p class="text-[11px] text-ink">{{ step.label }}</p>
+              <p v-if="step.detail" class="mt-0.5 break-all font-mono text-[10px] text-faint">
+                {{ step.detail }}
+              </p>
+            </div>
+          </li>
+        </ol>
+
+        <div
+          v-if="vmMakeDone"
+          class="mt-3 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-[11px] text-emerald-700"
+        >
+          镜像已发布：<span class="font-mono">{{ vmMakeDone.imageId }}</span> ·
+          {{ vmMakeDone.channel }} ·
+          <RouterLink to="/images" class="font-medium underline">去镜像列表</RouterLink>
+        </div>
+
+        <template #footer>
+          <AppButton :disabled="vmMakeBusy" @click="vmMakeOpen = false">关闭</AppButton>
+          <AppButton
+            variant="primary"
+            :loading="vmMakeBusy"
+            :disabled="vmMakeBusy || vmMakeDone !== null"
+            @click="submitVmMake"
+          >
+            开始制作
+          </AppButton>
         </template>
       </AppModal>
 

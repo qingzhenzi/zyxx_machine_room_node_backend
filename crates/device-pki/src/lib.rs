@@ -10,7 +10,9 @@
 //!   `GET /agent/config`（节点配置，契约 §17.3）、
 //!   `POST /resources/presign`（对象存储预签名，契约 §16.2）、
 //!   `POST /machine/p2p/seed` / `GET /machine/p2p/peers`（P2P 镜像分发种子）、
-//!   `POST /machine/command/result`（机器命令结果回传）、`POST /revoke`
+//!   `POST /machine/command/result`（机器命令结果回传）、
+//!   `POST /machine/images/presign-upload` / `POST /machine/images/register`（VM 导出镜像上传/登记，
+//!   契约 `docs/vm-base-image-and-diff-disk.md` §8.5）、`POST /revoke`
 
 pub mod agent_config;
 pub mod ca;
@@ -19,6 +21,7 @@ pub mod challenge;
 pub mod channel;
 pub mod command;
 pub mod error;
+pub mod images;
 pub mod messaging;
 #[cfg(feature = "redis-notify")]
 pub mod notify_redis;

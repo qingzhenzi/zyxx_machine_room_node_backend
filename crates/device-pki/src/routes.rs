@@ -1363,7 +1363,16 @@ pub fn mtls_router(st: AppState) -> Router {
         .route("/machine/p2p/seed", post(crate::p2p::seed))
         .route("/machine/p2p/peers", get(crate::p2p::peers))
         // 机器命令结果回传（Phase1 VM 远程控制）
-        .route("/machine/command/result", post(crate::command::report_result))
+        .route(
+            "/machine/command/result",
+            post(crate::command::report_result),
+        )
+        // 阶段 2：从 VM 制作镜像 —— 分片上传预签名 + manifest 登记（契约 §8.5）
+        .route(
+            "/machine/images/presign-upload",
+            post(crate::images::presign_upload),
+        )
+        .route("/machine/images/register", post(crate::images::register))
         .route("/revoke", post(revoke))
         .with_state(st)
 }

@@ -2,6 +2,10 @@ import { describe, expect, it } from 'vitest'
 
 import {
   batchVmNamePreview,
+  buildMakeImageArgs,
+  isVmRunningState,
+  parseMakeImageResult,
+  validateMakeImageForm,
   buildCreateArgs,
   isValidVmName,
   parseDiskInfo,
@@ -11,6 +15,7 @@ import {
   slotSuffix,
   validateVmCreateForm,
   type VmCreateForm,
+  type VmMakeImageForm,
 } from '../vmCommand'
 
 function form(overrides: Partial<VmCreateForm> = {}): VmCreateForm {
@@ -149,5 +154,57 @@ describe('命令结果解析', () => {
       sizeBytes: 123,
     })
     expect(parseExportResult({})).toBeNull()
+  })
+})
+
+function makeForm(overrides: Partial<VmMakeImageForm> = {}): VmMakeImageForm {
+  return {
+    name: 'lab-base',
+    version: '1.0.0',
+    platform: 'linux/amd64',
+    baseVolume: 'ubuntu-22.04',
+    description: 'after install',
+    channel: 'prod',
+    ...overrides,
+  }
+}
+
+describe('制作镜像 image.make', () => {
+  it('表单校验（镜像名/版本/平台/说明）', () => {
+    expect(validateMakeImageForm(makeForm())).toBeNull()
+    expect(validateMakeImageForm(makeForm({ name: 'Lab Base' }))).toMatch(/镜像名/)
+    expect(validateMakeImageForm(makeForm({ name: 'x'.repeat(65) }))).toMatch(/镜像名/)
+    expect(validateMakeImageForm(makeForm({ version: '1 0' }))).toMatch(/版本/)
+    expect(validateMakeImageForm(makeForm({ platform: 'linux' }))).toMatch(/平台/)
+    expect(validateMakeImageForm(makeForm({ description: 'x'.repeat(256) }))).toMatch(/说明/)
+  })
+
+  it('buildMakeImageArgs 只带有效字段', () => {
+    expect(buildMakeImageArgs('lab-1', makeForm())).toEqual({
+      vm_name: 'lab-1',
+      name: 'lab-base',
+      version: '1.0.0',
+      platform: 'linux/amd64',
+      base_volume: 'ubuntu-22.04',
+      description: 'after install',
+    })
+    const minimal = buildMakeImageArgs('lab-1', makeForm({ baseVolume: '', description: '' }))
+    expect(minimal).not.toHaveProperty('base_volume')
+    expect(minimal).not.toHaveProperty('description')
+  })
+
+  it('运行中的 VM 禁用制作镜像', () => {
+    expect(isVmRunningState('running')).toBe(true)
+    expect(isVmRunningState('paused')).toBe(true)
+    expect(isVmRunningState('shut off')).toBe(false)
+    expect(isVmRunningState(null)).toBe(false)
+  })
+
+  it('parseMakeImageResult', () => {
+    expect(
+      parseMakeImageResult({ image_id: 'img-1', manifest_digest: 'abc', total_size: 5, chunks: 1 }),
+    ).toEqual({ imageId: 'img-1', manifestDigest: 'abc', totalSize: 5, chunks: 1 })
+    expect(parseMakeImageResult({ image_id: 'img-1' })).toBeNull()
+    expect(parseMakeImageResult(null)).toBeNull()
   })
 })

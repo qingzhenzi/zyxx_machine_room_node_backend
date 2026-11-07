@@ -34,6 +34,8 @@ pub enum Error {
     Forbidden(String),
     #[error("资源不存在")]
     NotFound,
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("对象存储未配置或不可用")]
     StorageUnavailable,
     #[error("请求过于频繁，请 {0}s 后再试")]
@@ -69,6 +71,7 @@ impl Error {
             Error::Unauthorized => "unauthorized",
             Error::Forbidden(_) => "forbidden",
             Error::NotFound => "not_found",
+            Error::Conflict(_) => "conflict",
             Error::StorageUnavailable => "storage_unavailable",
             Error::RateLimited(_) => "rate_limited",
             Error::DownlinkFull(_) => "downlink_full",
@@ -94,6 +97,7 @@ impl Error {
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
             Error::Forbidden(_) => StatusCode::FORBIDDEN,
             Error::NotFound => StatusCode::NOT_FOUND,
+            Error::Conflict(_) => StatusCode::CONFLICT,
             // 预签名依赖外部对象存储：没配置时不掩盖，让客户端按可重试处理
             Error::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Error::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,

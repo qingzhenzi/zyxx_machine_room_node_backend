@@ -4,7 +4,7 @@
 //! 名称 `[A-Za-z0-9._-]{1,64}`；create 的 vcpus 1..=64 / memory_mib 256..=262144 /
 //! disk_gb 1..=2048；base_volume 与 base_path 二选一（前端只做 base_volume 选择）。
 
-import type { VmCommandOp } from '@/api/schema'
+import type { ImageChannel, VmCommandOp } from '@/api/schema'
 
 export const VM_OP_LABELS: Record<VmCommandOp, string> = {
   list: '刷新列表',
@@ -20,6 +20,7 @@ export const VM_OP_LABELS: Record<VmCommandOp, string> = {
   'snapshot.delete': '删除快照',
   'disk.info': '磁盘链',
   export: '导出磁盘',
+  'image.make': '制作镜像',
 }
 
 /** 与服务端一致的名称白名单（防路径注入）。 */
@@ -153,6 +154,88 @@ export function batchVmNamePreview(prefix: string, slot: string): string {
   if (suffix.length > 62) suffix = suffix.slice(0, 62)
   const maxPrefix = Math.max(1, 64 - (suffix.length + 1))
   return `${prefix.trim().slice(0, maxPrefix)}-${suffix}`
+}
+
+// ---- 「制作镜像」（image.make：导出 → 分片上传 → register → verify → publish） ----
+
+/** 镜像名（与 qe_domain::validate_image_name 一致）：小写字母/数字/`-_.`，1..=64。 */
+export const IMAGE_NAME_PATTERN = /^[a-z0-9._-]{1,64}$/
+/** 镜像版本（与 qe_domain::validate_image_version 一致）。 */
+export const IMAGE_VERSION_PATTERN = /^[A-Za-z0-9._+-]{1,64}$/
+/** 平台 `{os}/{arch}`，两段各 1..=32，字母/数字/`-_.`。 */
+export const IMAGE_PLATFORM_PATTERN = /^[A-Za-z0-9._-]{1,32}\/[A-Za-z0-9._-]{1,32}$/
+
+export interface VmMakeImageForm {
+  name: string
+  version: string
+  platform: string
+  /** 可选：该 VM 使用的底包卷名（仅写进 manifest annotations 作为来源信息）。 */
+  baseVolume: string
+  description: string
+  /** 发布通道（verify 通过后 publish 用）。 */
+  channel: ImageChannel
+}
+
+export interface VmMakeImageResult {
+  imageId: string
+  manifestDigest: string
+  totalSize: number | null
+  chunks: number | null
+}
+
+/** 运行中的 VM 不允许制作镜像（导出要求关机，避免 qcow2 元数据不一致）。 */
+export function isVmRunningState(state: string | null | undefined): boolean {
+  const normalized = (state ?? '').trim().toLowerCase()
+  return ['running', 'paused', 'restarting', 'blocked', 'in shutdown'].includes(normalized)
+}
+
+/** 返回第一条错误信息；null = 合法。 */
+export function validateMakeImageForm(form: VmMakeImageForm): string | null {
+  if (!IMAGE_NAME_PATTERN.test(form.name.trim())) {
+    return '镜像名只允许小写字母、数字、点、下划线、短横线（1-64 字符）'
+  }
+  if (!IMAGE_VERSION_PATTERN.test(form.version.trim())) {
+    return '镜像版本只允许字母、数字、点、下划线、短横线、加号（1-64 字符）'
+  }
+  if (!IMAGE_PLATFORM_PATTERN.test(form.platform.trim())) {
+    return '平台格式应为 {os}/{arch}（如 linux/amd64）'
+  }
+  const baseVolume = form.baseVolume.trim()
+  if (baseVolume && !/^[A-Za-z0-9._-]{1,128}$/.test(baseVolume)) {
+    return '底包卷名只允许字母、数字、点、下划线、短横线（1-128 字符）'
+  }
+  if (form.description.trim().length > 255) return '说明不能超过 255 个字符'
+  return null
+}
+
+/** 构造 `image.make` 的 args（服务端/agent 契约见设计 §8.5）。 */
+export function buildMakeImageArgs(vmName: string, form: VmMakeImageForm): Record<string, unknown> {
+  const args: Record<string, unknown> = {
+    vm_name: vmName.trim(),
+    name: form.name.trim(),
+    version: form.version.trim(),
+    platform: form.platform.trim(),
+  }
+  const baseVolume = form.baseVolume.trim()
+  if (baseVolume) args.base_volume = baseVolume
+  const description = form.description.trim()
+  if (description) args.description = description
+  return args
+}
+
+/** 解析 `image.make` 的 result：`{image_id, manifest_digest, total_size?, chunks?}`。 */
+export function parseMakeImageResult(data: unknown): VmMakeImageResult | null {
+  const root = asObject(data)
+  if (!root) return null
+  const imageId = asString(root.image_id) ?? asString(root.imageId)
+  const manifestDigest = asString(root.manifest_digest) ?? asString(root.manifestDigest)
+  if (!imageId || !manifestDigest) return null
+  return {
+    imageId,
+    manifestDigest,
+    totalSize: asNumber(root.total_size) ?? asNumber(root.totalSize),
+    chunks: asNumber(root.chunks),
+  }
 }
 
 function asObject(value: unknown): Record<string, unknown> | null {

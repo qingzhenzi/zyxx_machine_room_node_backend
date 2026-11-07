@@ -713,6 +713,7 @@ export type VmCommandOp =
   | 'snapshot.delete'
   | 'disk.info'
   | 'export'
+  | 'image.make'
 
 export interface VmCommandRequest {
   op: VmCommandOp

@@ -24,7 +24,12 @@ use qe_db::machine::{MachineSnapshotMeta, MachineSnapshotRecord, MachineSummary}
 use crate::{
     api::extractors::{ApiJson, AuthUser, ClientIp},
     auth::authorization,
-    domain::{models::Page, rbac::permissions, validation, wol},
+    domain::{
+        models::Page,
+        rbac::permissions,
+        storage::{validate_image_name, validate_image_version, validate_platform},
+        validation, wol,
+    },
     error::{AppError, AppResult},
     state::AppState,
 };
@@ -329,6 +334,8 @@ async fn send_wake_packets(macs: &[wol::MacAddress]) -> (Vec<String>, Vec<String
 const VM_COMMAND_DOWNLINK_KIND: &str = "vm.command";
 /// pending 超过该秒数视为超时（GET 时顺手把表更新为 timeout）。
 const VM_COMMAND_PENDING_TIMEOUT_SECS: i64 = 120;
+/// `image.make`（导出→分片上传→登记）的 pending 超时阈值（设计 §8.5：600s）。
+const VM_COMMAND_IMAGE_MAKE_TIMEOUT_SECS: i64 = 600;
 
 /// 允许的 VM 操作白名单（阶段 1 + 阶段 1.5 底包/差分盘/快照）。
 const VM_COMMAND_OPS: &[&str] = &[
@@ -345,6 +352,7 @@ const VM_COMMAND_OPS: &[&str] = &[
     "snapshot.delete",
     "disk.info",
     "export",
+    "image.make",
 ];
 
 /// VM 名/snapshot 名的通用约束（防路径注入）：`[A-Za-z0-9._-]{1,64}`。
@@ -418,6 +426,8 @@ struct MachineCommandRow {
     error: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    /// 下发 payload（`{request_id,op,args}`），用于按 op 决定 pending 超时阈值。
+    payload: Option<serde_json::Value>,
 }
 
 // ---- 参数校验（纯函数，便于单测） ----
@@ -658,6 +668,56 @@ fn build_create_args(
     Ok(out)
 }
 
+/// 校验 `image.make` 的 args（从 VM 导出 → 分片上传 → 登记镜像，agent 侧执行）。
+///
+/// args：`{vm_name, name, version, platform?, base_volume?, description?}`；
+/// 镜像名/版本/平台复用 `qe_domain::storage` 的校验规则（服务端不信任 agent）。
+fn build_image_make_args(
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> AppResult<serde_json::Map<String, serde_json::Value>> {
+    reject_unknown_args(
+        args,
+        &[
+            "vm_name",
+            "name",
+            "version",
+            "platform",
+            "base_volume",
+            "description",
+        ],
+    )?;
+    let mut out = serde_json::Map::new();
+    let vm_name = expect_string(args, "vm_name")?.ok_or_else(|| bad_arg("缺少 vm_name"))?;
+    let vm_name = validate_name_token(&vm_name, "vm_name", VM_NAME_MAX_CHARS)?;
+    out.insert("vm_name".to_owned(), serde_json::json!(vm_name));
+
+    let name = expect_string(args, "name")?.ok_or_else(|| bad_arg("缺少镜像名 name"))?;
+    let name = validate_image_name(&name).map_err(|error| bad_arg(error.to_string()))?;
+    out.insert("name".to_owned(), serde_json::json!(name));
+
+    let version = expect_string(args, "version")?.ok_or_else(|| bad_arg("缺少镜像版本 version"))?;
+    let version = validate_image_version(&version).map_err(|error| bad_arg(error.to_string()))?;
+    out.insert("version".to_owned(), serde_json::json!(version));
+
+    if let Some(platform) = expect_string(args, "platform")?.filter(|value| !value.is_empty()) {
+        let platform = validate_platform(&platform).map_err(|error| bad_arg(error.to_string()))?;
+        out.insert("platform".to_owned(), serde_json::json!(platform));
+    }
+    if let Some(base_volume) = expect_string(args, "base_volume")?.filter(|value| !value.is_empty())
+    {
+        let base_volume = validate_volume_name(&base_volume)?;
+        out.insert("base_volume".to_owned(), serde_json::json!(base_volume));
+    }
+    if let Some(description) = expect_string(args, "description")?.filter(|value| !value.is_empty())
+    {
+        if description.chars().count() > 255 {
+            return Err(bad_arg("description 不能超过 255 个字符"));
+        }
+        out.insert("description".to_owned(), serde_json::json!(description));
+    }
+    Ok(out)
+}
+
 /// 校验 op 白名单与各 op 的 args（纯函数，便于单测）。
 fn validate_vm_command(request: VmCommandRequest) -> AppResult<ValidatedVmCommand> {
     let op = request.op.trim().to_ascii_lowercase();
@@ -740,6 +800,7 @@ fn validate_vm_command(request: VmCommandRequest) -> AppResult<ValidatedVmComman
             out.insert("format".to_owned(), serde_json::json!("qcow2"));
             out
         }
+        "image.make" => build_image_make_args(&args)?,
         // 单机生命周期/截图：只接受 name。
         _ => {
             reject_unknown_args(&args, &["name"])?;
@@ -1132,7 +1193,7 @@ pub async fn get_vm_command(
         .map_err(|_| AppError::bad_request("request_id 不是合法 UUID"))?;
 
     let row = sqlx::query_as::<_, MachineCommandRow>(
-        "SELECT request_id, status, result, error, created_at, updated_at
+        "SELECT request_id, status, result, error, created_at, updated_at, payload
            FROM machine_command_results
           WHERE request_id = $1 AND serial = $2",
     )
@@ -1145,8 +1206,18 @@ pub async fn get_vm_command(
 
     let mut status = row.status;
     let mut updated_at = row.updated_at;
+    // image.make 要做「导出 qcow2 + 分片上传」，耗时远高于普通命令（设计 §8.5 超时 600s）。
+    let pending_timeout_secs = match row
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("op"))
+        .and_then(|op| op.as_str())
+    {
+        Some("image.make") => VM_COMMAND_IMAGE_MAKE_TIMEOUT_SECS,
+        _ => VM_COMMAND_PENDING_TIMEOUT_SECS,
+    };
     if status == "pending"
-        && row.created_at + chrono::Duration::seconds(VM_COMMAND_PENDING_TIMEOUT_SECS) < Utc::now()
+        && row.created_at + chrono::Duration::seconds(pending_timeout_secs) < Utc::now()
     {
         sqlx::query(
             "UPDATE machine_command_results
@@ -1333,6 +1404,7 @@ mod tests {
             "snapshot.delete",
             "disk.info",
             "export",
+            "image.make",
         ] {
             assert!(VM_COMMAND_OPS.contains(&op), "缺少 op：{op}");
         }
@@ -1527,6 +1599,57 @@ mod tests {
             ))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn image_make_args_are_validated() {
+        let ok = validate_vm_command(request_args(
+            "image.make",
+            serde_json::json!({
+                "vm_name":"lab-1","name":"lab-base","version":"1.0.0",
+                "platform":"linux/amd64","base_volume":"ubuntu-22.04","description":"after install"
+            }),
+        ))
+        .unwrap();
+        assert_eq!(ok.args["vm_name"], serde_json::json!("lab-1"));
+        assert_eq!(ok.args["name"], serde_json::json!("lab-base"));
+        assert_eq!(ok.args["platform"], serde_json::json!("linux/amd64"));
+
+        for (args, label) in [
+            (
+                serde_json::json!({"name":"lab-base","version":"1.0.0"}),
+                "缺 vm_name",
+            ),
+            (
+                serde_json::json!({"vm_name":"lab-1","version":"1.0.0"}),
+                "缺镜像名",
+            ),
+            (
+                serde_json::json!({"vm_name":"lab-1","name":"lab-base"}),
+                "缺版本",
+            ),
+            (
+                serde_json::json!({"vm_name":"lab-1","name":"Lab Base","version":"1.0.0"}),
+                "镜像名非法",
+            ),
+            (
+                serde_json::json!({"vm_name":"lab-1","name":"lab-base","version":"1 0"}),
+                "版本非法",
+            ),
+            (
+                serde_json::json!({"vm_name":"lab-1","name":"lab-base","version":"1.0.0","platform":"linux"}),
+                "平台非法",
+            ),
+            (
+                serde_json::json!({"vm_name":"lab-1","name":"lab-base","version":"1.0.0","unknown":1}),
+                "未知字段",
+            ),
+        ] {
+            assert!(
+                validate_vm_command(request_args("image.make", args)).is_err(),
+                "应拒绝：{label}"
+            );
+        }
     }
 
     #[test]
