@@ -1362,6 +1362,8 @@ pub fn mtls_router(st: AppState) -> Router {
         // P2P 镜像分发：seed 登记 / peer 查询（ticket 即能力，仅内网 mTLS）
         .route("/machine/p2p/seed", post(crate::p2p::seed))
         .route("/machine/p2p/peers", get(crate::p2p::peers))
+        // 机器命令结果回传（Phase1 VM 远程控制）
+        .route("/machine/command/result", post(crate::command::report_result))
         .route("/revoke", post(revoke))
         .with_state(st)
 }
