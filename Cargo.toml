@@ -14,3 +14,14 @@ authors = ["QEStudio"]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# 磁盘优化（2026-11-07）：本机 target 曾达 128G（debug/incremental 单项 53G）。
+# dev/test 只保留行表级调试信息并关闭增量编译；需要完整调试时临时
+# `CARGO_PROFILE_DEV_DEBUG=2 cargo ...`。发布构建见上方 [profile.release]。
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
