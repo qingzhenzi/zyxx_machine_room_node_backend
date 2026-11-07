@@ -355,6 +355,14 @@ pub async fn enroll(
         tracing::info!(serial = %old_serial, slot = %req.slot, "superseded old cert, revoked immediately");
     }
 
+    if matches!(kind, TokenKind::Auto) {
+        // 新证书立即进入可用集合：客户端紧接着就会用这张证书做 mTLS
+        // confirm；等后台 5s 刷新会有一个窗口把首次 confirm 拒掉，导致
+        // enrollment 永远停在 issued（机器显示未激活）。
+        st.cert_status.mark_live(&issued.serial_hex);
+        tracing::info!(serial = %issued.serial_hex, slot = %req.slot, "new auto cert marked live immediately");
+    }
+
     match kind {
         TokenKind::Auto => Ok(Json(EnrollReply::Issued {
             cert_pem: issued.cert_pem,
@@ -424,7 +432,11 @@ pub async fn decide_enrollment(
     if let Some(note) = req.note.as_deref() {
         tracing::info!(enroll_id = %id, note, "approval decision note");
     }
-    if !req.approve {
+    if req.approve {
+        // 批准后客户端会立刻用证书 confirm；立即加入可用集合，避免 5s 缓存窗口。
+        st.cert_status.mark_live(&serial);
+        tracing::info!(enroll_id = %id, serial = %serial, "enrollment approved, cert marked live");
+    } else {
         // 立即生效，不等 5s 后台刷新
         st.cert_status.mark_revoked(&serial);
         tracing::info!(enroll_id = %id, serial = %serial, "enrollment rejected, cert revoked");

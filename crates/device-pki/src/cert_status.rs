@@ -73,6 +73,18 @@ impl CertStatusCache {
         Ok(count)
     }
 
+    /// 本地立即标记可用（新签证书/审批通过时用，不等 5s 刷新）。
+    pub fn mark_live(&self, serial: &str) {
+        self.revoked
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(serial);
+        self.live
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(serial.to_owned());
+    }
+
     /// 本地立即标记吊销（顶掉旧证书 / 审批拒绝时用，不等下一轮刷新）。
     pub fn mark_revoked(&self, serial: &str) {
         self.revoked

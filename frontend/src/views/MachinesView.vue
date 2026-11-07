@@ -16,6 +16,7 @@ import MetricCard from '@/features/areas/MetricCard.vue'
 import type { MetricCardProps } from '@/features/areas/MetricCard.vue'
 import { MACHINE_HEALTH_FILTERS, machineHealthMeta } from '@/features/machines/machineMeta'
 import { useMachineStream } from '@/features/machines/useMachineStream'
+import { useToastStore } from '@/stores/toast'
 import UsageBar from '@/features/machines/UsageBar.vue'
 import { errorMessage } from '@/utils/errors'
 import { formatRelative, formatSeconds, shortId } from '@/utils/format'
@@ -40,6 +41,9 @@ const roomId = ref('')
 const health = ref('')
 
 const stats = ref({ total: 0, online: 0, alerts: 0, missing: 0 })
+const toast = useToastStore()
+/** 已见过的 serial：轮询发现新设备时提示（首次加载不提示）。 */
+let knownSerials: Set<string> | null = null
 const statsLoading = ref(false)
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)))
@@ -188,6 +192,31 @@ const { run: refreshFromStream } = useDebounceFn(() => {
   void load()
   void loadStats()
 }, 400)
+
+// 前端兜底轮询：新设备注册后 presence 事件默认不通知 online、首个遥测快照也可能延迟，
+// 因此每 5s 刷新当前页；首次加载只建基线，后续出现新 serial 时 toast。
+useInterval(() => {
+  if (document.visibilityState === 'hidden') return
+  void Promise.all([load(), loadStats()])
+}, 5_000)
+
+watch(
+  () => items.value.map((item) => item.serial),
+  (serials) => {
+    const current = new Set(serials)
+    if (knownSerials && !keyword.value && !areaId.value && !roomId.value && !health.value) {
+      for (const machine of items.value) {
+        if (!knownSerials.has(machine.serial)) {
+          toast.success(
+            machine.report ? '新机器已上线' : '新机器已注册，等待首帧遥测',
+            `${machine.device_slot} · ${shortId(machine.serial, 10)}`,
+          )
+        }
+      }
+    }
+    knownSerials = new Set([...(knownSerials ?? []), ...current])
+  },
+)
 
 const { status: streamStatus, lastEventAt } = useMachineStream({
   onSnapshot: () => refreshFromStream(),
