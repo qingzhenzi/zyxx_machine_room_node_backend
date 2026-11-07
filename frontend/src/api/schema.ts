@@ -698,6 +698,29 @@ export interface WakeReply {
   warnings: string[]
 }
 
+/** VM 远程控制命令（与后端 op 白名单一致）。 */
+export type VmCommandOp = 'list' | 'start' | 'shutdown' | 'reboot' | 'destroy' | 'screenshot'
+
+export interface VmCommandRequest {
+  op: VmCommandOp
+  /** list 不传；其它命令必填。 */
+  name?: string
+}
+
+export interface VmCommandAccepted {
+  request_id: string
+}
+
+export interface VmCommandReply {
+  request_id: string
+  status: 'pending' | 'ok' | 'error' | 'timeout'
+  /** agent 回传结果：list → {vms:[...]}；screenshot → {format,image_base64,size_bytes}。 */
+  data?: Record<string, unknown> | null
+  error?: string | null
+  created_at: string
+  updated_at: string
+}
+
 export interface MachineReportSummary {
   agent_version: string
   collected_at: string

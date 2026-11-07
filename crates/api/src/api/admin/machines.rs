@@ -9,8 +9,10 @@ use std::{collections::VecDeque, convert::Infallible, time::Duration};
 use axum::{
     Json,
     extract::{Path, Query, State},
+    http::StatusCode,
     response::sse::{Event, Sse},
 };
+use chrono::{DateTime, Utc};
 use futures_util::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -20,7 +22,7 @@ use uuid::Uuid;
 use qe_db::machine::{MachineSnapshotMeta, MachineSnapshotRecord, MachineSummary};
 
 use crate::{
-    api::extractors::{AuthUser, ClientIp},
+    api::extractors::{ApiJson, AuthUser, ClientIp},
     auth::authorization,
     domain::{models::Page, rbac::permissions, validation, wol},
     error::{AppError, AppResult},
@@ -315,6 +317,270 @@ async fn send_wake_packets(macs: &[wol::MacAddress]) -> (Vec<String>, Vec<String
     (sent_to, warnings)
 }
 
+// ---------------------------------------------------------------------------
+// VM 远程控制（kind = vm.command，经 device_downlink 下发；结果回写 0031 表）
+// ---------------------------------------------------------------------------
+
+/// 下发 VM 命令的 device_downlink kind（与 room-agent 侧契约一致）。
+const VM_COMMAND_DOWNLINK_KIND: &str = "vm.command";
+/// pending 超过该秒数视为超时（GET 时顺手把表更新为 timeout）。
+const VM_COMMAND_PENDING_TIMEOUT_SECS: i64 = 120;
+/// 允许的 VM 操作白名单。`list` 不需要 name，其它命令必须带非空 name。
+const VM_COMMAND_OPS: &[&str] = &[
+    "list",
+    "start",
+    "shutdown",
+    "reboot",
+    "destroy",
+    "screenshot",
+];
+
+/// `POST /admin/machines/{serial}/vm/commands` 请求体。
+#[derive(Debug, Deserialize)]
+pub struct VmCommandRequest {
+    /// 操作：list / start / shutdown / reboot / destroy / screenshot。
+    pub op: String,
+    /// 虚拟机名；list 不传，其它命令必填。
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// 校验后的 VM 命令。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedVmCommand {
+    op: String,
+    name: Option<String>,
+}
+
+/// 202 响应：只回 request_id，前端据此轮询结果。
+#[derive(Debug, Serialize)]
+pub struct VmCommandAccepted {
+    pub request_id: Uuid,
+}
+
+/// GET 结果响应（`data` 为 agent 回传的 result；截图时含 image_base64）。
+#[derive(Debug, Serialize)]
+pub struct VmCommandReply {
+    pub request_id: Uuid,
+    pub status: String,
+    pub data: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// `machine_command_results` 行（表由迁移 0031 创建，T1 负责）。
+#[derive(Debug, sqlx::FromRow)]
+struct MachineCommandRow {
+    request_id: Uuid,
+    status: String,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+/// 校验 op 白名单与 name 约束（纯函数，便于单测）。
+///
+/// - `list`：不接受 name（传了非空 name 视为 400）；
+/// - `start/shutdown/reboot/destroy/screenshot`：必须带非空 name（≤128 字符）。
+fn validate_vm_command(request: VmCommandRequest) -> AppResult<ValidatedVmCommand> {
+    let op = request.op.trim().to_ascii_lowercase();
+    if !VM_COMMAND_OPS.contains(&op.as_str()) {
+        return Err(AppError::bad_request(format!(
+            "op 只能是 {}",
+            VM_COMMAND_OPS.join(" / ")
+        )));
+    }
+    let name = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if op == "list" {
+        if name.is_some() {
+            return Err(AppError::bad_request("list 命令不接受 name"));
+        }
+        return Ok(ValidatedVmCommand { op, name: None });
+    }
+    let Some(name) = name else {
+        return Err(AppError::bad_request(format!("{op} 命令必须提供非空 name")));
+    };
+    if name.chars().count() > 128 {
+        return Err(AppError::bad_request("name 长度不能超过 128 字符"));
+    }
+    Ok(ValidatedVmCommand {
+        op,
+        name: Some(name.to_owned()),
+    })
+}
+
+/// 构造 `vm.command` 下行 payload：`{"request_id","op","args":{"name"}}`。
+///
+/// `list` 的 args 为空对象（不带 name）。
+fn vm_command_downlink_payload(
+    request_id: Uuid,
+    command: &ValidatedVmCommand,
+) -> serde_json::Value {
+    let args = match command.name.as_deref() {
+        Some(name) => serde_json::json!({ "name": name }),
+        None => serde_json::json!({}),
+    };
+    serde_json::json!({
+        "request_id": request_id,
+        "op": command.op,
+        "args": args,
+    })
+}
+
+/// `POST /api/v1/admin/machines/{serial}/vm/commands` —— 下发 VM 远程控制命令。
+///
+/// 权限 `vm:control`；设备不存在 404；op/name 非法 400。
+/// 成功：插入 `machine_command_results(pending)` + enqueue downlink `vm.command`，
+/// 返回 **202** `{request_id}`；设备无存活证书/入队失败时清理 pending 行并返回 4xx/503。
+pub async fn create_vm_command(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    Path(serial): Path<String>,
+    ApiJson(request): ApiJson<VmCommandRequest>,
+) -> AppResult<(StatusCode, Json<VmCommandAccepted>)> {
+    authorization::require_permission(&state, id, permissions::VM_CONTROL).await?;
+
+    let serial = serial.trim();
+    if serial.is_empty() {
+        return Err(AppError::bad_request("serial 不能为空"));
+    }
+    let command = validate_vm_command(request)?;
+    let device = state
+        .machines
+        .summary(serial)
+        .await?
+        .ok_or_else(|| AppError::not_found("机器不存在"))?;
+
+    let request_id = Uuid::new_v4();
+    let downlink = vm_command_downlink_payload(request_id, &command);
+    sqlx::query(
+        "INSERT INTO machine_command_results (request_id, serial, kind, payload, status)
+         VALUES ($1, $2, $3, $4, 'pending')",
+    )
+    .bind(request_id)
+    .bind(&device.serial)
+    .bind(VM_COMMAND_DOWNLINK_KIND)
+    .bind(&downlink)
+    .execute(state.db.pool())
+    .await
+    .map_err(|error| AppError::internal(format!("写入 VM 命令失败: {error}")))?;
+
+    let downlink_text = downlink.to_string();
+    match state
+        .storage_repo
+        .enqueue_downlink_for_slot(
+            &device.device_slot,
+            VM_COMMAND_DOWNLINK_KIND,
+            &downlink_text,
+        )
+        .await
+    {
+        Ok(Some(device_serial)) => {
+            // 唤醒长连接（跨进程尽力而为；失败还有 2s 兜底轮询）。
+            if let Err(error) = state
+                .cache
+                .publish(
+                    &state.config.schedule_downlink_notify_channel,
+                    &device_serial,
+                )
+                .await
+            {
+                tracing::warn!(%error, %device_serial, "发布设备下行通知失败，vm.command 已入队");
+            }
+            Ok((StatusCode::ACCEPTED, Json(VmCommandAccepted { request_id })))
+        }
+        Ok(None) => {
+            cleanup_pending_vm_command(&state, request_id).await;
+            Err(AppError::service_unavailable(
+                "设备当前没有存活证书，VM 命令未下发",
+            ))
+        }
+        Err(error) => {
+            cleanup_pending_vm_command(&state, request_id).await;
+            Err(error.into())
+        }
+    }
+}
+
+/// 入队失败时清掉刚插入的 pending 行，避免留下永远不会被处理的命令。
+async fn cleanup_pending_vm_command(state: &AppState, request_id: Uuid) {
+    if let Err(error) = sqlx::query(
+        "DELETE FROM machine_command_results WHERE request_id = $1 AND status = 'pending'",
+    )
+    .bind(request_id)
+    .execute(state.db.pool())
+    .await
+    {
+        tracing::warn!(%error, %request_id, "清理未下发的 vm.command pending 行失败");
+    }
+}
+
+/// `GET /api/v1/admin/machines/{serial}/vm/commands/{request_id}` —— 查询命令结果。
+///
+/// 权限 `vm:control`；`(serial, request_id)` 不存在 404。pending 超过 120s 时
+/// 顺手把表更新为 `timeout`（多副本并发更新是幂等的）。
+pub async fn get_vm_command(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    Path((serial, request_id)): Path<(String, String)>,
+) -> AppResult<Json<VmCommandReply>> {
+    authorization::require_permission(&state, id, permissions::VM_CONTROL).await?;
+
+    let serial = serial.trim();
+    if serial.is_empty() {
+        return Err(AppError::bad_request("serial 不能为空"));
+    }
+    let request_id = request_id
+        .trim()
+        .parse::<Uuid>()
+        .map_err(|_| AppError::bad_request("request_id 不是合法 UUID"))?;
+
+    let row = sqlx::query_as::<_, MachineCommandRow>(
+        "SELECT request_id, status, result, error, created_at, updated_at
+           FROM machine_command_results
+          WHERE request_id = $1 AND serial = $2",
+    )
+    .bind(request_id)
+    .bind(serial)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(|error| AppError::internal(format!("查询 VM 命令失败: {error}")))?
+    .ok_or_else(|| AppError::not_found("命令不存在"))?;
+
+    let mut status = row.status;
+    let mut updated_at = row.updated_at;
+    if status == "pending"
+        && row.created_at + chrono::Duration::seconds(VM_COMMAND_PENDING_TIMEOUT_SECS) < Utc::now()
+    {
+        sqlx::query(
+            "UPDATE machine_command_results
+                SET status = 'timeout', updated_at = now()
+              WHERE request_id = $1 AND status = 'pending'",
+        )
+        .bind(request_id)
+        .execute(state.db.pool())
+        .await
+        .map_err(|error| AppError::internal(format!("更新 VM 命令超时失败: {error}")))?;
+        status = "timeout".to_owned();
+        updated_at = Utc::now();
+    }
+
+    Ok(Json(VmCommandReply {
+        request_id: row.request_id,
+        status,
+        data: row.result,
+        error: row.error,
+        created_at: row.created_at,
+        updated_at,
+    }))
+}
+
 /// SSE 实时流：新快照落库后 2 秒内推送；首次连接从当前最新 id 开始（不补历史），
 /// 断线重连带上最后收到的 `id` 作为 `after_id` 可补发最多 200 条。
 ///
@@ -439,4 +705,80 @@ fn machine_snapshot_frame(record: MachineSnapshotMeta) -> Event {
         "{}".to_owned()
     });
     Event::default().id(id).event("machine.snapshot").data(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(op: &str, name: Option<&str>) -> VmCommandRequest {
+        VmCommandRequest {
+            op: op.to_owned(),
+            name: name.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn vm_ops_whitelist_is_enforced() {
+        for op in [
+            "list",
+            "start",
+            "shutdown",
+            "reboot",
+            "destroy",
+            "screenshot",
+        ] {
+            let name = if op == "list" { None } else { Some("debian12") };
+            assert!(validate_vm_command(request(op, name)).is_ok(), "op={op}");
+        }
+        for op in ["exec", "rm-rf", ""] {
+            assert!(
+                validate_vm_command(request(op, Some("debian12"))).is_err(),
+                "应拒绝 op={op}"
+            );
+        }
+    }
+
+    #[test]
+    fn vm_command_name_rules_are_enforced() {
+        // list 不接受 name
+        assert!(validate_vm_command(request("list", Some("debian12"))).is_err());
+        assert!(validate_vm_command(request("list", None)).is_ok());
+        // 其它命令必须有非空 name
+        for op in ["start", "shutdown", "reboot", "destroy", "screenshot"] {
+            assert!(validate_vm_command(request(op, None)).is_err(), "op={op}");
+            assert!(
+                validate_vm_command(request(op, Some("  "))).is_err(),
+                "op={op} 空白 name 应拒绝"
+            );
+            assert!(
+                validate_vm_command(request(op, Some("debian12"))).is_ok(),
+                "op={op}"
+            );
+        }
+        // 超长 name
+        assert!(validate_vm_command(request("start", Some(&"x".repeat(129)))).is_err());
+    }
+
+    #[test]
+    fn vm_command_is_normalized_to_lowercase() {
+        let command = validate_vm_command(request(" START ", Some(" debian12 "))).unwrap();
+        assert_eq!(command.op, "start");
+        assert_eq!(command.name.as_deref(), Some("debian12"));
+    }
+
+    #[test]
+    fn downlink_payload_matches_contract() {
+        let request_id = Uuid::nil();
+        let list = validate_vm_command(request("list", None)).unwrap();
+        let list_payload = vm_command_downlink_payload(request_id, &list);
+        assert_eq!(list_payload["request_id"], serde_json::json!(request_id));
+        assert_eq!(list_payload["op"], serde_json::json!("list"));
+        assert_eq!(list_payload["args"], serde_json::json!({}));
+
+        let start = validate_vm_command(request("start", Some("debian12"))).unwrap();
+        let start_payload = vm_command_downlink_payload(request_id, &start);
+        assert_eq!(start_payload["op"], serde_json::json!("start"));
+        assert_eq!(start_payload["args"]["name"], serde_json::json!("debian12"));
+    }
 }

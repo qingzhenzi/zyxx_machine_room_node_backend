@@ -26,6 +26,8 @@ pub mod permissions {
     pub const DEVICE_MANAGE: &str = "device:manage";
     // WOL：向机器发送 magic packet（电源控制，比 device:read 更高）。
     pub const DEVICE_WAKE: &str = "device:wake";
+    // VM 远程控制：对机器上的虚拟机执行 start/shutdown/reboot/destroy/screenshot 等。
+    pub const VM_CONTROL: &str = "vm:control";
     pub const STORAGE_READ: &str = "storage:read";
     pub const STORAGE_MANAGE: &str = "storage:manage";
     pub const IMAGE_READ: &str = "image:read";
@@ -67,6 +69,7 @@ pub mod permissions {
         DEVICE_READ,
         DEVICE_MANAGE,
         DEVICE_WAKE,
+        VM_CONTROL,
         STORAGE_READ,
         STORAGE_MANAGE,
         IMAGE_READ,
@@ -127,7 +130,7 @@ mod tests {
         ] {
             assert!(permissions::ALL.contains(&code), "缺少权限：{code}");
         }
-        assert_eq!(permissions::ALL.len(), 37);
+        assert_eq!(permissions::ALL.len(), 38);
     }
 
     #[test]
@@ -144,7 +147,7 @@ mod tests {
         assert_eq!(permissions::TICKET_CREATE, "ticket:create");
         assert_eq!(permissions::TICKET_HANDLE, "ticket:handle");
         assert_eq!(permissions::TICKET_MANAGE, "ticket:manage");
-        assert_eq!(permissions::ALL.len(), 37);
+        assert_eq!(permissions::ALL.len(), 38);
     }
 
     #[test]
@@ -161,7 +164,7 @@ mod tests {
             assert!(permissions::ALL.contains(&code), "缺少权限：{code}");
             assert_eq!(code, expected);
         }
-        assert_eq!(permissions::ALL.len(), 37);
+        assert_eq!(permissions::ALL.len(), 38);
     }
 
     #[test]
@@ -178,7 +181,13 @@ mod tests {
             assert!(permissions::ALL.contains(&code), "缺少权限：{code}");
             assert_eq!(code, expected);
         }
-        assert_eq!(permissions::ALL.len(), 37);
+        assert_eq!(permissions::ALL.len(), 38);
+    }
+
+    #[test]
+    fn vm_control_permission_is_registered() {
+        assert!(permissions::ALL.contains(&permissions::VM_CONTROL));
+        assert_eq!(permissions::VM_CONTROL, "vm:control");
     }
 
     #[test]

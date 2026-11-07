@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { parseMachinePayload } from '../payload'
+import { parseMachinePayload, parseVmList } from '../payload'
 
 describe('parseMachinePayload', () => {
   it('extracts macs from sections.agent.host.macs', () => {
@@ -24,5 +24,31 @@ describe('parseMachinePayload', () => {
       sections: { agent: { host: { macs: ['not-a-mac', 42, null] } } },
     })
     expect(parsed.agent?.macs).toEqual([])
+  })
+})
+
+describe('parseVmList / vms', () => {
+  it('parses sections.vms from telemetry payload', () => {
+    const parsed = parseMachinePayload({
+      sections: {
+        vms: [
+          { name: 'debian12', state: 'running', vcpus: 2, memory_bytes: 2147483648 },
+          { name: 'win11', state: 'shut off', vcpus: 4, memory_bytes: 8589934592 },
+        ],
+      },
+    })
+    expect(parsed.vms).toEqual([
+      { name: 'debian12', state: 'running', vcpus: 2, memoryBytes: 2147483648 },
+      { name: 'win11', state: 'shut off', vcpus: 4, memoryBytes: 8589934592 },
+    ])
+  })
+
+  it('parses vm.command list results ({vms:[...]})', () => {
+    const vms = parseVmList({
+      vms: [{ name: 'debian12', state: 'running', vcpus: 2, memory_bytes: 1024 }],
+    })
+    expect(vms).toEqual([{ name: 'debian12', state: 'running', vcpus: 2, memoryBytes: 1024 }])
+    expect(parseVmList({})).toBeNull()
+    expect(parseVmList(null)).toBeNull()
   })
 })

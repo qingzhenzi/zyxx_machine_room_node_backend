@@ -21,6 +21,12 @@ export const routes: RouteRecordRaw[] = [
         meta: { title: '总览' },
       },
       {
+        path: 'teacher',
+        name: 'teacher',
+        component: () => import('@/views/TeacherView.vue'),
+        meta: { title: '教师工作台', permission: PERMISSIONS.roomRead },
+      },
+      {
         path: 'areas',
         name: 'areas',
         component: () => import('@/views/AreasView.vue'),

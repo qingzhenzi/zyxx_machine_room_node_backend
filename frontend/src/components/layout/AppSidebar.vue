@@ -24,7 +24,16 @@ interface NavItem {
 const navGroups: { label: string; items: NavItem[] }[] = [
   {
     label: '工作台',
-    items: [{ name: 'overview', label: '总览', icon: 'overview', to: '/' }],
+    items: [
+      { name: 'overview', label: '总览', icon: 'overview', to: '/' },
+      {
+        name: 'teacher',
+        label: '教师工作台',
+        icon: 'spark',
+        to: '/teacher',
+        permission: PERMISSIONS.roomRead,
+      },
+    ],
   },
   {
     label: '空间与设备',

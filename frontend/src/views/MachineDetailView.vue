@@ -3,8 +3,9 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 import { api, isNotFound } from '@/api'
-import type { MachineDetail } from '@/api/schema'
+import type { MachineDetail, VmCommandOp, VmCommandReply } from '@/api/schema'
 import AppButton from '@/components/ui/AppButton.vue'
+import AppModal from '@/components/ui/AppModal.vue'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
 import EmptyState from '@/components/ui/EmptyState.vue'
 import IconButton from '@/components/ui/IconButton.vue'
@@ -21,13 +22,17 @@ import MachineHealthIssues from '@/features/machines/MachineHealthIssues.vue'
 import MachineHistoryTable from '@/features/machines/MachineHistoryTable.vue'
 import MachineOverviewSections from '@/features/machines/MachineOverviewSections.vue'
 import UsageBar from '@/features/machines/UsageBar.vue'
-import { healthScoreClass, machineHealthMeta } from '@/features/machines/machineMeta'
-import { parseMachinePayload } from '@/features/machines/payload'
+import {
+  healthScoreClass,
+  machineHealthMeta,
+  workloadStateMeta,
+} from '@/features/machines/machineMeta'
+import { parseMachinePayload, parseVmList, type VmView } from '@/features/machines/payload'
 import { useMachineStream } from '@/features/machines/useMachineStream'
 import { useAuthStore } from '@/stores/auth'
 import { useToastStore } from '@/stores/toast'
 import { errorMessage } from '@/utils/errors'
-import { formatFullDateTime, formatRelative, formatSeconds } from '@/utils/format'
+import { formatBytes, formatFullDateTime, formatRelative, formatSeconds } from '@/utils/format'
 import { PERMISSIONS } from '@/utils/permissions'
 
 const auth = useAuthStore()
@@ -244,6 +249,136 @@ async function wakeMachine() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 虚拟机远程控制（vm:control）：命令经 device_downlink 下发，轮询 machine_command_results。
+// ---------------------------------------------------------------------------
+
+const VM_OP_LABELS: Record<VmCommandOp, string> = {
+  list: '刷新列表',
+  start: '启动',
+  shutdown: '关机',
+  reboot: '重启',
+  destroy: '销毁',
+  screenshot: '截图',
+}
+const VM_CONFIRM_OPS: VmCommandOp[] = ['start', 'shutdown', 'reboot', 'destroy']
+const VM_POLL_INTERVAL_MS = 1000
+const VM_POLL_MAX_ATTEMPTS = 60
+
+const canVmControl = computed(() => auth.can(PERMISSIONS.vmControl))
+/** `list` 命令返回的列表覆盖遥测快照（刷新按钮/操作后的真实状态）。 */
+const vmOverride = ref<VmView[] | null>(null)
+const vmRows = computed<VmView[]>(() => vmOverride.value ?? parsed.value?.vms ?? [])
+const vmBusy = ref(false)
+const vmBusyName = ref('')
+const vmConfirm = ref<{ op: VmCommandOp; name: string } | null>(null)
+const vmScreenshot = ref<{ name: string; src: string } | null>(null)
+
+const vmConfirmDetail = computed(() => {
+  const pending = vmConfirm.value
+  if (!pending) return ''
+  return [
+    `虚拟机：${pending.name}`,
+    `操作：${VM_OP_LABELS[pending.op]}`,
+    '命令经设备下行交给机器上的 room-agent 执行，最长等待 60s。',
+    pending.op === 'destroy' ? '销毁不可撤销，请确认磁盘数据已不需要。' : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+})
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function pollVmCommand(requestId: string): Promise<VmCommandReply> {
+  for (let attempt = 0; attempt < VM_POLL_MAX_ATTEMPTS; attempt += 1) {
+    const reply = await api.vmCommandResult(serial.value, requestId)
+    if (reply.status !== 'pending') return reply
+    await sleep(VM_POLL_INTERVAL_MS)
+  }
+  // 后端 pending>120s 会转 timeout；前端只等 60s，超时返回本地 timeout 以便提示。
+  const now = new Date().toISOString()
+  return {
+    request_id: requestId,
+    status: 'timeout',
+    data: null,
+    error: null,
+    created_at: now,
+    updated_at: now,
+  }
+}
+
+function applyVmResult(op: VmCommandOp, name: string | null, data: Record<string, unknown> | null) {
+  if (op === 'list') {
+    const vms = parseVmList(data)
+    if (vms) vmOverride.value = vms
+    return
+  }
+  if (op === 'screenshot') {
+    const image = typeof data?.image_base64 === 'string' ? data.image_base64 : ''
+    if (!image) {
+      toast.error('截图失败', '机器没有返回截图数据（检查 libvirt / 显卡驱动）')
+      return
+    }
+    const format = typeof data?.format === 'string' ? data.format : 'png'
+    vmScreenshot.value = {
+      name: name ?? '虚拟机',
+      src: `data:image/${format};base64,${image}`,
+    }
+  }
+}
+
+async function runVmCommand(op: VmCommandOp, name?: string) {
+  if (!serial.value || vmBusy.value) return
+  vmBusy.value = true
+  vmBusyName.value = name ?? ''
+  let refreshAfter = false
+  try {
+    const accepted = await api.vmCommand(serial.value, { op, ...(name ? { name } : {}) })
+    const reply = await pollVmCommand(accepted.request_id)
+    if (reply.status === 'ok') {
+      applyVmResult(op, name ?? null, reply.data ?? null)
+      toast.success(`虚拟机${VM_OP_LABELS[op]}成功`, name ? `虚拟机：${name}` : '已刷新虚拟机列表')
+      // 启停/销毁后状态会变化：自动再拉一次列表（agent 回报的是操作结果，不是完整列表）。
+      refreshAfter = op !== 'list' && op !== 'screenshot'
+    } else if (reply.status === 'timeout') {
+      toast.error('虚拟机命令超时', '60s 内未收到机器回报，请确认机器在线且 agent 正常')
+    } else {
+      toast.error('虚拟机命令失败', reply.error ?? '机器返回错误')
+    }
+  } catch (caught) {
+    toast.error('虚拟机命令失败', errorMessage(caught, '请稍后重试'))
+  } finally {
+    vmBusy.value = false
+    vmBusyName.value = ''
+  }
+  if (refreshAfter) void runVmCommand('list')
+}
+
+/** 启动/关机/重启/销毁先弹确认框；截图/刷新直接下发。 */
+function requestVmOp(op: VmCommandOp, name: string) {
+  if (VM_CONFIRM_OPS.includes(op)) {
+    vmConfirm.value = { op, name }
+    return
+  }
+  void runVmCommand(op, name)
+}
+
+function confirmVmOp() {
+  const pending = vmConfirm.value
+  vmConfirm.value = null
+  if (pending) void runVmCommand(pending.op, pending.name)
+}
+
+function refreshVmList() {
+  void runVmCommand('list')
+}
+
+function screenshotVm(name: string) {
+  void runVmCommand('screenshot', name)
+}
+
 async function load(silent = false) {
   if (!serial.value) return
   if (!silent) loading.value = true
@@ -393,6 +528,86 @@ onMounted(() => void load())
 
       <div class="mt-4 grid grid-cols-12 items-start gap-4">
         <div class="col-span-8 flex min-w-0 flex-col gap-4">
+          <PageSection
+            title="虚拟机"
+            description="远程控制：命令经 device_downlink 下发到机器上的 room-agent 执行"
+          >
+            <div class="flex items-center justify-between gap-2 px-5 pt-4">
+              <p class="text-[11px] text-muted">共 {{ vmRows.length }} 台虚拟机</p>
+              <div class="flex items-center gap-2">
+                <AppButton
+                  v-if="canVmControl"
+                  size="sm"
+                  icon="refresh"
+                  :loading="vmBusy && !vmBusyName"
+                  :disabled="vmBusy"
+                  @click="refreshVmList"
+                >
+                  刷新列表
+                </AppButton>
+                <span v-else class="text-[10.5px] text-faint">只读（需要 vm:control 权限）</span>
+              </div>
+            </div>
+
+            <ul v-if="vmRows.length" class="mt-2 divide-y divide-line/70">
+              <li
+                v-for="vm in vmRows"
+                :key="vm.name"
+                class="flex flex-wrap items-center justify-between gap-2 px-5 py-3"
+              >
+                <div class="min-w-0">
+                  <p class="truncate font-mono text-[11.5px] text-ink">{{ vm.name }}</p>
+                  <p class="mt-0.5 text-[10.5px] text-faint">
+                    {{ vm.vcpus ?? '—' }} vCPU · {{ formatBytes(vm.memoryBytes) }}
+                  </p>
+                </div>
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <StateBadge
+                    :label="workloadStateMeta(vm.state).label"
+                    :tone="workloadStateMeta(vm.state).tone"
+                  />
+                  <template v-if="canVmControl">
+                    <AppButton
+                      size="sm"
+                      icon="play"
+                      :disabled="vmBusy"
+                      @click="requestVmOp('start', vm.name)"
+                    >
+                      启动
+                    </AppButton>
+                    <AppButton
+                      size="sm"
+                      :disabled="vmBusy"
+                      @click="requestVmOp('shutdown', vm.name)"
+                    >
+                      关机
+                    </AppButton>
+                    <AppButton size="sm" :disabled="vmBusy" @click="requestVmOp('reboot', vm.name)">
+                      重启
+                    </AppButton>
+                    <AppButton
+                      size="sm"
+                      variant="danger"
+                      :disabled="vmBusy"
+                      @click="requestVmOp('destroy', vm.name)"
+                    >
+                      销毁
+                    </AppButton>
+                    <AppButton size="sm" :disabled="vmBusy" @click="screenshotVm(vm.name)">
+                      截图
+                    </AppButton>
+                  </template>
+                </div>
+              </li>
+            </ul>
+            <EmptyState
+              v-else
+              title="没有虚拟机"
+              description="最新快照未上报 sections.vms（机器未安装/未启用 libvirt，或 agent 未升级）。"
+              icon="server"
+            />
+          </PageSection>
+
           <template v-if="parsed">
             <MachineHealthIssues :issues="parsed.healthIssues" />
             <MachineOverviewSections :payload="parsed" />
@@ -497,6 +712,42 @@ onMounted(() => void load())
       <div v-if="detail" class="mt-4">
         <MachineHistoryTable :points="detail.history ?? []" />
       </div>
+
+      <ConfirmDialog
+        :open="vmConfirm !== null"
+        title="虚拟机操作"
+        :description="
+          vmConfirm ? `确认对 ${vmConfirm.name} 执行「${VM_OP_LABELS[vmConfirm.op]}」？` : ''
+        "
+        :detail="vmConfirmDetail"
+        :danger="vmConfirm?.op === 'destroy'"
+        confirm-label="确认执行"
+        :loading="vmBusy"
+        @close="vmConfirm = null"
+        @confirm="confirmVmOp"
+      />
+
+      <AppModal
+        :open="vmScreenshot !== null"
+        title="虚拟机截图"
+        :description="vmScreenshot ? `虚拟机：${vmScreenshot.name}` : ''"
+        size="lg"
+        @close="vmScreenshot = null"
+      >
+        <div v-if="vmScreenshot" class="flex justify-center">
+          <img
+            :src="vmScreenshot.src"
+            :alt="`${vmScreenshot.name} 截图`"
+            class="max-h-[70vh] w-auto rounded-md border border-line"
+          />
+        </div>
+        <template #footer>
+          <AppButton :disabled="vmBusy" @click="vmScreenshot && screenshotVm(vmScreenshot.name)">
+            刷新截图
+          </AppButton>
+          <AppButton variant="primary" @click="vmScreenshot = null">关闭</AppButton>
+        </template>
+      </AppModal>
 
       <ConfirmDialog
         :open="wakeOpen"

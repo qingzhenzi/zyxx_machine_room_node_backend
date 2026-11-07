@@ -125,6 +125,9 @@ import type {
   UpdateTicketScopesRequest,
   UpdateUserRequest,
   UpsertExceptionRequest,
+  VmCommandAccepted,
+  VmCommandReply,
+  VmCommandRequest,
   UserPage,
   UserProfile,
   UserSession,
@@ -583,6 +586,20 @@ export const api = {
   /** WOL：向机器发送 Wake-on-LAN magic packet（需要 device:wake 权限）。 */
   wakeMachine: (serial: string) =>
     unwrap<WakeReply>(http.post(`/admin/machines/${encodeURIComponent(serial)}/wake`)),
+
+  /** VM 远程控制：下发命令（202 返回 request_id，前端轮询结果）。 */
+  vmCommand: (serial: string, input: VmCommandRequest) =>
+    unwrap<VmCommandAccepted>(
+      http.post(`/admin/machines/${encodeURIComponent(serial)}/vm/commands`, input),
+    ),
+
+  /** VM 远程控制：查询命令结果（pending/ok/error/timeout）。 */
+  vmCommandResult: (serial: string, requestId: string) =>
+    unwrap<VmCommandReply>(
+      http.get(
+        `/admin/machines/${encodeURIComponent(serial)}/vm/commands/${encodeURIComponent(requestId)}`,
+      ),
+    ),
 
   // ---- 设备在线事件 ----
   listDeviceEvents: (params: PresenceEventParams = {}) =>

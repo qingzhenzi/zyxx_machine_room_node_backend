@@ -22,6 +22,7 @@ export const PERMISSIONS = {
   deviceRead: 'device:read',
   deviceManage: 'device:manage',
   deviceWake: 'device:wake',
+  vmControl: 'vm:control',
   storageRead: 'storage:read',
   storageManage: 'storage:manage',
   imageRead: 'image:read',

@@ -825,6 +825,15 @@ function parseHealthIssues(
  * 把 `MachineSnapshot.payload` 解析成页面使用的视图模型。
  * 入参可以是任意 JSON；解析失败返回全空结构，而不是抛异常。
  */
+/** 解析 `vm.command list` 的 `result.vms`（与遥测 sections.vms 同结构）；非法返回 null。 */
+export function parseVmList(value: unknown): VmView[] | null {
+  const root = asObject(value)
+  if (!root) return null
+  const raw = asArray(root.vms)
+  if (!raw) return null
+  return raw.map((item) => parseVm(item)).filter((item): item is VmView => item !== null)
+}
+
 export function parseMachinePayload(payload: unknown): MachinePayloadView {
   const root = asObject(payload) ?? {}
   const sections = asObject(root.sections)
