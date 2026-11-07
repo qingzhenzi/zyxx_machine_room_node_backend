@@ -279,10 +279,11 @@ const VM_CONFIRM_OPS: VmCommandOp[] = [
   'shutdown',
   'reboot',
   'destroy',
+  'delete',
   'snapshot.restore',
   'snapshot.delete',
 ]
-const VM_REFRESH_OPS: VmCommandOp[] = ['start', 'shutdown', 'reboot', 'destroy', 'create']
+const VM_REFRESH_OPS: VmCommandOp[] = ['start', 'shutdown', 'reboot', 'destroy', 'delete', 'create']
 const VM_POLL_INTERVAL_MS = 1000
 const VM_POLL_MAX_ATTEMPTS = 60
 
@@ -452,6 +453,11 @@ function confirmVmOp() {
   if (!pending) return
   if (pending.op === 'snapshot.restore' || pending.op === 'snapshot.delete') {
     void runSnapshotMutation(pending.op, pending.name, pending.snapshot ?? '')
+    return
+  }
+  if (pending.op === 'delete') {
+    // 控制面删除默认连带清理磁盘（与 CLI rm --with-disks 语义一致）。
+    void runVmCommand('delete', { name: pending.name, remove_disks: true })
     return
   }
   void runVmCommand(pending.op, { name: pending.name })
@@ -970,6 +976,14 @@ onMounted(() => void load())
                       @click="requestVmOp('destroy', vm.name)"
                     >
                       销毁
+                    </AppButton>
+                    <AppButton
+                      size="sm"
+                      variant="danger"
+                      :disabled="vmBusy"
+                      @click="requestVmOp('delete', vm.name)"
+                    >
+                      删除
                     </AppButton>
                     <AppButton size="sm" :disabled="vmBusy" @click="screenshotVm(vm.name)">
                       截图

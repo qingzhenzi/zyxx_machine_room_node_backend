@@ -47,7 +47,9 @@
 | op | args | 说明 |
 | --- | --- | --- |
 | `list` | 无 | 列出域；data `{vms:[...]}` |
-| `start` / `shutdown` / `reboot` / `destroy` / `screenshot` | `{name}` | 生命周期/截图（name 必填） |
+| `start` / `shutdown` / `reboot` / `screenshot` | `{name}` | 生命周期/截图（name 必填） |
+| `destroy` | `{name}` | **强制断电**（只停止，不删除定义；可再 start） |
+| `delete` | `{name, remove_disks?=false}` | **删除虚拟机**：运行中先 destroy → undefine → 可选删除磁盘文件（并清理空目录）；data `{name, undefine, removed_disks}` |
 | `create` | `{name, vcpus=2, memory_mib=2048, disk_gb=20, base_volume?, base_path?, gpu?, start?}` | 用底包创建 qcow2 **差分盘**并 define（可立即启动）；data `{name, disk_path, base, defined, started}` |
 | `snapshot.create` | `{name, snapshot, description?}` | 关机状态下创建 qcow2 内部快照 |
 | `snapshot.list` | `{name}` | data `{snapshots:[{tag, created_at, vm_size, date}]}` |

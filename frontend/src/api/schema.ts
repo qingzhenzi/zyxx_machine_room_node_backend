@@ -776,6 +776,7 @@ export type VmCommandOp =
   | 'shutdown'
   | 'reboot'
   | 'destroy'
+  | 'delete'
   | 'screenshot'
   | 'create'
   | 'snapshot.create'

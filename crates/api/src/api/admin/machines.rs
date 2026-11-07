@@ -344,6 +344,7 @@ const VM_COMMAND_OPS: &[&str] = &[
     "shutdown",
     "reboot",
     "destroy",
+    "delete",
     "screenshot",
     "create",
     "snapshot.create",
@@ -802,6 +803,17 @@ fn validate_vm_command(request: VmCommandRequest) -> AppResult<ValidatedVmComman
             out
         }
         "image.make" => build_image_make_args(&args)?,
+        "delete" => {
+            reject_unknown_args(&args, &["name", "remove_disks"])?;
+            let mut out = serde_json::Map::new();
+            out.insert("name".to_owned(), serde_json::json!(required_name(&args)?));
+            if let Some(remove_disks) = expect_bool(&args, "remove_disks")? {
+                if remove_disks {
+                    out.insert("remove_disks".to_owned(), serde_json::json!(true));
+                }
+            }
+            out
+        }
         // 单机生命周期/截图：只接受 name。
         _ => {
             reject_unknown_args(&args, &["name"])?;
@@ -1862,5 +1874,30 @@ mod tests {
                 "应拒绝：{field}"
             );
         }
+    }
+
+    #[test]
+    fn delete_args_are_validated() {
+        let ok = validate_vm_command(request_args(
+            "delete",
+            serde_json::json!({"name":"lab-1","remove_disks":true}),
+        ))
+        .unwrap();
+        assert_eq!(ok.args["name"], serde_json::json!("lab-1"));
+        assert_eq!(ok.args["remove_disks"], serde_json::json!(true));
+        // 缺省不删盘
+        let ok = validate_vm_command(request_args(
+            "delete",
+            serde_json::json!({"name":"lab-1"}),
+        ))
+        .unwrap();
+        assert!(ok.args.get("remove_disks").is_none());
+        // 未知字段 / 缺 name 拒绝
+        assert!(validate_vm_command(request_args(
+            "delete",
+            serde_json::json!({"name":"lab-1","unknown":1})
+        ))
+        .is_err());
+        assert!(validate_vm_command(request_args("delete", serde_json::json!({}))).is_err());
     }
 }

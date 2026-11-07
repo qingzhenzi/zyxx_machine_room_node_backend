@@ -12,6 +12,7 @@ export const VM_OP_LABELS: Record<VmCommandOp, string> = {
   shutdown: '关机',
   reboot: '重启',
   destroy: '销毁',
+  delete: '删除虚拟机',
   screenshot: '截图',
   create: '新建虚拟机',
   'snapshot.create': '创建快照',
