@@ -126,6 +126,8 @@ import type {
   UpdateUserRequest,
   UpsertExceptionRequest,
   VmCommandAccepted,
+  VmEnvironmentReply,
+  VmEnvironmentRequest,
   VmCommandReply,
   VmCommandRequest,
   UserPage,
@@ -591,6 +593,12 @@ export const api = {
   vmCommand: (serial: string, input: VmCommandRequest) =>
     unwrap<VmCommandAccepted>(
       http.post(`/admin/machines/${encodeURIComponent(serial)}/vm/commands`, input),
+    ),
+
+  /** 教师批量下发实验环境：对房间主设备 + 子机逐槽位下发 create。 */
+  batchVmEnvironments: (roomId: string, input: VmEnvironmentRequest) =>
+    unwrap<VmEnvironmentReply>(
+      http.post(`/admin/rooms/${encodeURIComponent(roomId)}/vm/environments`, input),
     ),
 
   /** VM 远程控制：查询命令结果（pending/ok/error/timeout）。 */

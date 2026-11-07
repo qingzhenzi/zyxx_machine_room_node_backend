@@ -699,12 +699,27 @@ export interface WakeReply {
 }
 
 /** VM 远程控制命令（与后端 op 白名单一致）。 */
-export type VmCommandOp = 'list' | 'start' | 'shutdown' | 'reboot' | 'destroy' | 'screenshot'
+export type VmCommandOp =
+  | 'list'
+  | 'start'
+  | 'shutdown'
+  | 'reboot'
+  | 'destroy'
+  | 'screenshot'
+  | 'create'
+  | 'snapshot.create'
+  | 'snapshot.list'
+  | 'snapshot.restore'
+  | 'snapshot.delete'
+  | 'disk.info'
+  | 'export'
 
 export interface VmCommandRequest {
   op: VmCommandOp
-  /** list 不传；其它命令必填。 */
+  /** 阶段 1 兼容：等价于 args.name。 */
   name?: string
+  /** 阶段 1.5：各 op 的参数对象（create/snapshot.* /disk.info/export 等）。 */
+  args?: Record<string, unknown>
 }
 
 export interface VmCommandAccepted {
@@ -719,6 +734,28 @@ export interface VmCommandReply {
   error?: string | null
   created_at: string
   updated_at: string
+}
+
+/** 教师批量下发实验环境（room 级）请求体。 */
+export interface VmEnvironmentRequest {
+  name_prefix: string
+  base_volume: string
+  vcpus?: number
+  memory_mib?: number
+  disk_gb?: number
+  auto_start?: boolean
+}
+
+/** 批量下发的单个槽位结果；`request_id/serial=null` 表示该槽位没有存活设备、未下发。 */
+export interface VmEnvironmentTarget {
+  device_slot: string
+  serial: string | null
+  request_id: string | null
+}
+
+export interface VmEnvironmentReply {
+  room_id: string
+  targets: VmEnvironmentTarget[]
 }
 
 export interface MachineReportSummary {

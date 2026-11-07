@@ -214,6 +214,11 @@ pub fn router() -> Router<AppState> {
             "/machines/{serial}/vm/commands/{request_id}",
             get(machines::get_vm_command),
         )
+        // 教师批量下发实验环境（room 级；逐槽位 create，权限 vm:control）。
+        .route(
+            "/rooms/{room_id}/vm/environments",
+            post(machines::create_room_vm_environment),
+        )
         // ---- 节点配置（P2）----
         .route(
             "/agent-configs",

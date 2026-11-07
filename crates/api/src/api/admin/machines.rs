@@ -319,13 +319,18 @@ async fn send_wake_packets(macs: &[wol::MacAddress]) -> (Vec<String>, Vec<String
 
 // ---------------------------------------------------------------------------
 // VM 远程控制（kind = vm.command，经 device_downlink 下发；结果回写 0031 表）
+//
+// 阶段 1.5：命令参数从 {op,name?} 扩展为 {op,args?}（保留旧 name 兼容），
+// args 按各 op 校验后原样透传给 room-agent；另提供教师「批量下发环境」API。
+// 契约见 docs/remote-vm-control.md 与 docs/vm-base-image-and-diff-disk.md §3/§4。
 // ---------------------------------------------------------------------------
 
 /// 下发 VM 命令的 device_downlink kind（与 room-agent 侧契约一致）。
 const VM_COMMAND_DOWNLINK_KIND: &str = "vm.command";
 /// pending 超过该秒数视为超时（GET 时顺手把表更新为 timeout）。
 const VM_COMMAND_PENDING_TIMEOUT_SECS: i64 = 120;
-/// 允许的 VM 操作白名单。`list` 不需要 name，其它命令必须带非空 name。
+
+/// 允许的 VM 操作白名单（阶段 1 + 阶段 1.5 底包/差分盘/快照）。
 const VM_COMMAND_OPS: &[&str] = &[
     "list",
     "start",
@@ -333,23 +338,58 @@ const VM_COMMAND_OPS: &[&str] = &[
     "reboot",
     "destroy",
     "screenshot",
+    "create",
+    "snapshot.create",
+    "snapshot.list",
+    "snapshot.restore",
+    "snapshot.delete",
+    "disk.info",
+    "export",
+];
+
+/// VM 名/snapshot 名的通用约束（防路径注入）：`[A-Za-z0-9._-]{1,64}`。
+const VM_NAME_MAX_CHARS: usize = 64;
+/// 批量下发时 name_prefix 上限（给 `<prefix>-<slot尾号>` 留空间）。
+const VM_PREFIX_MAX_CHARS: usize = 32;
+/// GPU 直通地址上限。
+const VM_GPU_MAX: usize = 2;
+/// create 默认/取值范围。
+const VM_DEFAULT_VCPUS: u64 = 2;
+const VM_DEFAULT_MEMORY_MIB: u64 = 2_048;
+const VM_DEFAULT_DISK_GB: u64 = 20;
+const VM_VCPUS_RANGE: (u64, u64) = (1, 64);
+const VM_MEMORY_MIB_RANGE: (u64, u64) = (256, 262_144);
+const VM_DISK_GB_RANGE: (u64, u64) = (1, 2_048);
+/// `create` 允许的 args 字段（未知字段直接 400，避免拼写错误静默透传）。
+const VM_CREATE_ARGS: &[&str] = &[
+    "name",
+    "vcpus",
+    "memory_mib",
+    "disk_gb",
+    "base_volume",
+    "base_path",
+    "gpu",
+    "start",
 ];
 
 /// `POST /admin/machines/{serial}/vm/commands` 请求体。
 #[derive(Debug, Deserialize)]
 pub struct VmCommandRequest {
-    /// 操作：list / start / shutdown / reboot / destroy / screenshot。
+    /// 操作：list / start / ... / export（见 [`VM_COMMAND_OPS`]）。
     pub op: String,
-    /// 虚拟机名；list 不传，其它命令必填。
+    /// 阶段 1 兼容字段：等价于 `args.name`。
     #[serde(default)]
     pub name: Option<String>,
+    /// 阶段 1.5：各 op 的参数对象（原样透传给 agent）。
+    #[serde(default)]
+    pub args: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-/// 校验后的 VM 命令。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 校验后的 VM 命令（args 已规范化、未知字段已拒绝）。
+#[derive(Debug, Clone, PartialEq)]
 struct ValidatedVmCommand {
     op: String,
-    name: Option<String>,
+    args: serde_json::Map<String, serde_json::Value>,
 }
 
 /// 202 响应：只回 request_id，前端据此轮询结果。
@@ -358,7 +398,7 @@ pub struct VmCommandAccepted {
     pub request_id: Uuid,
 }
 
-/// GET 结果响应（`data` 为 agent 回传的 result；截图时含 image_base64）。
+/// GET 结果响应（`data` 为 agent 回传的 result；截图/快照/磁盘链/导出都在 data 里）。
 #[derive(Debug, Serialize)]
 pub struct VmCommandReply {
     pub request_id: Uuid,
@@ -369,7 +409,7 @@ pub struct VmCommandReply {
     pub updated_at: DateTime<Utc>,
 }
 
-/// `machine_command_results` 行（表由迁移 0031 创建，T1 负责）。
+/// `machine_command_results` 行（表由迁移 0031 创建）。
 #[derive(Debug, sqlx::FromRow)]
 struct MachineCommandRow {
     request_id: Uuid,
@@ -380,62 +420,563 @@ struct MachineCommandRow {
     updated_at: DateTime<Utc>,
 }
 
-/// 校验 op 白名单与 name 约束（纯函数，便于单测）。
-///
-/// - `list`：不接受 name（传了非空 name 视为 400）；
-/// - `start/shutdown/reboot/destroy/screenshot`：必须带非空 name（≤128 字符）。
+// ---- 参数校验（纯函数，便于单测） ----
+
+fn bad_arg(message: impl Into<String>) -> AppError {
+    AppError::bad_request(message.into())
+}
+
+fn reject_unknown_args(
+    args: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+) -> AppResult<()> {
+    for key in args.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(bad_arg(format!(
+                "不支持的参数 `{key}`（允许：{}）",
+                allowed.join(" / ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn expect_string(
+    args: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> AppResult<Option<String>> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(raw)) => Ok(Some(raw.trim().to_owned())),
+        Some(_) => Err(bad_arg(format!("{key} 必须是字符串"))),
+    }
+}
+
+fn expect_u64(
+    args: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> AppResult<Option<u64>> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(number)) => number
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| bad_arg(format!("{key} 必须是非负整数"))),
+        Some(serde_json::Value::String(raw)) => raw
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| bad_arg(format!("{key} 必须是非负整数"))),
+        Some(_) => Err(bad_arg(format!("{key} 必须是非负整数"))),
+    }
+}
+
+fn expect_bool(
+    args: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> AppResult<Option<bool>> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(bad_arg(format!("{key} 必须是布尔值"))),
+    }
+}
+
+fn expect_string_array(
+    args: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> AppResult<Option<Vec<String>>> {
+    match args.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(items)) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(value) = item.as_str() else {
+                    return Err(bad_arg(format!("{key} 必须是字符串数组")));
+                };
+                values.push(value.trim().to_owned());
+            }
+            Ok(Some(values))
+        }
+        Some(_) => Err(bad_arg(format!("{key} 必须是字符串数组"))),
+    }
+}
+
+/// 校验 `[A-Za-z0-9._-]{1,max}`，返回 trim 后的规范值。
+fn validate_name_token(raw: &str, field: &str, max_chars: usize) -> AppResult<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(bad_arg(format!("{field} 不能为空")));
+    }
+    if value.chars().count() > max_chars {
+        return Err(bad_arg(format!("{field} 不能超过 {max_chars} 个字符")));
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(bad_arg(format!(
+            "{field} 只允许字母、数字、点、下划线、短横线（{value}）"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+/// libvirt 存储池卷名：不能含 `/` 或 NUL（卷名即文件路径的一段）。
+fn validate_volume_name(raw: &str) -> AppResult<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(bad_arg("base_volume 不能为空"));
+    }
+    if value.chars().count() > 128 {
+        return Err(bad_arg("base_volume 不能超过 128 个字符"));
+    }
+    if value.contains('/') || value.contains('\0') || value.contains("..") {
+        return Err(bad_arg("base_volume 含有非法字符"));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_base_path(raw: &str) -> AppResult<String> {
+    let value = raw.trim();
+    if !value.starts_with('/') {
+        return Err(bad_arg("base_path 必须是绝对路径"));
+    }
+    if value.chars().count() > 512 {
+        return Err(bad_arg("base_path 不能超过 512 个字符"));
+    }
+    if value.contains('\0') {
+        return Err(bad_arg("base_path 含有非法字符"));
+    }
+    Ok(value.to_owned())
+}
+
+/// GPU PCI 直通地址：`dddd:bb:dd.f`（十六进制，function 0-7）。
+fn validate_gpu_address(raw: &str) -> AppResult<String> {
+    let value = raw.trim();
+    let invalid = || bad_arg(format!("gpu 地址非法（{value}），应为 dddd:bb:dd.f"));
+    let mut parts = value.split(':');
+    let (Some(domain), Some(bus), Some(rest)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(invalid());
+    };
+    if parts.next().is_some() {
+        return Err(invalid());
+    }
+    let (device, function) = rest.split_once('.').ok_or_else(invalid)?;
+    let hex_ok =
+        |part: &str, len: usize| part.len() == len && part.chars().all(|ch| ch.is_ascii_hexdigit());
+    if !hex_ok(domain, 4) || !hex_ok(bus, 2) || !hex_ok(device, 2) {
+        return Err(invalid());
+    }
+    if function.len() != 1 || !matches!(function, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7") {
+        return Err(invalid());
+    }
+    Ok(value.to_owned())
+}
+
+fn check_range(value: u64, field: &str, range: (u64, u64)) -> AppResult<u64> {
+    if !(range.0..=range.1).contains(&value) {
+        return Err(bad_arg(format!(
+            "{field} 必须在 {}..={} 之间（当前 {value}）",
+            range.0, range.1
+        )));
+    }
+    Ok(value)
+}
+
+fn required_name(args: &serde_json::Map<String, serde_json::Value>) -> AppResult<String> {
+    let raw = expect_string(args, "name")?.ok_or_else(|| bad_arg("缺少 name"))?;
+    validate_name_token(&raw, "name", VM_NAME_MAX_CHARS)
+}
+
+fn required_snapshot(args: &serde_json::Map<String, serde_json::Value>) -> AppResult<String> {
+    let raw = expect_string(args, "snapshot")?.ok_or_else(|| bad_arg("缺少 snapshot"))?;
+    validate_name_token(&raw, "snapshot", VM_NAME_MAX_CHARS)
+}
+
+/// 校验并规范化 `create` 的 args（补默认值；`base_volume` 与 `base_path` 二选一）。
+fn build_create_args(
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> AppResult<serde_json::Map<String, serde_json::Value>> {
+    reject_unknown_args(args, VM_CREATE_ARGS)?;
+    let mut out = serde_json::Map::new();
+    out.insert("name".to_owned(), serde_json::json!(required_name(args)?));
+    let vcpus = check_range(
+        expect_u64(args, "vcpus")?.unwrap_or(VM_DEFAULT_VCPUS),
+        "vcpus",
+        VM_VCPUS_RANGE,
+    )?;
+    let memory_mib = check_range(
+        expect_u64(args, "memory_mib")?.unwrap_or(VM_DEFAULT_MEMORY_MIB),
+        "memory_mib",
+        VM_MEMORY_MIB_RANGE,
+    )?;
+    let disk_gb = check_range(
+        expect_u64(args, "disk_gb")?.unwrap_or(VM_DEFAULT_DISK_GB),
+        "disk_gb",
+        VM_DISK_GB_RANGE,
+    )?;
+    out.insert("vcpus".to_owned(), serde_json::json!(vcpus));
+    out.insert("memory_mib".to_owned(), serde_json::json!(memory_mib));
+    out.insert("disk_gb".to_owned(), serde_json::json!(disk_gb));
+
+    let base_volume = expect_string(args, "base_volume")?
+        .filter(|value| !value.is_empty())
+        .map(|value| validate_volume_name(&value))
+        .transpose()?;
+    let base_path = expect_string(args, "base_path")?
+        .filter(|value| !value.is_empty())
+        .map(|value| validate_base_path(&value))
+        .transpose()?;
+    match (base_volume, base_path) {
+        (Some(_), Some(_)) => {
+            return Err(bad_arg("base_volume 与 base_path 只能二选一"));
+        }
+        (Some(volume), None) => {
+            out.insert("base_volume".to_owned(), serde_json::json!(volume));
+        }
+        (None, Some(path)) => {
+            out.insert("base_path".to_owned(), serde_json::json!(path));
+        }
+        (None, None) => {}
+    }
+
+    if let Some(gpu) = expect_string_array(args, "gpu")? {
+        if gpu.len() > VM_GPU_MAX {
+            return Err(bad_arg(format!("gpu 最多 {VM_GPU_MAX} 个")));
+        }
+        let gpu: Vec<String> = gpu
+            .iter()
+            .map(|value| validate_gpu_address(value))
+            .collect::<AppResult<_>>()?;
+        out.insert("gpu".to_owned(), serde_json::json!(gpu));
+    }
+
+    if let Some(start) = expect_bool(args, "start")? {
+        out.insert("start".to_owned(), serde_json::json!(start));
+    }
+    Ok(out)
+}
+
+/// 校验 op 白名单与各 op 的 args（纯函数，便于单测）。
 fn validate_vm_command(request: VmCommandRequest) -> AppResult<ValidatedVmCommand> {
     let op = request.op.trim().to_ascii_lowercase();
     if !VM_COMMAND_OPS.contains(&op.as_str()) {
-        return Err(AppError::bad_request(format!(
-            "op 只能是 {}",
-            VM_COMMAND_OPS.join(" / ")
-        )));
+        return Err(bad_arg(format!("op 只能是 {}", VM_COMMAND_OPS.join(" / "))));
     }
-    let name = request
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if op == "list" {
-        if name.is_some() {
-            return Err(AppError::bad_request("list 命令不接受 name"));
+
+    let mut args = request.args.unwrap_or_default();
+    // 阶段 1 兼容：`{op,name}` ≡ `{op,args:{name}}`；两者同时给出时必须一致。
+    if let Some(legacy_name) = request.name {
+        let legacy_name = legacy_name.trim().to_owned();
+        if !legacy_name.is_empty() {
+            match args.get("name") {
+                Some(serde_json::Value::String(existing)) if existing.trim() == legacy_name => {}
+                Some(_) => {
+                    return Err(bad_arg("name 与 args.name 不一致，请只使用 args"));
+                }
+                None => {
+                    args.insert("name".to_owned(), serde_json::json!(legacy_name));
+                }
+            }
         }
-        return Ok(ValidatedVmCommand { op, name: None });
     }
-    let Some(name) = name else {
-        return Err(AppError::bad_request(format!("{op} 命令必须提供非空 name")));
+
+    if op == "list" {
+        if !args.is_empty() {
+            return Err(bad_arg("list 命令不接受参数"));
+        }
+        return Ok(ValidatedVmCommand {
+            op,
+            args: serde_json::Map::new(),
+        });
+    }
+
+    let normalized = match op.as_str() {
+        "create" => build_create_args(&args)?,
+        "snapshot.create" => {
+            reject_unknown_args(&args, &["name", "snapshot", "description"])?;
+            let mut out = serde_json::Map::new();
+            out.insert("name".to_owned(), serde_json::json!(required_name(&args)?));
+            out.insert(
+                "snapshot".to_owned(),
+                serde_json::json!(required_snapshot(&args)?),
+            );
+            if let Some(description) = expect_string(&args, "description")? {
+                if description.chars().count() > 255 {
+                    return Err(bad_arg("description 不能超过 255 个字符"));
+                }
+                out.insert("description".to_owned(), serde_json::json!(description));
+            }
+            out
+        }
+        "snapshot.restore" | "snapshot.delete" => {
+            reject_unknown_args(&args, &["name", "snapshot"])?;
+            let mut out = serde_json::Map::new();
+            out.insert("name".to_owned(), serde_json::json!(required_name(&args)?));
+            out.insert(
+                "snapshot".to_owned(),
+                serde_json::json!(required_snapshot(&args)?),
+            );
+            out
+        }
+        "snapshot.list" | "disk.info" => {
+            reject_unknown_args(&args, &["name"])?;
+            let mut out = serde_json::Map::new();
+            out.insert("name".to_owned(), serde_json::json!(required_name(&args)?));
+            out
+        }
+        "export" => {
+            reject_unknown_args(&args, &["name", "format"])?;
+            let mut out = serde_json::Map::new();
+            out.insert("name".to_owned(), serde_json::json!(required_name(&args)?));
+            let format = expect_string(&args, "format")?
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "qcow2".to_owned())
+                .to_ascii_lowercase();
+            if format != "qcow2" {
+                return Err(bad_arg("export 目前只支持 format=qcow2"));
+            }
+            out.insert("format".to_owned(), serde_json::json!("qcow2"));
+            out
+        }
+        // 单机生命周期/截图：只接受 name。
+        _ => {
+            reject_unknown_args(&args, &["name"])?;
+            let mut out = serde_json::Map::new();
+            out.insert("name".to_owned(), serde_json::json!(required_name(&args)?));
+            out
+        }
     };
-    if name.chars().count() > 128 {
-        return Err(AppError::bad_request("name 长度不能超过 128 字符"));
-    }
+
     Ok(ValidatedVmCommand {
         op,
-        name: Some(name.to_owned()),
+        args: normalized,
     })
 }
 
-/// 构造 `vm.command` 下行 payload：`{"request_id","op","args":{"name"}}`。
-///
-/// `list` 的 args 为空对象（不带 name）。
+/// 构造 `vm.command` 下行 payload：`{"request_id","op","args":{...}}`。
 fn vm_command_downlink_payload(
     request_id: Uuid,
     command: &ValidatedVmCommand,
 ) -> serde_json::Value {
-    let args = match command.name.as_deref() {
-        Some(name) => serde_json::json!({ "name": name }),
-        None => serde_json::json!({}),
-    };
     serde_json::json!({
         "request_id": request_id,
         "op": command.op,
-        "args": args,
+        "args": command.args,
     })
 }
 
+// ---- 教师批量下发环境（room 级） ----
+
+/// `POST /admin/rooms/{room_id}/vm/environments` 请求体。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmEnvironmentRequest {
+    /// `create` 的名称前缀：最终名为 `<name_prefix>-<槽位尾号>`。
+    pub name_prefix: String,
+    /// 底包 libvirt 卷名（`<image name>-<version>`）。
+    pub base_volume: String,
+    #[serde(default)]
+    pub vcpus: Option<u64>,
+    #[serde(default)]
+    pub memory_mib: Option<u64>,
+    #[serde(default)]
+    pub disk_gb: Option<u64>,
+    #[serde(default)]
+    pub auto_start: Option<bool>,
+}
+
+/// 校验后的批量下发参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedVmEnvironment {
+    name_prefix: String,
+    base_volume: String,
+    vcpus: u64,
+    memory_mib: u64,
+    disk_gb: u64,
+    auto_start: bool,
+}
+
+/// 批量下发中的单个槽位结果。`request_id/serial` 为 `null` 表示该槽位没有存活设备，
+/// 命令未入队（前端展示为「未下发」）。
+#[derive(Debug, Serialize)]
+pub struct VmEnvironmentTarget {
+    pub device_slot: String,
+    pub serial: Option<String>,
+    pub request_id: Option<Uuid>,
+}
+
+/// 批量下发响应。
+#[derive(Debug, Serialize)]
+pub struct VmEnvironmentReply {
+    pub room_id: Uuid,
+    pub targets: Vec<VmEnvironmentTarget>,
+}
+
+fn validate_vm_environment(request: &VmEnvironmentRequest) -> AppResult<ValidatedVmEnvironment> {
+    let name_prefix =
+        validate_name_token(&request.name_prefix, "name_prefix", VM_PREFIX_MAX_CHARS)?;
+    let base_volume = validate_volume_name(&request.base_volume)?;
+    let vcpus = check_range(
+        request.vcpus.unwrap_or(VM_DEFAULT_VCPUS),
+        "vcpus",
+        VM_VCPUS_RANGE,
+    )?;
+    let memory_mib = check_range(
+        request.memory_mib.unwrap_or(VM_DEFAULT_MEMORY_MIB),
+        "memory_mib",
+        VM_MEMORY_MIB_RANGE,
+    )?;
+    let disk_gb = check_range(
+        request.disk_gb.unwrap_or(VM_DEFAULT_DISK_GB),
+        "disk_gb",
+        VM_DISK_GB_RANGE,
+    )?;
+    Ok(ValidatedVmEnvironment {
+        name_prefix,
+        base_volume,
+        vcpus,
+        memory_mib,
+        disk_gb,
+        auto_start: request.auto_start.unwrap_or(false),
+    })
+}
+
+/// 取槽位尾号作为 VM 名后缀：`room-101` → `101`，`w3f-crit-slot-1793663233` → `1793663233`；
+/// 只保留 `[A-Za-z0-9._-]`，空则退回 `1`。
+fn sanitize_slot_suffix(slot: &str) -> String {
+    let trimmed = slot.trim();
+    let candidate = trimmed
+        .rsplit(['-', '_'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(trimmed);
+    let cleaned: String = candidate
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        .collect();
+    let cleaned = cleaned.trim_matches(|ch| matches!(ch, '.' | '_' | '-'));
+    if cleaned.is_empty() {
+        "1".to_owned()
+    } else {
+        cleaned.to_owned()
+    }
+}
+
+/// 生成 `<prefix>-<槽位尾号>`，总长不超过 [`VM_NAME_MAX_CHARS`]。
+fn batch_vm_name(prefix: &str, slot: &str) -> String {
+    let mut suffix = sanitize_slot_suffix(slot);
+    let max_suffix = VM_NAME_MAX_CHARS.saturating_sub(2);
+    if suffix.len() > max_suffix {
+        suffix.truncate(max_suffix);
+    }
+    let max_prefix = VM_NAME_MAX_CHARS.saturating_sub(suffix.len() + 1).max(1);
+    let prefix: String = prefix.chars().take(max_prefix).collect();
+    format!("{prefix}-{suffix}")
+}
+
+/// 构造批量 `create` 的 args（与单机 create 同构）。
+fn environment_create_args(
+    env: &ValidatedVmEnvironment,
+    slot: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::json!({
+        "name": batch_vm_name(&env.name_prefix, slot),
+        "vcpus": env.vcpus,
+        "memory_mib": env.memory_mib,
+        "disk_gb": env.disk_gb,
+        "base_volume": env.base_volume,
+        "start": env.auto_start,
+    })
+    .as_object()
+    .cloned()
+    .unwrap_or_default()
+}
+
+// ---- 数据库写入 / 下行 ----
+
+async fn insert_pending_vm_command(
+    state: &AppState,
+    request_id: Uuid,
+    serial: &str,
+    downlink: &serde_json::Value,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO machine_command_results (request_id, serial, kind, payload, status)
+         VALUES ($1, $2, $3, $4, 'pending')",
+    )
+    .bind(request_id)
+    .bind(serial)
+    .bind(VM_COMMAND_DOWNLINK_KIND)
+    .bind(downlink)
+    .execute(state.db.pool())
+    .await
+    .map_err(|error| AppError::internal(format!("写入 VM 命令失败: {error}")))?;
+    Ok(())
+}
+
+/// 入队 `vm.command`；成功时顺手唤醒 device-pki 长连接（失败还有 2s 兜底轮询）。
+async fn enqueue_vm_downlink(
+    state: &AppState,
+    slot: &str,
+    downlink_text: &str,
+) -> AppResult<Option<String>> {
+    match state
+        .storage_repo
+        .enqueue_downlink_for_slot(slot, VM_COMMAND_DOWNLINK_KIND, downlink_text)
+        .await
+    {
+        Ok(Some(device_serial)) => {
+            if let Err(error) = state
+                .cache
+                .publish(
+                    &state.config.schedule_downlink_notify_channel,
+                    &device_serial,
+                )
+                .await
+            {
+                tracing::warn!(%error, %device_serial, "发布设备下行通知失败，vm.command 已入队");
+            }
+            Ok(Some(device_serial))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// 入队失败时清掉刚插入的 pending 行，避免留下永远不会被处理的命令。
+async fn cleanup_pending_vm_command(state: &AppState, request_id: Uuid) {
+    if let Err(error) = sqlx::query(
+        "DELETE FROM machine_command_results WHERE request_id = $1 AND status = 'pending'",
+    )
+    .bind(request_id)
+    .execute(state.db.pool())
+    .await
+    {
+        tracing::warn!(%error, %request_id, "清理未下发的 vm.command pending 行失败");
+    }
+}
+
+/// 解析槽位当前存活的设备 serial（与 `enqueue_downlink_for_slot` 的选取口径一致）。
+async fn resolve_live_serial(state: &AppState, slot: &str) -> AppResult<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT serial
+           FROM device_enrollment
+          WHERE device_slot = $1 AND status IN ('issued', 'active')
+          ORDER BY (status = 'active') DESC, activated_at DESC NULLS LAST
+          LIMIT 1",
+    )
+    .bind(slot)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(|error| AppError::internal(format!("查询设备槽位失败: {error}")))
+}
+
+// ---- HTTP handlers ----
+
 /// `POST /api/v1/admin/machines/{serial}/vm/commands` —— 下发 VM 远程控制命令。
 ///
-/// 权限 `vm:control`；设备不存在 404；op/name 非法 400。
+/// 权限 `vm:control`；设备不存在 404；op/args 非法 400。
 /// 成功：插入 `machine_command_results(pending)` + enqueue downlink `vm.command`，
 /// 返回 **202** `{request_id}`；设备无存活证书/入队失败时清理 pending 行并返回 4xx/503。
 pub async fn create_vm_command(
@@ -459,42 +1000,11 @@ pub async fn create_vm_command(
 
     let request_id = Uuid::new_v4();
     let downlink = vm_command_downlink_payload(request_id, &command);
-    sqlx::query(
-        "INSERT INTO machine_command_results (request_id, serial, kind, payload, status)
-         VALUES ($1, $2, $3, $4, 'pending')",
-    )
-    .bind(request_id)
-    .bind(&device.serial)
-    .bind(VM_COMMAND_DOWNLINK_KIND)
-    .bind(&downlink)
-    .execute(state.db.pool())
-    .await
-    .map_err(|error| AppError::internal(format!("写入 VM 命令失败: {error}")))?;
+    insert_pending_vm_command(&state, request_id, &device.serial, &downlink).await?;
 
     let downlink_text = downlink.to_string();
-    match state
-        .storage_repo
-        .enqueue_downlink_for_slot(
-            &device.device_slot,
-            VM_COMMAND_DOWNLINK_KIND,
-            &downlink_text,
-        )
-        .await
-    {
-        Ok(Some(device_serial)) => {
-            // 唤醒长连接（跨进程尽力而为；失败还有 2s 兜底轮询）。
-            if let Err(error) = state
-                .cache
-                .publish(
-                    &state.config.schedule_downlink_notify_channel,
-                    &device_serial,
-                )
-                .await
-            {
-                tracing::warn!(%error, %device_serial, "发布设备下行通知失败，vm.command 已入队");
-            }
-            Ok((StatusCode::ACCEPTED, Json(VmCommandAccepted { request_id })))
-        }
+    match enqueue_vm_downlink(&state, &device.device_slot, &downlink_text).await {
+        Ok(Some(_)) => Ok((StatusCode::ACCEPTED, Json(VmCommandAccepted { request_id }))),
         Ok(None) => {
             cleanup_pending_vm_command(&state, request_id).await;
             Err(AppError::service_unavailable(
@@ -503,22 +1013,102 @@ pub async fn create_vm_command(
         }
         Err(error) => {
             cleanup_pending_vm_command(&state, request_id).await;
-            Err(error.into())
+            Err(error)
         }
     }
 }
 
-/// 入队失败时清掉刚插入的 pending 行，避免留下永远不会被处理的命令。
-async fn cleanup_pending_vm_command(state: &AppState, request_id: Uuid) {
-    if let Err(error) = sqlx::query(
-        "DELETE FROM machine_command_results WHERE request_id = $1 AND status = 'pending'",
-    )
-    .bind(request_id)
-    .execute(state.db.pool())
-    .await
-    {
-        tracing::warn!(%error, %request_id, "清理未下发的 vm.command pending 行失败");
+/// `POST /api/v1/admin/rooms/{room_id}/vm/environments` —— 教师批量下发实验环境。
+///
+/// 对房间主设备槽位 + `room_devices` 子机逐槽位下发 `create`（VM 名 `<prefix>-<槽位尾号>`），
+/// 每个槽位返回自己的 `request_id`（前端逐个轮询）。没有绑定任何槽位 → 409。
+pub async fn create_room_vm_environment(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    Path(room_id): Path<Uuid>,
+    ApiJson(request): ApiJson<VmEnvironmentRequest>,
+) -> AppResult<(StatusCode, Json<VmEnvironmentReply>)> {
+    authorization::require_permission(&state, id, permissions::VM_CONTROL).await?;
+    let env = validate_vm_environment(&request)?;
+    let room = state
+        .rooms
+        .get(room_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("房间不存在"))?;
+
+    let mut slots: Vec<String> = Vec::new();
+    if let Some(slot) = room.device_slot.as_deref() {
+        let slot = slot.trim();
+        if !slot.is_empty() && !slots.iter().any(|existing| existing == slot) {
+            slots.push(slot.to_owned());
+        }
     }
+    let machines = state
+        .devices
+        .list_room_machines(room_id)
+        .await?
+        .unwrap_or_default();
+    for machine in machines {
+        let slot = machine.device_slot.trim();
+        if !slot.is_empty() && !slots.iter().any(|existing| existing == slot) {
+            slots.push(slot.to_owned());
+        }
+    }
+    if slots.is_empty() {
+        return Err(AppError::conflict(
+            "房间没有绑定设备槽位，无法批量下发环境配置",
+        ));
+    }
+
+    let mut targets = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let request_id = Uuid::new_v4();
+        let Some(serial) = resolve_live_serial(&state, &slot).await? else {
+            // 槽位已分配但设备未注册/离线：没有 serial 无法落 pending，标记为未下发。
+            targets.push(VmEnvironmentTarget {
+                device_slot: slot,
+                serial: None,
+                request_id: None,
+            });
+            continue;
+        };
+
+        let command = ValidatedVmCommand {
+            op: "create".to_owned(),
+            args: environment_create_args(&env, &slot),
+        };
+        let downlink = vm_command_downlink_payload(request_id, &command);
+        insert_pending_vm_command(&state, request_id, &serial, &downlink).await?;
+        match enqueue_vm_downlink(&state, &slot, &downlink.to_string()).await {
+            Ok(Some(_)) => targets.push(VmEnvironmentTarget {
+                device_slot: slot,
+                serial: Some(serial),
+                request_id: Some(request_id),
+            }),
+            Ok(None) => {
+                cleanup_pending_vm_command(&state, request_id).await;
+                targets.push(VmEnvironmentTarget {
+                    device_slot: slot,
+                    serial: Some(serial),
+                    request_id: None,
+                });
+            }
+            Err(error) => {
+                cleanup_pending_vm_command(&state, request_id).await;
+                tracing::warn!(%error, %slot, "批量下发环境：vm.command 入队失败");
+                targets.push(VmEnvironmentTarget {
+                    device_slot: slot,
+                    serial: Some(serial),
+                    request_id: None,
+                });
+            }
+        }
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(VmEnvironmentReply { room_id, targets }),
+    ))
 }
 
 /// `GET /api/v1/admin/machines/{serial}/vm/commands/{request_id}` —— 查询命令结果。
@@ -715,11 +1305,20 @@ mod tests {
         VmCommandRequest {
             op: op.to_owned(),
             name: name.map(ToOwned::to_owned),
+            args: None,
+        }
+    }
+
+    fn request_args(op: &str, args: serde_json::Value) -> VmCommandRequest {
+        VmCommandRequest {
+            op: op.to_owned(),
+            name: None,
+            args: args.as_object().cloned(),
         }
     }
 
     #[test]
-    fn vm_ops_whitelist_is_enforced() {
+    fn vm_ops_whitelist_includes_phase15_ops() {
         for op in [
             "list",
             "start",
@@ -727,9 +1326,15 @@ mod tests {
             "reboot",
             "destroy",
             "screenshot",
+            "create",
+            "snapshot.create",
+            "snapshot.list",
+            "snapshot.restore",
+            "snapshot.delete",
+            "disk.info",
+            "export",
         ] {
-            let name = if op == "list" { None } else { Some("debian12") };
-            assert!(validate_vm_command(request(op, name)).is_ok(), "op={op}");
+            assert!(VM_COMMAND_OPS.contains(&op), "缺少 op：{op}");
         }
         for op in ["exec", "rm-rf", ""] {
             assert!(
@@ -740,11 +1345,33 @@ mod tests {
     }
 
     #[test]
-    fn vm_command_name_rules_are_enforced() {
-        // list 不接受 name
-        assert!(validate_vm_command(request("list", Some("debian12"))).is_err());
+    fn legacy_name_is_mapped_to_args_name() {
+        let command = validate_vm_command(request("START", Some(" debian12 "))).unwrap();
+        assert_eq!(command.op, "start");
+        assert_eq!(command.args["name"], serde_json::json!("debian12"));
+
+        // name 与 args.name 冲突 → 400
+        assert!(
+            validate_vm_command(VmCommandRequest {
+                op: "start".to_owned(),
+                name: Some("a".to_owned()),
+                args: serde_json::json!({"name":"b"}).as_object().cloned(),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn list_rejects_arguments() {
         assert!(validate_vm_command(request("list", None)).is_ok());
-        // 其它命令必须有非空 name
+        assert!(validate_vm_command(request("list", Some("debian12"))).is_err());
+        assert!(
+            validate_vm_command(request_args("list", serde_json::json!({"name":"x"}))).is_err()
+        );
+    }
+
+    #[test]
+    fn lifecycle_ops_require_valid_name() {
         for op in ["start", "shutdown", "reboot", "destroy", "screenshot"] {
             assert!(validate_vm_command(request(op, None)).is_err(), "op={op}");
             assert!(
@@ -756,15 +1383,150 @@ mod tests {
                 "op={op}"
             );
         }
-        // 超长 name
-        assert!(validate_vm_command(request("start", Some(&"x".repeat(129)))).is_err());
+        // 名字白名单（防路径注入）
+        for bad in ["../evil", "a/b", "a b", "域名", &"x".repeat(65)] {
+            assert!(
+                validate_vm_command(request("start", Some(bad))).is_err(),
+                "应拒绝 name={bad}"
+            );
+        }
+        for good in ["debian12", "lab.1", "a_b-c"] {
+            assert!(validate_vm_command(request("start", Some(good))).is_ok());
+        }
     }
 
     #[test]
-    fn vm_command_is_normalized_to_lowercase() {
-        let command = validate_vm_command(request(" START ", Some(" debian12 "))).unwrap();
-        assert_eq!(command.op, "start");
-        assert_eq!(command.name.as_deref(), Some("debian12"));
+    fn create_applies_defaults_and_ranges() {
+        let command = validate_vm_command(request_args(
+            "create",
+            serde_json::json!({"name":"lab-1","base_volume":"ubuntu-22.04"}),
+        ))
+        .unwrap();
+        assert_eq!(command.args["name"], serde_json::json!("lab-1"));
+        assert_eq!(command.args["vcpus"], serde_json::json!(2));
+        assert_eq!(command.args["memory_mib"], serde_json::json!(2048));
+        assert_eq!(command.args["disk_gb"], serde_json::json!(20));
+        assert_eq!(
+            command.args["base_volume"],
+            serde_json::json!("ubuntu-22.04")
+        );
+        assert!(command.args.get("start").is_none());
+
+        for (args, label) in [
+            (serde_json::json!({"name":"a","vcpus":0}), "vcpus 越界"),
+            (serde_json::json!({"name":"a","vcpus":65}), "vcpus 越界"),
+            (
+                serde_json::json!({"name":"a","memory_mib":255}),
+                "memory 越界",
+            ),
+            (
+                serde_json::json!({"name":"a","memory_mib":262145}),
+                "memory 越界",
+            ),
+            (serde_json::json!({"name":"a","disk_gb":0}), "disk 越界"),
+            (serde_json::json!({"name":"a","disk_gb":2049}), "disk 越界"),
+            (
+                serde_json::json!({"name":"a","base_volume":"x","base_path":"/tmp/x"}),
+                "底包二选一",
+            ),
+            (
+                serde_json::json!({"name":"a","base_path":"relative.qcow2"}),
+                "base_path 非绝对",
+            ),
+            (
+                serde_json::json!({"name":"a","gpu":["0000:01:00.0","0000:02:00.0","0000:03:00.0"]}),
+                "gpu 超限",
+            ),
+            (
+                serde_json::json!({"name":"a","gpu":["not-a-pci"]}),
+                "gpu 格式",
+            ),
+            (serde_json::json!({"name":"a","unknown":1}), "未知字段"),
+        ] {
+            assert!(
+                validate_vm_command(request_args("create", args)).is_err(),
+                "应拒绝：{label}"
+            );
+        }
+
+        let command = validate_vm_command(request_args(
+            "create",
+            serde_json::json!({
+                "name":"lab-1","vcpus":4,"memory_mib":8192,"disk_gb":100,
+                "base_volume":"ubuntu-22.04","gpu":["0000:01:00.0","0000:02:00.0"],
+                "start":true
+            }),
+        ))
+        .unwrap();
+        assert_eq!(command.args["vcpus"], serde_json::json!(4));
+        assert_eq!(command.args["memory_mib"], serde_json::json!(8192));
+        assert_eq!(command.args["disk_gb"], serde_json::json!(100));
+        assert_eq!(
+            command.args["gpu"],
+            serde_json::json!(["0000:01:00.0", "0000:02:00.0"])
+        );
+        assert_eq!(command.args["start"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn snapshot_and_disk_ops_validate_args() {
+        // snapshot.create：name + snapshot 必填，description 可选≤255
+        let command = validate_vm_command(request_args(
+            "snapshot.create",
+            serde_json::json!({"name":"lab-1","snapshot":"snap-1","description":"after install"}),
+        ))
+        .unwrap();
+        assert_eq!(command.args["snapshot"], serde_json::json!("snap-1"));
+        assert_eq!(
+            command.args["description"],
+            serde_json::json!("after install")
+        );
+        for args in [
+            serde_json::json!({"name":"lab-1"}),
+            serde_json::json!({"snapshot":"snap-1"}),
+            serde_json::json!({"name":"lab-1","snapshot":"snap-1","description":"x".repeat(256)}),
+        ] {
+            assert!(validate_vm_command(request_args("snapshot.create", args)).is_err());
+        }
+        // restore/delete 必须 name+snapshot
+        for op in ["snapshot.restore", "snapshot.delete"] {
+            assert!(
+                validate_vm_command(request_args(op, serde_json::json!({"name":"lab-1"}))).is_err()
+            );
+            assert!(
+                validate_vm_command(request_args(
+                    op,
+                    serde_json::json!({"name":"lab-1","snapshot":"snap-1"})
+                ))
+                .is_ok()
+            );
+        }
+        // list/disk.info 只接受 name
+        for op in ["snapshot.list", "disk.info"] {
+            assert!(validate_vm_command(request_args(op, serde_json::json!({}))).is_err());
+            assert!(
+                validate_vm_command(request_args(op, serde_json::json!({"name":"lab-1"}))).is_ok()
+            );
+        }
+        // export 只支持 qcow2（缺省即 qcow2）
+        let command =
+            validate_vm_command(request_args("export", serde_json::json!({"name":"lab-1"})))
+                .unwrap();
+        assert_eq!(command.args["format"], serde_json::json!("qcow2"));
+        assert!(
+            validate_vm_command(request_args(
+                "export",
+                serde_json::json!({"name":"lab-1","format":"raw"})
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_vm_command(request_args(
+                "export",
+                serde_json::json!({"name":"lab-1","format":"qcow2"})
+            ))
+            .is_ok()
+        );
     }
 
     #[test]
@@ -780,5 +1542,104 @@ mod tests {
         let start_payload = vm_command_downlink_payload(request_id, &start);
         assert_eq!(start_payload["op"], serde_json::json!("start"));
         assert_eq!(start_payload["args"]["name"], serde_json::json!("debian12"));
+
+        let create = validate_vm_command(request_args(
+            "create",
+            serde_json::json!({"name":"lab-1","base_volume":"ubuntu-22.04"}),
+        ))
+        .unwrap();
+        let create_payload = vm_command_downlink_payload(request_id, &create);
+        assert_eq!(create_payload["op"], serde_json::json!("create"));
+        assert_eq!(
+            create_payload["args"]["base_volume"],
+            serde_json::json!("ubuntu-22.04")
+        );
+        assert_eq!(create_payload["args"]["vcpus"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn batch_slot_suffix_is_sanitized() {
+        assert_eq!(sanitize_slot_suffix("room-101"), "101");
+        assert_eq!(
+            sanitize_slot_suffix("w3f-crit-slot-1793663233"),
+            "1793663233"
+        );
+        assert_eq!(sanitize_slot_suffix("room_102"), "102");
+        assert_eq!(sanitize_slot_suffix("slot42"), "slot42");
+        assert_eq!(sanitize_slot_suffix("    "), "1");
+        assert_eq!(sanitize_slot_suffix("a b/c"), "abc");
+    }
+
+    #[test]
+    fn batch_vm_name_composes_prefix_and_suffix() {
+        assert_eq!(batch_vm_name("lab", "room-101"), "lab-101");
+        assert_eq!(batch_vm_name("lab", "room-102"), "lab-102");
+        assert_eq!(
+            batch_vm_name("w3f", "w3f-crit-slot-1793663233"),
+            "w3f-1793663233"
+        );
+        // 总长不超过 64
+        let long_prefix = "p".repeat(32);
+        let long_slot = format!("room-{}", "9".repeat(60));
+        let name = batch_vm_name(&long_prefix, &long_slot);
+        assert!(name.chars().count() <= 64, "name={name}");
+        assert!(name.starts_with("p"));
+        assert!(name.contains('-'));
+    }
+
+    fn base_environment_request() -> VmEnvironmentRequest {
+        VmEnvironmentRequest {
+            name_prefix: "lab".to_owned(),
+            base_volume: "ubuntu-22.04".to_owned(),
+            vcpus: None,
+            memory_mib: None,
+            disk_gb: None,
+            auto_start: None,
+        }
+    }
+
+    #[test]
+    fn batch_environment_validation_and_args() {
+        let request = base_environment_request();
+        let env = validate_vm_environment(&request).unwrap();
+        assert_eq!(env.vcpus, 2);
+        assert_eq!(env.memory_mib, 2048);
+        assert_eq!(env.disk_gb, 20);
+        assert!(!env.auto_start);
+
+        let args = environment_create_args(&env, "room-101");
+        assert_eq!(args["name"], serde_json::json!("lab-101"));
+        assert_eq!(args["vcpus"], serde_json::json!(2));
+        assert_eq!(args["base_volume"], serde_json::json!("ubuntu-22.04"));
+        assert_eq!(args["start"], serde_json::json!(false));
+
+        for (field, request) in [
+            (
+                "非法 prefix",
+                VmEnvironmentRequest {
+                    name_prefix: "lab/1".to_owned(),
+                    ..base_environment_request()
+                },
+            ),
+            (
+                "空 base_volume",
+                VmEnvironmentRequest {
+                    base_volume: "  ".to_owned(),
+                    ..base_environment_request()
+                },
+            ),
+            (
+                "vcpus 越界",
+                VmEnvironmentRequest {
+                    vcpus: Some(65),
+                    ..base_environment_request()
+                },
+            ),
+        ] {
+            assert!(
+                validate_vm_environment(&request).is_err(),
+                "应拒绝：{field}"
+            );
+        }
     }
 }

@@ -3,7 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 import { api, isNotFound } from '@/api'
-import type { MachineDetail, VmCommandOp, VmCommandReply } from '@/api/schema'
+import type { ImageArtifact, MachineDetail, VmCommandOp, VmCommandReply } from '@/api/schema'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
@@ -28,6 +28,19 @@ import {
   workloadStateMeta,
 } from '@/features/machines/machineMeta'
 import { parseMachinePayload, parseVmList, type VmView } from '@/features/machines/payload'
+import {
+  VM_OP_LABELS,
+  buildCreateArgs,
+  isValidVmName,
+  parseDiskInfo,
+  parseExportResult,
+  parseSnapshotList,
+  validateVmCreateForm,
+  type VmCreateForm,
+  type VmDiskInfoView,
+  type VmExportView,
+  type VmSnapshotRow,
+} from '@/features/machines/vmCommand'
 import { useMachineStream } from '@/features/machines/useMachineStream'
 import { useAuthStore } from '@/stores/auth'
 import { useToastStore } from '@/stores/toast'
@@ -251,17 +264,18 @@ async function wakeMachine() {
 
 // ---------------------------------------------------------------------------
 // 虚拟机远程控制（vm:control）：命令经 device_downlink 下发，轮询 machine_command_results。
+// 阶段 1.5：底包/差分盘/快照/磁盘链/导出（args 契约见 docs/vm-base-image-and-diff-disk.md §3）。
 // ---------------------------------------------------------------------------
 
-const VM_OP_LABELS: Record<VmCommandOp, string> = {
-  list: '刷新列表',
-  start: '启动',
-  shutdown: '关机',
-  reboot: '重启',
-  destroy: '销毁',
-  screenshot: '截图',
-}
-const VM_CONFIRM_OPS: VmCommandOp[] = ['start', 'shutdown', 'reboot', 'destroy']
+const VM_CONFIRM_OPS: VmCommandOp[] = [
+  'start',
+  'shutdown',
+  'reboot',
+  'destroy',
+  'snapshot.restore',
+  'snapshot.delete',
+]
+const VM_REFRESH_OPS: VmCommandOp[] = ['start', 'shutdown', 'reboot', 'destroy', 'create']
 const VM_POLL_INTERVAL_MS = 1000
 const VM_POLL_MAX_ATTEMPTS = 60
 
@@ -271,14 +285,54 @@ const vmOverride = ref<VmView[] | null>(null)
 const vmRows = computed<VmView[]>(() => vmOverride.value ?? parsed.value?.vms ?? [])
 const vmBusy = ref(false)
 const vmBusyName = ref('')
-const vmConfirm = ref<{ op: VmCommandOp; name: string } | null>(null)
+
+// 确认框（生命周期 / 快照恢复/删除）
+const vmConfirm = ref<{ op: VmCommandOp; name: string; snapshot?: string } | null>(null)
+// 截图
 const vmScreenshot = ref<{ name: string; src: string } | null>(null)
+// 新建虚拟机
+const vmCreateOpen = ref(false)
+const vmCreateError = ref('')
+const vmBaseImages = ref<ImageArtifact[]>([])
+const vmBaseImagesLoading = ref(false)
+const vmCreateForm = ref<VmCreateForm>({
+  name: '',
+  vcpus: 2,
+  memoryMiB: 2048,
+  diskGiB: 20,
+  baseVolume: '',
+  start: true,
+  gpu: '',
+})
+// 快照抽屉
+const vmSnapshotOpen = ref(false)
+const vmSnapshotVm = ref('')
+const vmSnapshotInput = ref('')
+const vmSnapshots = ref<VmSnapshotRow[]>([])
+// 磁盘链
+const vmDiskOpen = ref(false)
+const vmDiskVm = ref('')
+const vmDiskInfo = ref<VmDiskInfoView | null>(null)
+// 导出
+const vmExportOpen = ref(false)
+const vmExportVm = ref('')
+const vmExportResult = ref<VmExportView | null>(null)
+
+/** 底包候选：已发布 vm_disk 镜像的 libvirt 卷名（`<image name>-<version>`，由导入器落盘）。 */
+const vmBaseVolumeOptions = computed(() =>
+  vmBaseImages.value.map((image) => ({
+    value: `${image.name}-${image.version}`,
+    label: `${image.name}-${image.version}`,
+    description: `${image.platform} · ${image.format}`,
+  })),
+)
 
 const vmConfirmDetail = computed(() => {
   const pending = vmConfirm.value
   if (!pending) return ''
   return [
     `虚拟机：${pending.name}`,
+    pending.snapshot ? `快照：${pending.snapshot}` : '',
     `操作：${VM_OP_LABELS[pending.op]}`,
     '命令经设备下行交给机器上的 room-agent 执行，最长等待 60s。',
     pending.op === 'destroy' ? '销毁不可撤销，请确认磁盘数据已不需要。' : '',
@@ -309,66 +363,85 @@ async function pollVmCommand(requestId: string): Promise<VmCommandReply> {
   }
 }
 
-function applyVmResult(op: VmCommandOp, name: string | null, data: Record<string, unknown> | null) {
-  if (op === 'list') {
-    const vms = parseVmList(data)
-    if (vms) vmOverride.value = vms
-    return
-  }
-  if (op === 'screenshot') {
-    const image = typeof data?.image_base64 === 'string' ? data.image_base64 : ''
-    if (!image) {
-      toast.error('截图失败', '机器没有返回截图数据（检查 libvirt / 显卡驱动）')
-      return
-    }
-    const format = typeof data?.format === 'string' ? data.format : 'png'
-    vmScreenshot.value = {
-      name: name ?? '虚拟机',
-      src: `data:image/${format};base64,${image}`,
-    }
-  }
-}
-
-async function runVmCommand(op: VmCommandOp, name?: string) {
-  if (!serial.value || vmBusy.value) return
+/** 只负责下发 + 轮询 + 错误 toast；成功后的 UI 状态由调用方处理。 */
+async function sendVmCommand(
+  op: VmCommandOp,
+  args: Record<string, unknown>,
+  label: string,
+): Promise<VmCommandReply | null> {
+  if (!serial.value || vmBusy.value) return null
   vmBusy.value = true
-  vmBusyName.value = name ?? ''
-  let refreshAfter = false
+  vmBusyName.value = label
   try {
-    const accepted = await api.vmCommand(serial.value, { op, ...(name ? { name } : {}) })
+    const accepted = await api.vmCommand(serial.value, { op, args })
     const reply = await pollVmCommand(accepted.request_id)
-    if (reply.status === 'ok') {
-      applyVmResult(op, name ?? null, reply.data ?? null)
-      toast.success(`虚拟机${VM_OP_LABELS[op]}成功`, name ? `虚拟机：${name}` : '已刷新虚拟机列表')
-      // 启停/销毁后状态会变化：自动再拉一次列表（agent 回报的是操作结果，不是完整列表）。
-      refreshAfter = op !== 'list' && op !== 'screenshot'
-    } else if (reply.status === 'timeout') {
-      toast.error('虚拟机命令超时', '60s 内未收到机器回报，请确认机器在线且 agent 正常')
+    if (reply.status === 'ok') return reply
+    if (reply.status === 'timeout') {
+      toast.error(`${label}超时`, '60s 内未收到机器回报，请确认机器在线且 agent 正常')
     } else {
-      toast.error('虚拟机命令失败', reply.error ?? '机器返回错误')
+      toast.error(`${label}失败`, reply.error ?? '机器返回错误')
     }
+    return reply
   } catch (caught) {
-    toast.error('虚拟机命令失败', errorMessage(caught, '请稍后重试'))
+    toast.error(`${label}失败`, errorMessage(caught, '请稍后重试'))
+    return null
   } finally {
     vmBusy.value = false
     vmBusyName.value = ''
   }
-  if (refreshAfter) void runVmCommand('list')
 }
 
-/** 启动/关机/重启/销毁先弹确认框；截图/刷新直接下发。 */
+/** 通用命令：刷新/生命周期/截图；成功后更新对应 UI 并刷新列表。 */
+async function runVmCommand(op: VmCommandOp, args: Record<string, unknown> = {}) {
+  const label = VM_OP_LABELS[op]
+  const reply = await sendVmCommand(op, args, label)
+  if (!reply || reply.status !== 'ok') return reply
+
+  if (op === 'list') {
+    const vms = parseVmList(reply.data)
+    if (vms) vmOverride.value = vms
+    toast.success('已刷新虚拟机列表')
+    return reply
+  }
+  if (op === 'screenshot') {
+    const data = (reply.data ?? {}) as Record<string, unknown>
+    const image = typeof data.image_base64 === 'string' ? data.image_base64 : ''
+    if (!image) {
+      toast.error('截图失败', '机器没有返回截图数据（检查 libvirt / 显卡驱动）')
+      return reply
+    }
+    const format = typeof data.format === 'string' ? data.format : 'png'
+    vmScreenshot.value = {
+      name: typeof args.name === 'string' ? args.name : '虚拟机',
+      src: `data:image/${format};base64,${image}`,
+    }
+    toast.success('截图完成')
+    return reply
+  }
+
+  toast.success(`${label}成功`, typeof args.name === 'string' ? `虚拟机：${args.name}` : undefined)
+  if (VM_REFRESH_OPS.includes(op)) void runVmCommand('list')
+  return reply
+}
+
+/** 启动/关机/重启/销毁/快照恢复/删除先弹确认框；截图/刷新直接下发。 */
 function requestVmOp(op: VmCommandOp, name: string) {
   if (VM_CONFIRM_OPS.includes(op)) {
     vmConfirm.value = { op, name }
     return
   }
-  void runVmCommand(op, name)
+  void runVmCommand(op, { name })
 }
 
 function confirmVmOp() {
   const pending = vmConfirm.value
   vmConfirm.value = null
-  if (pending) void runVmCommand(pending.op, pending.name)
+  if (!pending) return
+  if (pending.op === 'snapshot.restore' || pending.op === 'snapshot.delete') {
+    void runSnapshotMutation(pending.op, pending.name, pending.snapshot ?? '')
+    return
+  }
+  void runVmCommand(pending.op, { name: pending.name })
 }
 
 function refreshVmList() {
@@ -376,7 +449,139 @@ function refreshVmList() {
 }
 
 function screenshotVm(name: string) {
-  void runVmCommand('screenshot', name)
+  void runVmCommand('screenshot', { name })
+}
+
+// ---- 新建虚拟机（底包 + 差分盘） ----
+
+async function loadVmBaseImages() {
+  vmBaseImagesLoading.value = true
+  try {
+    const page = await api.listImages({
+      kind: 'vm_disk',
+      status: 'published',
+      page: 1,
+      page_size: 50,
+    })
+    vmBaseImages.value = page.items ?? []
+  } catch {
+    vmBaseImages.value = []
+  } finally {
+    vmBaseImagesLoading.value = false
+  }
+}
+
+function openVmCreate() {
+  vmCreateError.value = ''
+  vmCreateForm.value = {
+    name: '',
+    vcpus: 2,
+    memoryMiB: 2048,
+    diskGiB: 20,
+    baseVolume: vmBaseVolumeOptions.value[0]?.value ?? '',
+    start: true,
+    gpu: '',
+  }
+  vmCreateOpen.value = true
+  if (!vmBaseImages.value.length) void loadVmBaseImages()
+}
+
+async function submitVmCreate() {
+  const error = validateVmCreateForm(vmCreateForm.value)
+  vmCreateError.value = error ?? ''
+  if (error) return
+  const form = vmCreateForm.value
+  const reply = await sendVmCommand('create', buildCreateArgs(form), '新建虚拟机')
+  if (!reply || reply.status !== 'ok') return
+  vmCreateOpen.value = false
+  const data = (reply.data ?? {}) as Record<string, unknown>
+  const diskPath = typeof data.disk_path === 'string' ? data.disk_path : ''
+  toast.success('虚拟机创建成功', diskPath ? `${form.name} · ${diskPath}` : form.name)
+  void runVmCommand('list')
+}
+
+// ---- 快照（关机状态下 qcow2 内部快照） ----
+
+async function openVmSnapshots(name: string) {
+  vmSnapshotVm.value = name
+  vmSnapshotInput.value = ''
+  vmSnapshots.value = []
+  vmSnapshotOpen.value = true
+  await refreshVmSnapshots()
+}
+
+async function refreshVmSnapshots() {
+  if (!vmSnapshotVm.value) return
+  const reply = await sendVmCommand('snapshot.list', { name: vmSnapshotVm.value }, '加载快照列表')
+  if (reply?.status === 'ok') {
+    vmSnapshots.value = parseSnapshotList(reply.data)
+  }
+}
+
+function snapshotNameError(): string {
+  const value = vmSnapshotInput.value.trim()
+  if (!value) return '请填写快照名'
+  if (!isValidVmName(value)) return '快照名只允许字母、数字、点、下划线、短横线（1-64 字符）'
+  return ''
+}
+
+async function createVmSnapshot() {
+  const error = snapshotNameError()
+  if (error) {
+    toast.error('快照名非法', error)
+    return
+  }
+  const snapshot = vmSnapshotInput.value.trim()
+  const reply = await sendVmCommand(
+    'snapshot.create',
+    { name: vmSnapshotVm.value, snapshot },
+    '创建快照',
+  )
+  if (!reply || reply.status !== 'ok') return
+  toast.success('快照已创建', snapshot)
+  vmSnapshotInput.value = ''
+  await refreshVmSnapshots()
+}
+
+function requestSnapshotRestore(tag: string) {
+  vmConfirm.value = { op: 'snapshot.restore', name: vmSnapshotVm.value, snapshot: tag }
+}
+
+function requestSnapshotDelete(tag: string) {
+  vmConfirm.value = { op: 'snapshot.delete', name: vmSnapshotVm.value, snapshot: tag }
+}
+
+async function runSnapshotMutation(op: VmCommandOp, name: string, snapshot: string) {
+  const reply = await sendVmCommand(op, { name, snapshot }, VM_OP_LABELS[op])
+  if (!reply || reply.status !== 'ok') return
+  toast.success(`${VM_OP_LABELS[op]}成功`, `虚拟机：${name} · 快照：${snapshot}`)
+  if (vmSnapshotOpen.value && vmSnapshotVm.value === name) await refreshVmSnapshots()
+}
+
+// ---- 磁盘链 / 导出（阶段 2 再接对象存储上传） ----
+
+async function openVmDiskInfo(name: string) {
+  vmDiskVm.value = name
+  vmDiskInfo.value = null
+  vmDiskOpen.value = true
+  const reply = await sendVmCommand('disk.info', { name }, '读取磁盘链')
+  if (reply?.status === 'ok') vmDiskInfo.value = parseDiskInfo(reply.data)
+}
+
+function refreshVmDiskInfo() {
+  if (vmDiskVm.value) void openVmDiskInfo(vmDiskVm.value)
+}
+
+async function openVmExport(name: string) {
+  vmExportVm.value = name
+  vmExportResult.value = null
+  vmExportOpen.value = true
+  const reply = await sendVmCommand('export', { name }, '导出磁盘')
+  if (reply?.status === 'ok') {
+    const parsed = parseExportResult(reply.data)
+    if (parsed) vmExportResult.value = parsed
+    else toast.error('导出结果无法解析', 'agent 没有返回 path/sha256')
+  }
 }
 
 async function load(silent = false) {
@@ -535,16 +740,20 @@ onMounted(() => void load())
             <div class="flex items-center justify-between gap-2 px-5 pt-4">
               <p class="text-[11px] text-muted">共 {{ vmRows.length }} 台虚拟机</p>
               <div class="flex items-center gap-2">
-                <AppButton
-                  v-if="canVmControl"
-                  size="sm"
-                  icon="refresh"
-                  :loading="vmBusy && !vmBusyName"
-                  :disabled="vmBusy"
-                  @click="refreshVmList"
-                >
-                  刷新列表
-                </AppButton>
+                <template v-if="canVmControl">
+                  <AppButton size="sm" icon="plus" :disabled="vmBusy" @click="openVmCreate">
+                    新建虚拟机
+                  </AppButton>
+                  <AppButton
+                    size="sm"
+                    icon="refresh"
+                    :loading="vmBusy && !vmBusyName"
+                    :disabled="vmBusy"
+                    @click="refreshVmList"
+                  >
+                    刷新列表
+                  </AppButton>
+                </template>
                 <span v-else class="text-[10.5px] text-faint">只读（需要 vm:control 权限）</span>
               </div>
             </div>
@@ -595,6 +804,15 @@ onMounted(() => void load())
                     </AppButton>
                     <AppButton size="sm" :disabled="vmBusy" @click="screenshotVm(vm.name)">
                       截图
+                    </AppButton>
+                    <AppButton size="sm" :disabled="vmBusy" @click="openVmSnapshots(vm.name)">
+                      快照
+                    </AppButton>
+                    <AppButton size="sm" :disabled="vmBusy" @click="openVmDiskInfo(vm.name)">
+                      磁盘链
+                    </AppButton>
+                    <AppButton size="sm" :disabled="vmBusy" @click="openVmExport(vm.name)">
+                      导出
                     </AppButton>
                   </template>
                 </div>
@@ -717,10 +935,12 @@ onMounted(() => void load())
         :open="vmConfirm !== null"
         title="虚拟机操作"
         :description="
-          vmConfirm ? `确认对 ${vmConfirm.name} 执行「${VM_OP_LABELS[vmConfirm.op]}」？` : ''
+          vmConfirm
+            ? `确认对 ${vmConfirm.name}${vmConfirm.snapshot ? ` 的快照 ${vmConfirm.snapshot}` : ''} 执行「${VM_OP_LABELS[vmConfirm.op]}」？`
+            : ''
         "
         :detail="vmConfirmDetail"
-        :danger="vmConfirm?.op === 'destroy'"
+        :danger="vmConfirm?.op === 'destroy' || vmConfirm?.op === 'snapshot.delete'"
         confirm-label="确认执行"
         :loading="vmBusy"
         @close="vmConfirm = null"
@@ -746,6 +966,237 @@ onMounted(() => void load())
             刷新截图
           </AppButton>
           <AppButton variant="primary" @click="vmScreenshot = null">关闭</AppButton>
+        </template>
+      </AppModal>
+
+      <AppModal
+        :open="vmCreateOpen"
+        title="新建虚拟机"
+        description="用已发布 VM 底包创建 qcow2 差分盘（只读引用底包，只保存增量）"
+        size="lg"
+        @close="vmCreateOpen = false"
+      >
+        <div class="grid grid-cols-2 gap-3">
+          <label class="flex flex-col gap-1 text-[11px] text-muted">
+            名称
+            <input
+              v-model="vmCreateForm.name"
+              placeholder="lab-1"
+              class="h-9 rounded-md border border-line bg-surface px-3 text-[12px] text-ink outline-none focus:border-accent"
+            />
+          </label>
+          <label class="flex flex-col gap-1 text-[11px] text-muted">
+            系统底包（已发布 vm_disk 镜像）
+            <select
+              v-model="vmCreateForm.baseVolume"
+              :disabled="vmBaseImagesLoading"
+              class="h-9 rounded-md border border-line bg-surface px-2 text-[12px] text-ink outline-none focus:border-accent"
+            >
+              <option value="">空白盘（不使用底包）</option>
+              <option
+                v-for="option in vmBaseVolumeOptions"
+                :key="option.value"
+                :value="option.value"
+              >
+                {{ option.label }}（{{ option.description }}）
+              </option>
+            </select>
+          </label>
+          <label class="flex flex-col gap-1 text-[11px] text-muted">
+            vCPU（1-64）
+            <input
+              v-model.number="vmCreateForm.vcpus"
+              type="number"
+              min="1"
+              max="64"
+              class="h-9 rounded-md border border-line bg-surface px-3 text-[12px] text-ink outline-none focus:border-accent"
+            />
+          </label>
+          <label class="flex flex-col gap-1 text-[11px] text-muted">
+            内存 MiB（256-262144）
+            <input
+              v-model.number="vmCreateForm.memoryMiB"
+              type="number"
+              min="256"
+              max="262144"
+              class="h-9 rounded-md border border-line bg-surface px-3 text-[12px] text-ink outline-none focus:border-accent"
+            />
+          </label>
+          <label class="flex flex-col gap-1 text-[11px] text-muted">
+            磁盘 GiB（1-2048）
+            <input
+              v-model.number="vmCreateForm.diskGiB"
+              type="number"
+              min="1"
+              max="2048"
+              class="h-9 rounded-md border border-line bg-surface px-3 text-[12px] text-ink outline-none focus:border-accent"
+            />
+          </label>
+          <label class="flex flex-col gap-1 text-[11px] text-muted">
+            GPU 直通（可选，逗号分隔最多 2 个）
+            <input
+              v-model="vmCreateForm.gpu"
+              placeholder="0000:01:00.0,0000:02:00.0"
+              class="h-9 rounded-md border border-line bg-surface px-3 text-[12px] text-ink outline-none focus:border-accent"
+            />
+          </label>
+          <label class="col-span-2 flex items-center gap-2 text-[11.5px] text-muted">
+            <input
+              v-model="vmCreateForm.start"
+              type="checkbox"
+              class="h-3.5 w-3.5 rounded border-line text-accent focus:ring-accent/25"
+            />
+            创建后立即启动
+          </label>
+        </div>
+        <p v-if="vmCreateError" class="mt-2 text-[11px] text-rose-600">{{ vmCreateError }}</p>
+        <p v-if="!vmBaseVolumeOptions.length" class="mt-2 text-[10.5px] text-faint">
+          没有已发布的 vm_disk 镜像：可在「镜像」页发布 VM 磁盘镜像后再选择底包，或先用空白盘。
+        </p>
+        <template #footer>
+          <AppButton :disabled="vmBusy" @click="vmCreateOpen = false">取消</AppButton>
+          <AppButton variant="primary" :loading="vmBusy" @click="submitVmCreate">创建</AppButton>
+        </template>
+      </AppModal>
+
+      <AppModal
+        :open="vmSnapshotOpen"
+        title="虚拟机快照"
+        :description="
+          vmSnapshotVm ? `虚拟机：${vmSnapshotVm}（快照保存在差分盘内部，要求关机状态）` : ''
+        "
+        size="lg"
+        @close="vmSnapshotOpen = false"
+      >
+        <div class="flex items-end gap-2">
+          <label class="flex flex-1 flex-col gap-1 text-[11px] text-muted">
+            新快照名
+            <input
+              v-model="vmSnapshotInput"
+              placeholder="snap-1"
+              class="h-9 rounded-md border border-line bg-surface px-3 text-[12px] text-ink outline-none focus:border-accent"
+            />
+          </label>
+          <AppButton :disabled="vmBusy" :loading="vmBusy" @click="createVmSnapshot"
+            >创建快照</AppButton
+          >
+          <AppButton :disabled="vmBusy" icon="refresh" @click="refreshVmSnapshots">刷新</AppButton>
+        </div>
+        <ul
+          v-if="vmSnapshots.length"
+          class="mt-3 divide-y divide-line/70 rounded-md border border-line"
+        >
+          <li
+            v-for="snapshot in vmSnapshots"
+            :key="snapshot.tag"
+            class="flex flex-wrap items-center justify-between gap-2 px-3 py-2"
+          >
+            <div class="min-w-0">
+              <p class="truncate font-mono text-[11px] text-ink">{{ snapshot.tag }}</p>
+              <p class="mt-0.5 text-[10px] text-faint">
+                {{ snapshot.createdAt ?? snapshot.date ?? '—' }}
+                <template v-if="snapshot.vmSize"> · {{ snapshot.vmSize }}</template>
+              </p>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <AppButton size="sm" :disabled="vmBusy" @click="requestSnapshotRestore(snapshot.tag)">
+                恢复
+              </AppButton>
+              <AppButton
+                size="sm"
+                variant="danger"
+                :disabled="vmBusy"
+                @click="requestSnapshotDelete(snapshot.tag)"
+              >
+                删除
+              </AppButton>
+            </div>
+          </li>
+        </ul>
+        <p v-else class="mt-3 text-[11px] text-muted">还没有快照（或列表尚未加载）。</p>
+      </AppModal>
+
+      <AppModal
+        :open="vmDiskOpen"
+        title="磁盘链"
+        :description="vmDiskVm ? `虚拟机：${vmDiskVm}（底包 → 差分盘 → 快照）` : ''"
+        size="lg"
+        @close="vmDiskOpen = false"
+      >
+        <div v-if="vmDiskInfo">
+          <ul v-if="vmDiskInfo.chain.length" class="mb-3 flex flex-wrap items-center gap-1.5">
+            <li
+              v-for="(item, index) in vmDiskInfo.chain"
+              :key="`${item}-${index}`"
+              class="flex items-center gap-1.5"
+            >
+              <span
+                class="rounded border border-line bg-canvas px-2 py-1 font-mono text-[10px] text-ink-soft"
+              >
+                {{ item }}
+              </span>
+              <span v-if="index < vmDiskInfo.chain.length - 1" class="text-faint">→</span>
+            </li>
+          </ul>
+          <table class="w-full text-left text-[10.5px]">
+            <thead class="text-faint">
+              <tr>
+                <th class="py-1">path</th>
+                <th class="py-1">format</th>
+                <th class="py-1">virtual_size</th>
+                <th class="py-1">backing_path</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="disk in vmDiskInfo.disks" :key="disk.path" class="border-t border-line/60">
+                <td class="max-w-[260px] truncate py-1 font-mono text-ink-soft">{{ disk.path }}</td>
+                <td class="py-1">{{ disk.format ?? '—' }}</td>
+                <td class="py-1 tabular-nums">{{ formatBytes(disk.virtualSize) }}</td>
+                <td class="max-w-[220px] truncate py-1 font-mono text-faint">
+                  {{ disk.backingPath ?? '—' }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p v-else class="text-[11px] text-muted">正在读取磁盘链（disk.info）…</p>
+        <template #footer>
+          <AppButton :disabled="vmBusy" icon="refresh" @click="refreshVmDiskInfo">刷新</AppButton>
+          <AppButton variant="primary" @click="vmDiskOpen = false">关闭</AppButton>
+        </template>
+      </AppModal>
+
+      <AppModal
+        :open="vmExportOpen"
+        title="导出磁盘"
+        :description="
+          vmExportVm ? `虚拟机：${vmExportVm}（导出为完整 qcow2；上传为镜像 = 阶段 2）` : ''
+        "
+        size="lg"
+        @close="vmExportOpen = false"
+      >
+        <div v-if="vmExportResult" class="flex flex-col gap-2 text-[11.5px]">
+          <div class="rounded-md border border-line bg-canvas/50 px-3 py-2">
+            <p class="text-[10.5px] text-faint">导出路径（机器本地）</p>
+            <p class="mt-0.5 break-all font-mono text-[11px] text-ink">{{ vmExportResult.path }}</p>
+          </div>
+          <div class="rounded-md border border-line bg-canvas/50 px-3 py-2">
+            <p class="text-[10.5px] text-faint">sha256</p>
+            <p class="mt-0.5 break-all font-mono text-[11px] text-ink">
+              {{ vmExportResult.sha256 ?? '—' }}
+            </p>
+          </div>
+          <p class="text-[10.5px] text-faint">
+            大小：{{ formatBytes(vmExportResult.sizeBytes) }} · “上传到对象存储并发布为底包”将在阶段
+            2 接入（当前先产出本地文件）。
+          </p>
+        </div>
+        <p v-else class="text-[11px] text-muted">正在导出磁盘（export，可能需要较长时间）…</p>
+        <template #footer>
+          <AppButton :disabled="vmBusy" @click="vmExportVm && openVmExport(vmExportVm)"
+            >重新导出</AppButton
+          >
+          <AppButton variant="primary" @click="vmExportOpen = false">关闭</AppButton>
         </template>
       </AppModal>
 
