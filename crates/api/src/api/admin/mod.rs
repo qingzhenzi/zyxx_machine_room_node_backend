@@ -217,6 +217,15 @@ pub fn router() -> Router<AppState> {
             "/machines/{serial}/vm/commands/{request_id}",
             get(machines::get_vm_command),
         )
+        // 容器生命周期（Incus 后端；权限同 vm:control，实验环境控制）。
+        .route(
+            "/machines/{serial}/container/commands",
+            post(machines::create_container_command),
+        )
+        .route(
+            "/machines/{serial}/container/commands/{request_id}",
+            get(machines::get_vm_command),
+        )
         // 教师批量下发实验环境（room 级；逐槽位 create，权限 vm:control）。
         .route(
             "/rooms/{room_id}/vm/environments",

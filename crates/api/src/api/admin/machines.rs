@@ -357,6 +357,21 @@ const VM_COMMAND_OPS: &[&str] = &[
     "vnc.info",
 ];
 
+/// 容器命令下行 kind（与 agent `container_control` 对齐）。
+const CONTAINER_COMMAND_DOWNLINK_KIND: &str = "container.command";
+/// 允许的容器操作白名单（Incus 后端）。
+const CONTAINER_COMMAND_OPS: &[&str] = &[
+    "list",
+    "start",
+    "stop",
+    "restart",
+    "delete",
+    "snapshot.create",
+    "snapshot.list",
+    "snapshot.restore",
+    "snapshot.delete",
+];
+
 /// VM 名/snapshot 名的通用约束（防路径注入）：`[A-Za-z0-9._-]{1,64}`。
 const VM_NAME_MAX_CHARS: usize = 64;
 /// 批量下发时 name_prefix 上限（给 `<prefix>-<slot尾号>` 留空间）。
@@ -829,6 +844,65 @@ fn validate_vm_command(request: VmCommandRequest) -> AppResult<ValidatedVmComman
     })
 }
 
+/// 校验容器命令（op 白名单 + args），复用 [`ValidatedVmCommand`] 形状。
+fn validate_container_command(request: VmCommandRequest) -> AppResult<ValidatedVmCommand> {
+    let op = request.op.trim().to_ascii_lowercase();
+    if !CONTAINER_COMMAND_OPS.contains(&op.as_str()) {
+        return Err(bad_arg(format!(
+            "op 只能是 {}",
+            CONTAINER_COMMAND_OPS.join(" / ")
+        )));
+    }
+    let mut args = request.args.unwrap_or_default();
+    if let Some(legacy_name) = request.name {
+        let legacy_name = legacy_name.trim().to_owned();
+        if !legacy_name.is_empty() {
+            match args.get("name") {
+                Some(serde_json::Value::String(existing)) if existing.trim() == legacy_name => {}
+                Some(_) => return Err(bad_arg("name 与 args.name 不一致，请只使用 args")),
+                None => {
+                    args.insert("name".to_owned(), serde_json::json!(legacy_name));
+                }
+            }
+        }
+    }
+    if op == "list" {
+        if !args.is_empty() {
+            return Err(bad_arg("list 命令不接受参数"));
+        }
+        return Ok(ValidatedVmCommand {
+            op,
+            args: serde_json::Map::new(),
+        });
+    }
+    let mut out = serde_json::Map::new();
+    match op.as_str() {
+        "delete" | "stop" => {
+            reject_unknown_args(&args, &["name", "force"])?;
+            out.insert("name".to_owned(), serde_json::json!(required_name(&args)?));
+            if let Some(force) = expect_bool(&args, "force")? {
+                if force {
+                    out.insert("force".to_owned(), serde_json::json!(true));
+                }
+            }
+        }
+        "snapshot.create" | "snapshot.restore" | "snapshot.delete" => {
+            reject_unknown_args(&args, &["name", "snapshot"])?;
+            out.insert("name".to_owned(), serde_json::json!(required_name(&args)?));
+            out.insert(
+                "snapshot".to_owned(),
+                serde_json::json!(required_snapshot(&args)?),
+            );
+        }
+        _ => {
+            // start/stop/restart/snapshot.list：只接受 name。
+            reject_unknown_args(&args, &["name"])?;
+            out.insert("name".to_owned(), serde_json::json!(required_name(&args)?));
+        }
+    }
+    Ok(ValidatedVmCommand { op, args: out })
+}
+
 /// 构造 `vm.command` 下行 payload：`{"request_id","op","args":{...}}`。
 fn vm_command_downlink_payload(
     request_id: Uuid,
@@ -1031,6 +1105,41 @@ async fn cleanup_pending_vm_command(state: &AppState, request_id: Uuid) {
     }
 }
 
+/// 插入一条 pending 命令（kind 通用：vm.command / container.command）。
+async fn insert_pending_command(
+    state: &AppState,
+    request_id: Uuid,
+    serial: &str,
+    kind: &str,
+    downlink: &serde_json::Value,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO machine_command_results (request_id, serial, kind, payload, status)
+         VALUES ($1, $2, $3, $4, 'pending')",
+    )
+    .bind(request_id)
+    .bind(serial)
+    .bind(kind)
+    .bind(downlink)
+    .execute(state.db.pool())
+    .await
+    .map_err(|error| AppError::internal(format!("写入命令失败: {error}")))?;
+    Ok(())
+}
+
+/// 清理未下发的 pending 行（kind 通用）。
+async fn cleanup_pending_command(state: &AppState, request_id: Uuid) {
+    if let Err(error) = sqlx::query(
+        "DELETE FROM machine_command_results WHERE request_id = $1 AND status = 'pending'",
+    )
+    .bind(request_id)
+    .execute(state.db.pool())
+    .await
+    {
+        tracing::warn!(%error, %request_id, "清理未下发的 pending 命令失败");
+    }
+}
+
 /// 解析槽位当前存活的设备 serial（与 `enqueue_downlink_for_slot` 的选取口径一致）。
 async fn resolve_live_serial(state: &AppState, slot: &str) -> AppResult<Option<String>> {
     sqlx::query_scalar(
@@ -1183,6 +1292,46 @@ pub async fn create_vm_command(
         }
         Err(error) => {
             cleanup_pending_vm_command(&state, request_id).await;
+            Err(error)
+        }
+    }
+}
+
+/// `POST /api/v1/admin/machines/{serial}/container/commands` —— 下发容器生命周期命令。
+///
+/// 权限 `vm:control`（实验环境控制）；op/args 非法 400；无存活证书 503。
+pub async fn create_container_command(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    Path(serial): Path<String>,
+    ApiJson(request): ApiJson<VmCommandRequest>,
+) -> AppResult<(StatusCode, Json<VmCommandAccepted>)> {
+    authorization::require_permission(&state, id, permissions::VM_CONTROL).await?;
+    let serial = serial.trim();
+    if serial.is_empty() {
+        return Err(AppError::bad_request("serial 不能为空"));
+    }
+    let command = validate_container_command(request)?;
+    let device = state
+        .machines
+        .summary(serial)
+        .await?
+        .ok_or_else(|| AppError::not_found("机器不存在"))?;
+
+    let request_id = Uuid::new_v4();
+    let downlink = vm_command_downlink_payload(request_id, &command);
+    insert_pending_command(&state, request_id, &device.serial, CONTAINER_COMMAND_DOWNLINK_KIND, &downlink).await?;
+    match enqueue_device_downlink(
+        &state,
+        &device.device_slot,
+        CONTAINER_COMMAND_DOWNLINK_KIND,
+        &downlink,
+    )
+    .await
+    {
+        Ok(()) => Ok((StatusCode::ACCEPTED, Json(VmCommandAccepted { request_id }))),
+        Err(error) => {
+            cleanup_pending_command(&state, request_id).await;
             Err(error)
         }
     }
@@ -1899,5 +2048,45 @@ mod tests {
         ))
         .is_err());
         assert!(validate_vm_command(request_args("delete", serde_json::json!({}))).is_err());
+    }
+
+    #[test]
+    fn container_command_args_are_validated() {
+        let ok = validate_container_command(request_args(
+            "start",
+            serde_json::json!({"name":"debian12-cfg"}),
+        ))
+        .unwrap();
+        assert_eq!(ok.op, "start");
+        assert_eq!(ok.args["name"], serde_json::json!("debian12-cfg"));
+        let ok = validate_container_command(request_args(
+            "delete",
+            serde_json::json!({"name":"c1","force":true}),
+        ))
+        .unwrap();
+        assert_eq!(ok.args["force"], serde_json::json!(true));
+        let ok = validate_container_command(request_args(
+            "snapshot.create",
+            serde_json::json!({"name":"c1","snapshot":"s1"}),
+        ))
+        .unwrap();
+        assert_eq!(ok.args["snapshot"], serde_json::json!("s1"));
+        // list 不接受参数；snapshot 缺 snapshot；未知字段/非法 name 拒绝
+        assert!(validate_container_command(request_args("list", serde_json::json!({"x":1}))).is_err());
+        assert!(validate_container_command(request_args(
+            "snapshot.create",
+            serde_json::json!({"name":"c1"})
+        ))
+        .is_err());
+        assert!(validate_container_command(request_args(
+            "start",
+            serde_json::json!({"name":"c1","unknown":1})
+        ))
+        .is_err());
+        assert!(validate_container_command(request_args(
+            "start",
+            serde_json::json!({"name":"../x"})
+        ))
+        .is_err());
     }
 }
