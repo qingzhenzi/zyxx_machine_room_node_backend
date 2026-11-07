@@ -203,6 +203,8 @@ pub fn router() -> Router<AppState> {
         .route("/machines/stream", get(machines::stream))
         .route("/machines/{serial}", get(machines::get))
         .route("/machines/{serial}/snapshots", get(machines::snapshots))
+        // WOL：需要 device:wake（迁移 0030 播种；默认仅 admin 角色）。
+        .route("/machines/{serial}/wake", post(machines::wake))
         // ---- 节点配置（P2）----
         .route(
             "/agent-configs",

@@ -130,6 +130,7 @@ import type {
   UserSession,
   UserSummary,
   VerifyReply,
+  WakeReply,
   WeeklySlot,
 } from './schema'
 import {
@@ -578,6 +579,10 @@ export const api = {
         params: { limit },
       }),
     ),
+
+  /** WOL：向机器发送 Wake-on-LAN magic packet（需要 device:wake 权限）。 */
+  wakeMachine: (serial: string) =>
+    unwrap<WakeReply>(http.post(`/admin/machines/${encodeURIComponent(serial)}/wake`)),
 
   // ---- 设备在线事件 ----
   listDeviceEvents: (params: PresenceEventParams = {}) =>

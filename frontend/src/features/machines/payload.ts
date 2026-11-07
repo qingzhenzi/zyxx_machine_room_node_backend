@@ -218,6 +218,8 @@ export interface AgentView {
   load1: number | null
   load5: number | null
   load15: number | null
+  /** 网卡 MAC（WOL 目标；服务端契约 `sections.agent.host.macs`，旧 agent 可能为空）。 */
+  macs: string[]
   tools: AgentToolView[]
 }
 
@@ -295,6 +297,22 @@ export function asBoolean(value: unknown): boolean | null {
     if (normalized === 'false' || normalized === 'no' || normalized === '0') return false
   }
   return null
+}
+
+const MAC_PATTERN = /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/
+
+/** 读取 MAC 数组（WOL 目标）：只保留合法 `aa:bb:cc:dd:ee:ff`，小写 + 去重。 */
+function macArrayField(record: JsonObject | null | undefined, ...keys: string[]): string[] {
+  if (!record) return []
+  for (const key of keys) {
+    const value = asArray(record[key])
+    if (!value) continue
+    const macs = value
+      .map((item) => asString(item)?.toLowerCase())
+      .filter((item): item is string => typeof item === 'string' && MAC_PATTERN.test(item))
+    return [...new Set(macs)]
+  }
+  return []
 }
 
 function strField(record: JsonObject | null | undefined, ...keys: string[]): string | null {
@@ -733,6 +751,7 @@ function parseAgent(
     load1: numField(agentHost, 'load1'),
     load5: numField(agentHost, 'load5'),
     load15: numField(agentHost, 'load15'),
+    macs: macArrayField(agentHost, 'macs'),
     tools,
   }
 }

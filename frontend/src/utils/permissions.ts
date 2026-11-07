@@ -21,6 +21,7 @@ export const PERMISSIONS = {
   scheduleEventManage: 'schedule:event:manage',
   deviceRead: 'device:read',
   deviceManage: 'device:manage',
+  deviceWake: 'device:wake',
   storageRead: 'storage:read',
   storageManage: 'storage:manage',
   imageRead: 'image:read',

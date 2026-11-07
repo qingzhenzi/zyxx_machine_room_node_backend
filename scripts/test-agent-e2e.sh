@@ -106,7 +106,7 @@ curl -sk -o /dev/null "https://localhost:$ENROLL_PORT/crl" \
 MIG_AFTER="$(psql "$DB_URL" -tAc "select count(*) from _sqlx_migrations" 2>/dev/null || echo 0)"
 [[ "${MIG_AFTER:-0}" -ge 28 ]] \
     || fail "测试库迁移不完整（_sqlx_migrations=${MIG_AFTER:-0}/28），见 $TMP_DIR/device-pki.log"
-log "OK  PostgreSQL 迁移就绪（${MIG_AFTER}/28）"
+log "OK  PostgreSQL 迁移就绪（当前 ${MIG_AFTER}，要求 ≥28）"
 
 log "签发一次性 token 并 enroll（slot=$SLOT）"
 TOKEN_JSON="$(curl -sk -X POST "https://localhost:$ENROLL_PORT/admin/tokens" \

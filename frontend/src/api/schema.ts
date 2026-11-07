@@ -686,6 +686,18 @@ export interface MachineReportRequest {
   sections?: Record<string, unknown>
 }
 
+export interface WakeReply {
+  /** 至少有一个 magic packet 成功发出。 */
+  ok: boolean
+  serial: string
+  /** 本次尝试的目标 MAC（来自最新快照 sections.agent.host.macs）。 */
+  macs: string[]
+  /** 至少成功发出一次 magic packet 的 MAC。 */
+  sent_to: string[]
+  /** 发送失败的 MAC/原因（不阻塞 HTTP 语义）。 */
+  warnings: string[]
+}
+
 export interface MachineReportSummary {
   agent_version: string
   collected_at: string

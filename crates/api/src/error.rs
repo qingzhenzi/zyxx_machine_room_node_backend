@@ -26,6 +26,8 @@ pub enum AppError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    UnprocessableEntity(String),
+    #[error("{0}")]
     TooManyRequests(String),
     #[error("{0}")]
     ServiceUnavailable(String),
@@ -58,6 +60,11 @@ impl AppError {
         Self::Conflict(message.into())
     }
 
+    /// 422：请求语义合法，但当前资源状态无法完成操作（如机器没有可用 MAC）。
+    pub fn unprocessable_entity(message: impl Into<String>) -> Self {
+        Self::UnprocessableEntity(message.into())
+    }
+
     pub fn too_many_requests(message: impl Into<String>) -> Self {
         Self::TooManyRequests(message.into())
     }
@@ -78,6 +85,7 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -92,6 +100,7 @@ impl AppError {
             Self::NotFound(_) => "not_found",
             Self::MethodNotAllowed(_) => "method_not_allowed",
             Self::Conflict(_) => "conflict",
+            Self::UnprocessableEntity(_) => "unprocessable_entity",
             Self::TooManyRequests(_) => "too_many_requests",
             Self::ServiceUnavailable(_) => "service_unavailable",
             Self::Internal(_) => "internal_error",

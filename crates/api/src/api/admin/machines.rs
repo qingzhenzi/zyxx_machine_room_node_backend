@@ -13,15 +13,16 @@ use axum::{
 };
 use futures_util::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
+use tokio::net::UdpSocket;
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use qe_db::machine::{MachineSnapshotMeta, MachineSnapshotRecord, MachineSummary};
 
 use crate::{
-    api::extractors::AuthUser,
+    api::extractors::{AuthUser, ClientIp},
     auth::authorization,
-    domain::{models::Page, rbac::permissions, validation},
+    domain::{models::Page, rbac::permissions, validation, wol},
     error::{AppError, AppResult},
     state::AppState,
 };
@@ -168,6 +169,150 @@ pub async fn snapshots(
         return Err(AppError::not_found("机器不存在"));
     }
     Ok(Json(state.machines.history(serial, limit).await?))
+}
+
+/// WOL：每个目标 MAC 发送的 magic packet 次数（UDP 无连接，重复提高到达率）。
+const WOL_SEND_COUNT: usize = 3;
+/// Wake-on-LAN 标准端口 9 的 IPv4 广播地址（需与目标机同一二层网络）。
+const WOL_BROADCAST_ADDR: &str = "255.255.255.255:9";
+
+/// 网络唤醒响应：`ok` 表示至少有一个 magic packet 成功发出；广播失败只进 `warnings`，
+/// HTTP 仍是 200（契约见 `docs/wol.md`）。
+#[derive(Debug, Serialize)]
+pub struct WakeReply {
+    pub ok: bool,
+    pub serial: String,
+    /// 本次尝试的目标 MAC（来自最新快照 `sections.agent.host.macs`）。
+    pub macs: Vec<String>,
+    /// 至少成功发出一次 magic packet 的 MAC。
+    pub sent_to: Vec<String>,
+    /// 发送失败的 MAC/原因（不阻塞 HTTP 语义）。
+    pub warnings: Vec<String>,
+}
+
+/// `POST /api/v1/admin/machines/{serial}/wake` —— 局域网唤醒（Wake-on-LAN）。
+///
+/// - 权限：`device:wake`（管理端默认只有 `admin` 角色，迁移 0030 播种）；
+/// - 目标 MAC 取该 serial **最新一条** `machine_snapshots.payload` 的
+///   `sections.agent.host.macs`；设备不存在 404、无快照/无 MAC 422；
+/// - 每个 MAC 发 3 次 102 字节 magic packet（6×0xFF + MAC×16）到 UDP 255.255.255.255:9；
+/// - 发送结果写审计 `device.wake`（resource_type=`machine`）。
+pub async fn wake(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    ClientIp(ip): ClientIp,
+    Path(serial): Path<String>,
+) -> AppResult<Json<WakeReply>> {
+    authorization::require_permission(&state, id, permissions::DEVICE_WAKE).await?;
+
+    let serial = serial.trim();
+    if serial.is_empty() {
+        return Err(AppError::bad_request("serial 不能为空"));
+    }
+
+    let device = state
+        .machines
+        .summary(serial)
+        .await?
+        .ok_or_else(|| AppError::not_found("机器不存在"))?;
+    let latest = state
+        .machines
+        .latest(&device.serial)
+        .await?
+        .ok_or_else(|| {
+            AppError::unprocessable_entity(
+                "该机器尚未上报快照，无法获取网卡 MAC（sections.agent.host.macs）",
+            )
+        })?;
+    let macs = wol::macs_from_payload(&latest.payload);
+    if macs.is_empty() {
+        return Err(AppError::unprocessable_entity(
+            "最新快照未上报可用网卡 MAC（sections.agent.host.macs），无法发送唤醒包",
+        ));
+    }
+
+    let mac_labels: Vec<String> = macs.iter().map(ToString::to_string).collect();
+    let (sent_to, warnings) = send_wake_packets(&macs).await;
+    let ok = !sent_to.is_empty();
+    if !warnings.is_empty() {
+        tracing::warn!(
+            serial = %device.serial,
+            ?warnings,
+            "Wake-on-LAN 部分或全部发送失败"
+        );
+    }
+
+    super::audit::record_or_log(
+        &state,
+        id,
+        "device.wake",
+        "machine",
+        Some(device.serial.clone()),
+        serde_json::json!({
+            "serial": device.serial,
+            "macs": mac_labels,
+            "sent_to": sent_to,
+            "warnings": warnings,
+            "snapshot_id": latest.id,
+        }),
+        ip.as_deref(),
+    )
+    .await;
+
+    Ok(Json(WakeReply {
+        ok,
+        serial: device.serial,
+        macs: mac_labels,
+        sent_to,
+        warnings,
+    }))
+}
+
+/// 发送 magic packet：每个 MAC 发 [`WOL_SEND_COUNT`] 次；返回 `(成功送达的 MAC, 警告)`。
+///
+/// 广播发送是「尽力而为」：UDP 无连接、无 ACK，只要 socket 写入成功就算发出，
+/// 目标机是否真的醒来由目标机 BIOS/网卡决定（见 `docs/wol.md` 排障）。
+async fn send_wake_packets(macs: &[wol::MacAddress]) -> (Vec<String>, Vec<String>) {
+    let mut sent_to = Vec::new();
+    let mut warnings = Vec::new();
+
+    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(socket) => socket,
+        Err(error) => {
+            warnings.push(format!(
+                "创建 UDP socket 失败（本机可能无网络权限）: {error}"
+            ));
+            return (sent_to, warnings);
+        }
+    };
+    if let Err(error) = socket.set_broadcast(true) {
+        warnings.push(format!("开启 UDP 广播失败: {error}"));
+    }
+
+    for mac in macs {
+        let packet = wol::magic_packet(*mac);
+        let mut succeeded = 0usize;
+        let mut last_error: Option<String> = None;
+        for _ in 0..WOL_SEND_COUNT {
+            match socket.send_to(&packet, WOL_BROADCAST_ADDR).await {
+                Ok(sent) if sent == packet.len() => succeeded += 1,
+                Ok(sent) => {
+                    last_error = Some(format!("仅发送 {sent}/{} 字节", packet.len()));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        if succeeded > 0 {
+            sent_to.push(mac.to_string());
+        } else {
+            warnings.push(format!(
+                "{mac} 发送失败: {}",
+                last_error.unwrap_or_else(|| "未知错误".to_owned())
+            ));
+        }
+    }
+
+    (sent_to, warnings)
 }
 
 /// SSE 实时流：新快照落库后 2 秒内推送；首次连接从当前最新 id 开始（不补历史），

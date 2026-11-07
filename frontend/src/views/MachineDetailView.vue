@@ -5,6 +5,7 @@ import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { api, isNotFound } from '@/api'
 import type { MachineDetail } from '@/api/schema'
 import AppButton from '@/components/ui/AppButton.vue'
+import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
 import EmptyState from '@/components/ui/EmptyState.vue'
 import IconButton from '@/components/ui/IconButton.vue'
 import InfoList from '@/components/ui/InfoList.vue'
@@ -24,15 +25,18 @@ import { healthScoreClass, machineHealthMeta } from '@/features/machines/machine
 import { parseMachinePayload } from '@/features/machines/payload'
 import { useMachineStream } from '@/features/machines/useMachineStream'
 import { useAuthStore } from '@/stores/auth'
+import { useToastStore } from '@/stores/toast'
 import { errorMessage } from '@/utils/errors'
 import { formatFullDateTime, formatRelative, formatSeconds } from '@/utils/format'
 import { PERMISSIONS } from '@/utils/permissions'
 
 const auth = useAuthStore()
+const toast = useToastStore()
 const route = useRoute()
 const router = useRouter()
 
 const canCreateTicket = computed(() => auth.can(PERMISSIONS.ticketCreate))
+const canWake = computed(() => auth.can(PERMISSIONS.deviceWake))
 
 /** P1 Wave 2 报修入口：带上机器 serial / 槽位 / 房间。 */
 function reportIssue() {
@@ -56,12 +60,32 @@ const loading = ref(false)
 const error = ref('')
 const notFound = ref(false)
 const autoRefresh = ref(false)
+const wakeOpen = ref(false)
+const wakeLoading = ref(false)
 
 const serial = computed(() => String(route.params.serial ?? ''))
 const report = computed(() => detail.value?.report ?? null)
 const health = computed(() => machineHealthMeta(report.value?.health_status))
 const parsed = computed(() =>
   detail.value?.latest ? parseMachinePayload(detail.value.latest.payload) : null,
+)
+
+/** WOL 目标 MAC：来自最新快照 `sections.agent.host.macs`（旧 agent 未上报 → 空）。 */
+const wakeMacs = computed(() => parsed.value?.agent?.macs ?? [])
+
+/** 按钮禁用原因（null = 可唤醒）。 */
+const wakeDisabledReason = computed(() => {
+  if (!detail.value?.latest) return '该机器尚未上报快照，暂无 MAC'
+  if (!wakeMacs.value.length) return '最新快照未上报网卡 MAC（sections.agent.host.macs）'
+  return ''
+})
+
+const wakeDetail = computed(() =>
+  [
+    `目标 MAC：${wakeMacs.value.join('、')}`,
+    'UDP 广播 255.255.255.255:9，每个 MAC 发 3 次 magic packet。',
+    '需与目标机在同一二层网络，且目标机 BIOS/网卡已开启 Wake-on-LAN。',
+  ].join('\n'),
 )
 
 /** 机器是否「Agent 在线」：只看 room-agent 快照新鲜度，与 device-pki 的 mTLS 会话状态相互独立。 */
@@ -166,6 +190,7 @@ const identityItems = computed(() => {
       value: report.value ? `v${report.value.agent_version}` : '未上报',
       mono: true,
     },
+    { label: '网卡 MAC', value: wakeMacs.value.join('、') || '未上报', mono: true },
   ]
 })
 
@@ -196,6 +221,28 @@ const streamMeta = computed<{ label: string; tone: 'emerald' | 'amber' | 'rose' 
   if (streamStatus.value === 'connecting') return { label: '实时流连接中', tone: 'amber' }
   return { label: '实时流重连中', tone: 'rose' }
 })
+
+async function wakeMachine() {
+  if (!serial.value) return
+  wakeLoading.value = true
+  try {
+    const reply = await api.wakeMachine(serial.value)
+    wakeOpen.value = false
+    if (reply.ok) {
+      const suffix = reply.warnings.length ? `；${reply.warnings.length} 条警告` : ''
+      toast.success('已发送网络唤醒', `目标 MAC：${reply.macs.join('、')}${suffix}`)
+    } else {
+      toast.error(
+        '唤醒包发送失败',
+        reply.warnings.join('；') || 'UDP 广播发送失败，请检查本机网络/广播权限',
+      )
+    }
+  } catch (caught) {
+    toast.error('网络唤醒失败', errorMessage(caught, '请稍后重试'))
+  } finally {
+    wakeLoading.value = false
+  }
+}
 
 async function load(silent = false) {
   if (!serial.value) return
@@ -274,6 +321,15 @@ onMounted(() => void load())
         <template #actions>
           <AppButton v-if="canCreateTicket" icon="ticket" @click="reportIssue">
             报修 / 建单
+          </AppButton>
+          <AppButton
+            v-if="canWake"
+            icon="zap"
+            :disabled="Boolean(wakeDisabledReason)"
+            :title="wakeDisabledReason || '发送 Wake-on-LAN magic packet'"
+            @click="wakeOpen = true"
+          >
+            网络唤醒
           </AppButton>
           <StateBadge
             :label="streamMeta.label"
@@ -441,6 +497,17 @@ onMounted(() => void load())
       <div v-if="detail" class="mt-4">
         <MachineHistoryTable :points="detail.history ?? []" />
       </div>
+
+      <ConfirmDialog
+        :open="wakeOpen"
+        title="网络唤醒"
+        :description="`向 ${report?.hostname || detail?.device_slot || serial} 发送 Wake-on-LAN magic packet？`"
+        :detail="wakeDetail"
+        confirm-label="发送唤醒包"
+        :loading="wakeLoading"
+        @close="wakeOpen = false"
+        @confirm="wakeMachine"
+      />
     </template>
   </div>
 </template>

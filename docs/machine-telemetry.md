@@ -3,9 +3,9 @@
 > 目标：房间内的「子机器端」周期性采集主机清单 + 健康结论 + 诊断结果，上报到服务端，
 > 管理控制台在「机器总览」里看到每台机器的实时状态与历史快照。
 >
-> 本文是 **v1.2 契约**；`room-agent` 实现、`qe-device-pki` 的 mTLS handler 与
-> `qe-api` 的管理端接口都以本文为准。相对 v1/v1.1 的变化见 §0（v1.2 为 device_id 身份勘误，
-> 身份模型以 `docs/device-pki-protocol.md` v0.2 为准）。
+> 本文是 **v1.3 契约**；`room-agent` 实现、`qe-device-pki` 的 mTLS handler 与
+> `qe-api` 的管理端接口都以本文为准。相对 v1/v1.1/v1.2 的变化见 §0（v1.2 为 device_id 身份勘误，
+> 身份模型以 `docs/device-pki-protocol.md` v0.2 为准；v1.3 增加 WOL 的 MAC 字段）。
 
 ## 0. v1.1 相对 v1 的变化
 
@@ -33,6 +33,26 @@ v1.1 文中"证书 CN 就是 device_slot"的表述已过时；HEAD 起设备身�
 - **`/agent/config` 的 device 层匹配**：用解析出的 `device_slot` 匹配 `agent_configs.scope_key`，
   不是证书 CN。
 - v1.1 的 `tier`（fast/full）、两档间隔与服务端下发语义完全不变，无需迁移动作。
+
+### 0.2 v1.3（2026-11-07）：`sections.agent.host.macs`（Wake-on-LAN，新增字段）
+
+- 内置 host 采集新增 **`sections.agent.host.macs`**：网卡 MAC 字符串数组，供控制台
+  「机器详情 → 网络唤醒」寻找同二层网络内的目标机。
+  - 来源：Linux `/sys/class/net/<iface>/address`；
+  - **只采集物理网卡**：`/sys/class/net/<iface>/device`（PCI/USB/virtio 设备）或
+    `phy80211`（无线）存在才算；bridge/veth/docker0/tun/tailscale 等虚拟接口不会
+    成为 WoL 目标（实测宿主机曾上报 16 个虚拟网卡，全是无用 MAC）；
+  - 规则：跳过回环接口（`lo`/`lo0`）、跳过全零地址、统一转**小写冒号格式**
+    （`aa:bb:cc:dd:ee:ff`）、**排序 + 去重**；读不到的接口直接忽略（数组可为空，
+    例如容器内只有 veth 时返回空数组——这是有意的保守行为）；
+  - 示例：`["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02"]`；
+  - fast/full 两档**都会**上报（host 是内置采集，不依赖外部工具）；
+  - 该 crate 没有「隐私模式/脱敏」开关：MAC 是局域网唤醒的必需字段，只在管理端可见；
+    如果未来引入脱敏模式，应把 `host.macs` 一并脱敏或省略，并在此处补充说明。
+- 消费方：`qe-api` 的 `POST /api/v1/admin/machines/{serial}/wake`（权限 `device:wake`，
+  迁移 `0030_wol_permission.sql`）读取**最新一条**快照的这个字段并发 magic packet；
+  链路与限制见 `docs/wol.md`。
+- `schema` 版本号仍为 `1`（纯新增字段，旧 agent 不上报时控制台按「无 MAC」处理）。
 
 ## 1. 角色与链路
 
@@ -126,7 +146,7 @@ room-agent（每个房间机器）
       "fast_interval_secs": 10,
       "full_interval_secs": 300,
       "tools": { "platform_health": "0.1.0", "platform_diagnose": "0.1.0" },
-      "host": { "machine_id": "..." }
+      "host": { "machine_id": "...", "macs": ["aa:bb:cc:dd:ee:ff"] }
     }
   }
 }

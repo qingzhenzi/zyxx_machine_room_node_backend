@@ -15,3 +15,4 @@ pub mod schedule_plan;
 pub mod storage;
 pub mod ticket;
 pub mod validation;
+pub mod wol;
