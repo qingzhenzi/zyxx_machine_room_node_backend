@@ -20,6 +20,7 @@ import MetricCard from '@/features/areas/MetricCard.vue'
 import type { MetricCardProps } from '@/features/areas/MetricCard.vue'
 import MachineHealthIssues from '@/features/machines/MachineHealthIssues.vue'
 import MachineHistoryTable from '@/features/machines/MachineHistoryTable.vue'
+import MachineMetricsChart from '@/features/machines/MachineMetricsChart.vue'
 import MachineOverviewSections from '@/features/machines/MachineOverviewSections.vue'
 import UsageBar from '@/features/machines/UsageBar.vue'
 import {
@@ -85,6 +86,9 @@ const loading = ref(false)
 const error = ref('')
 const notFound = ref(false)
 const autoRefresh = ref(false)
+/** 实时模式：每 2s 请求 agent 立即上报一次 fast 快照（Pterodactyl 风格）。 */
+const liveMode = ref(true)
+const liveBusy = ref(false)
 const wakeOpen = ref(false)
 const wakeLoading = ref(false)
 
@@ -289,6 +293,7 @@ const VM_POLL_MAX_ATTEMPTS = 60
 
 const canVmControl = computed(() => auth.can(PERMISSIONS.vmControl))
 const canRequestTelemetry = computed(() => auth.can(PERMISSIONS.deviceManage))
+const chartPoints = computed(() => detail.value?.history ?? [])
 /** `list` 命令返回的列表覆盖遥测快照（刷新按钮/操作后的真实状态）。 */
 const vmOverride = ref<VmView[] | null>(null)
 const vmRows = computed<VmView[]>(() => vmOverride.value ?? parsed.value?.vms ?? [])
@@ -766,7 +771,7 @@ async function load(silent = false) {
   error.value = ''
   notFound.value = false
   try {
-    detail.value = await api.getMachine(serial.value, { history_limit: 20 })
+    detail.value = await api.getMachine(serial.value, { history_limit: 50 })
   } catch (caught) {
     if (isNotFound(caught)) {
       notFound.value = true
@@ -783,6 +788,20 @@ function refresh() {
 }
 
 const telemetryBusy = ref(false)
+
+// 实时模式：页面可见时每 2s 请求一次立即上报；快照经 SSE 回来后由 onSnapshot 刷新详情。
+useInterval(async () => {
+  if (!liveMode.value || !canRequestTelemetry.value) return
+  if (document.visibilityState === 'hidden' || liveBusy.value) return
+  liveBusy.value = true
+  try {
+    await api.requestTelemetryReport(serial.value)
+  } catch {
+    // 机器离线/权限变化时静默失败，保留手动刷新和自动刷新。
+  } finally {
+    liveBusy.value = false
+  }
+}, 2_000)
 
 /** 请求 agent 立即上报一次 fast 快照（走 device_downlink，不依赖定时器）。 */
 async function requestTelemetryReport() {
@@ -880,6 +899,18 @@ onMounted(() => void load())
             />
             自动刷新
           </label>
+          <label
+            v-if="canRequestTelemetry"
+            class="flex items-center gap-2 text-[11.5px] text-muted"
+            title="页面可见时每 2 秒请求 agent 立即上报一次快照"
+          >
+            <input
+              v-model="liveMode"
+              type="checkbox"
+              class="h-3.5 w-3.5 rounded border-line text-accent focus:ring-accent/25"
+            />
+            实时 2s
+          </label>
           <AppButton
             v-if="canRequestTelemetry"
             icon="refresh"
@@ -932,6 +963,13 @@ onMounted(() => void load())
       <section class="mt-4 grid grid-cols-6 gap-3" aria-label="机器关键指标">
         <MetricCard v-for="card in statCards" :key="card.label" v-bind="card" />
       </section>
+
+      <MachineMetricsChart
+        v-if="report"
+        class="mt-4"
+        :points="chartPoints"
+        :live="liveMode && canRequestTelemetry && !detail?.report_stale"
+      />
 
       <div class="mt-4 grid grid-cols-12 items-start gap-4">
         <div class="col-span-8 flex min-w-0 flex-col gap-4">
