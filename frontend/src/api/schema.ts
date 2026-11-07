@@ -737,6 +737,12 @@ export interface MachineReportRequest {
   sections?: Record<string, unknown>
 }
 
+export interface TelemetryReportReply {
+  accepted: boolean
+  request_id: string
+  serial: string
+}
+
 export interface WakeReply {
   /** 至少有一个 magic packet 成功发出。 */
   ok: boolean

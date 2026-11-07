@@ -141,6 +141,7 @@ import type {
   UserSummary,
   VerifyReply,
   WakeReply,
+  TelemetryReportReply,
   WeeklySlot,
 } from './schema'
 import {
@@ -588,6 +589,12 @@ export const api = {
       http.get(`/admin/machines/${encodeURIComponent(serial)}/snapshots`, {
         params: { limit },
       }),
+    ),
+
+  /** 请求 agent 立即上报一次 fast 快照（device:manage）。 */
+  requestTelemetryReport: (serial: string) =>
+    unwrap<TelemetryReportReply>(
+      http.post(`/admin/machines/${encodeURIComponent(serial)}/telemetry/report`),
     ),
 
   /** WOL：向机器发送 Wake-on-LAN magic packet（需要 device:wake 权限）。 */

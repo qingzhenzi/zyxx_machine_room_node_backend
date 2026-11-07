@@ -204,6 +204,62 @@ pub struct WakeReply {
 ///   `sections.agent.host.macs`；设备不存在 404、无快照/无 MAC 422；
 /// - 每个 MAC 发 3 次 102 字节 magic packet（6×0xFF + MAC×16）到 UDP 255.255.255.255:9；
 /// - 发送结果写审计 `device.wake`（resource_type=`machine`）。
+/// `POST /api/v1/admin/machines/{serial}/telemetry/report` —— 请求 agent 立即上报一次 fast 快照。
+///
+/// 权限 `device:manage`；通过 `device_downlink` 下发 `telemetry.report`，
+/// agent 收到后在遥测线程立刻采集并上报，前端靠 `machine_snapshots` SSE 收到更新。
+#[derive(Debug, Serialize)]
+pub struct TelemetryReportReply {
+    pub accepted: bool,
+    pub request_id: Uuid,
+    pub serial: String,
+}
+
+pub async fn request_telemetry_report(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    Path(serial): Path<String>,
+) -> AppResult<(StatusCode, Json<TelemetryReportReply>)> {
+    authorization::require_permission(&state, id, permissions::DEVICE_MANAGE).await?;
+
+    let serial = serial.trim();
+    if serial.is_empty() {
+        return Err(AppError::bad_request("serial 不能为空"));
+    }
+    let device = state
+        .machines
+        .summary(serial)
+        .await?
+        .ok_or_else(|| AppError::not_found("机器不存在"))?;
+
+    let request_id = Uuid::new_v4();
+    let payload = serde_json::json!({
+        "request_id": request_id,
+        "tier": "fast",
+    });
+    enqueue_device_downlink(&state, &device.device_slot, "telemetry.report", &payload).await?;
+
+    super::audit::record_or_log(
+        &state,
+        id,
+        "device.telemetry_report",
+        "machine",
+        Some(device.serial.clone()),
+        serde_json::json!({ "serial": device.serial, "tier": "fast" }),
+        None,
+    )
+    .await;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(TelemetryReportReply {
+            accepted: true,
+            request_id,
+            serial: device.serial,
+        }),
+    ))
+}
+
 pub async fn wake(
     State(state): State<AppState>,
     AuthUser { id }: AuthUser,

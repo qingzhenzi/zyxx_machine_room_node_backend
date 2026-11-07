@@ -288,6 +288,7 @@ const VM_POLL_INTERVAL_MS = 1000
 const VM_POLL_MAX_ATTEMPTS = 60
 
 const canVmControl = computed(() => auth.can(PERMISSIONS.vmControl))
+const canRequestTelemetry = computed(() => auth.can(PERMISSIONS.deviceManage))
 /** `list` 命令返回的列表覆盖遥测快照（刷新按钮/操作后的真实状态）。 */
 const vmOverride = ref<VmView[] | null>(null)
 const vmRows = computed<VmView[]>(() => vmOverride.value ?? parsed.value?.vms ?? [])
@@ -781,6 +782,23 @@ function refresh() {
   void load()
 }
 
+const telemetryBusy = ref(false)
+
+/** 请求 agent 立即上报一次 fast 快照（走 device_downlink，不依赖定时器）。 */
+async function requestTelemetryReport() {
+  if (!serial.value) return
+  telemetryBusy.value = true
+  try {
+    await api.requestTelemetryReport(serial.value)
+    toast.success('已请求立即上报', 'agent 收到后会马上采集，通常 1–2 秒内刷新')
+    window.setTimeout(() => void load(true), 1500)
+  } catch (caught) {
+    toast.error('请求立即上报失败', errorMessage(caught, '请确认机器在线后重试'))
+  } finally {
+    telemetryBusy.value = false
+  }
+}
+
 useInterval(() => {
   if (autoRefresh.value) void load(true)
 }, 30_000)
@@ -862,6 +880,15 @@ onMounted(() => void load())
             />
             自动刷新
           </label>
+          <AppButton
+            v-if="canRequestTelemetry"
+            icon="refresh"
+            :loading="telemetryBusy"
+            title="通过 device_downlink 请求 agent 立即上报一次快照"
+            @click="requestTelemetryReport"
+          >
+            立即上报
+          </AppButton>
           <IconButton
             icon="refresh"
             label="刷新机器详情"
