@@ -112,7 +112,13 @@ pub async fn enroll_challenge(
         return Err(Error::SlotConflict);
     }
 
-    let issued = challenge::issue(&st.db, &token_row.token_hash, &req.slot, token_row.device_id).await?;
+    let issued = challenge::issue(
+        &st.db,
+        &token_row.token_hash,
+        &req.slot,
+        token_row.device_id,
+    )
+    .await?;
 
     // approval 型：落一条 pending（或复用已有的），供 GET /enroll/{id} 轮询
     let mut enroll_id = None;
@@ -257,8 +263,13 @@ pub async fn enroll(
     // 先签发（纯计算，无副作用），再把「消费 challenge + 消费 token + 顶掉旧证书 +
     // 落库」放进**同一个事务**：任何一步失败都整体回滚，token 不会被烧掉，
     // 客户端可以拿同一张链接重试。之前消费事务与落库分离，落库失败 = 链接作废。
-    let device_id = chal.device_id.or(token_row.device_id).unwrap_or_else(Uuid::new_v4);
-    let issued = st.ca.sign_csr(&csr_der, &device_id.to_string(), CLIENT_CERT_DAYS)?;
+    let device_id = chal
+        .device_id
+        .or(token_row.device_id)
+        .unwrap_or_else(Uuid::new_v4);
+    let issued = st
+        .ca
+        .sign_csr(&csr_der, &device_id.to_string(), CLIENT_CERT_DAYS)?;
 
     let mut tx = st.db.begin().await?;
     if !challenge::consume(&mut *tx, req.challenge_id).await? {
@@ -1348,6 +1359,9 @@ pub fn mtls_router(st: AppState) -> Router {
         .route("/agent/config", get(crate::agent_config::get_config))
         // 设备换对象存储预签名 URL（大文件不走消息通道，契约 §16.2）
         .route("/resources/presign", post(crate::resource::presign))
+        // P2P 镜像分发：seed 登记 / peer 查询（ticket 即能力，仅内网 mTLS）
+        .route("/machine/p2p/seed", post(crate::p2p::seed))
+        .route("/machine/p2p/peers", get(crate::p2p::peers))
         .route("/revoke", post(revoke))
         .with_state(st)
 }

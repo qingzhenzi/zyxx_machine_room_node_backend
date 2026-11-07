@@ -211,7 +211,8 @@ async fn mtls_report_accepts_device_id_cn() {
     let app = routes::mtls_router(state);
 
     // CN 用 device_id，而不是 slot。
-    let (status, body) = post_report(&app, peer(&serial, &device_id.to_string()), report_body()).await;
+    let (status, body) =
+        post_report(&app, peer(&serial, &device_id.to_string()), report_body()).await;
     assert_eq!(status, 202, "{body}");
     assert_eq!(body["serial"], serial);
     assert_eq!(body["device_id"], device_id.to_string());
@@ -233,6 +234,10 @@ async fn mtls_report_accepts_device_id_cn() {
         "DELETE FROM device_session WHERE serial = $1",
         "DELETE FROM device_enrollment WHERE serial = $1",
     ] {
-        sqlx::query(sql).bind(&serial).execute(&db).await.expect("cleanup");
+        sqlx::query(sql)
+            .bind(&serial)
+            .execute(&db)
+            .await
+            .expect("cleanup");
     }
 }

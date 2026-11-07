@@ -8,7 +8,9 @@
 //!   `DELETE /admin/enrollments/{id}`、`POST /admin/enroll/{id}/decide`、`GET /crl`
 //! - 业务 listener（mTLS）：`POST /enroll/confirm`、`POST /messages`、
 //!   `GET /agent/config`（节点配置，契约 §17.3）、
-//!   `POST /resources/presign`（对象存储预签名，契约 §16.2）、`POST /revoke`
+//!   `POST /resources/presign`（对象存储预签名，契约 §16.2）、
+//!   `POST /machine/p2p/seed` / `GET /machine/p2p/peers`（P2P 镜像分发种子）、
+//!   `POST /revoke`
 
 pub mod agent_config;
 pub mod ca;
@@ -19,6 +21,7 @@ pub mod error;
 pub mod messaging;
 #[cfg(feature = "redis-notify")]
 pub mod notify_redis;
+pub mod p2p;
 pub mod pop;
 pub mod ratelimit;
 pub mod resource;
