@@ -7,6 +7,15 @@ ARG RUNTIME_IMAGE=debian:bookworm-slim
 FROM ${RUST_IMAGE} AS builder
 WORKDIR /app
 
+# 受限网络/内网镜像：可指定 crates.io 镜像源（例如 rsproxy），留空则用官方源。
+# 例：docker build --build-arg CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/ .
+ARG CARGO_REGISTRY_MIRROR=
+RUN if [ -n "$CARGO_REGISTRY_MIRROR" ]; then \
+        mkdir -p "$HOME/.cargo" && \
+        printf '[source.crates-io]\nreplace-with = "mirror"\n[source.mirror]\nregistry = "%s"\n' \
+            "$CARGO_REGISTRY_MIRROR" > "$HOME/.cargo/config.toml"; \
+    fi
+
 # 先用空 crate 编译依赖，利用 Docker 层缓存加速重复构建。
 # 所有 workspace 成员（7 个）都要放占位 manifest + 占位 src，否则 cargo 解析
 # workspace / 路径依赖时会直接失败（历史踩坑：漏了 storage、device-pki）。

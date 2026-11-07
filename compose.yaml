@@ -105,6 +105,8 @@ services:
       args:
         RUST_IMAGE: ${RUST_IMAGE:-rust:1.97-bookworm}
         RUNTIME_IMAGE: ${RUNTIME_IMAGE:-debian:bookworm-slim}
+        # 内网/受限网络可指定 crates.io 镜像（如 sparse+https://rsproxy.cn/index/）。
+        CARGO_REGISTRY_MIRROR: ${CARGO_REGISTRY_MIRROR:-}
     image: ${BACKEND_IMAGE:-qestudio/backend:local}
     environment: *api-environment
     depends_on:
