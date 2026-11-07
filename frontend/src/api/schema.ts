@@ -519,6 +519,57 @@ export interface EventRule {
   updated_at?: string
 }
 
+/** 总控阶段 2：一个控制节点的只读摘要计数。 */
+export interface FederationCounts {
+  areas: number
+  images: number
+  machines: number
+  online_machines: number
+  open_tickets: number
+  rooms: number
+}
+
+/** 联邦节点视图（后端不返回 token）。 */
+export interface FederationNodeView {
+  base_url: string
+  created_at: string
+  enabled: boolean
+  id: string
+  last_seen_at: string | null
+  last_status: string | null
+  name: string
+  status: 'online' | 'offline' | 'unknown'
+  summary: FederationCounts | null
+  updated_at: string
+}
+
+/** 聚合 KPI（本地 + 各 online 联邦节点）。 */
+export interface FederationTotals {
+  areas: number
+  images: number
+  machines: number
+  nodes_offline: number
+  nodes_online: number
+  nodes_total: number
+  online_machines: number
+  open_tickets: number
+  rooms: number
+}
+
+export interface FederationOverview {
+  generated_at: string
+  local: FederationCounts
+  node_name: string
+  nodes: FederationNodeView[]
+  totals: FederationTotals
+}
+
+export interface CreateFederationNodeRequest {
+  base_url: string
+  name: string
+  token: string
+}
+
 export interface ImageArtifact {
   compression: Compression
   created_at: string

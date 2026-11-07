@@ -69,6 +69,10 @@ pub struct Config {
     pub device_pki_internal_url: String,
     /// device-pki 内部中继 token；`None` = noVNC 代理不可用（503）。
     pub device_pki_internal_token: Option<String>,
+    // ---- 总控阶段 2：多控制节点联邦 ----
+    /// 联邦 token：允许其他控制节点用 `x-federation-token` 拉取本节点 summary。
+    /// `None` = 只接受 admin JWT。
+    pub federation_token: Option<String>,
     // ---- 设备在线状态通知（device.offline / device.online webhook）----
     /// 是否启用在 qe-api 侧扫描 `device_session` 并投递状态变化 webhook。
     pub device_presence_enabled: bool,
@@ -317,6 +321,7 @@ impl Config {
                 .trim_end_matches('/')
                 .to_owned(),
             device_pki_internal_token: env_optional("DEVICE_PKI_INTERNAL_TOKEN"),
+            federation_token: env_optional("FEDERATION_TOKEN"),
             public_enroll_endpoint: env_optional("PUBLIC_ENROLL_ENDPOINT")
                 .unwrap_or_else(|| "https://localhost:4440".to_owned())
                 .trim_end_matches('/')

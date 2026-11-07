@@ -1248,10 +1248,11 @@ impl StorageRepo {
 
     /// 该 sha256 分片仍被多少个镜像 manifest 引用（用于判断能否删除 S3 对象）。
     pub async fn chunk_reference_count(&self, sha256: &str) -> DbResult<i64> {
-        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM image_chunks WHERE sha256 = $1")
-            .bind(sha256)
-            .fetch_one(&self.db)
-            .await?;
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM image_chunks WHERE sha256 = $1")
+                .bind(sha256)
+                .fetch_one(&self.db)
+                .await?;
         Ok(count)
     }
 

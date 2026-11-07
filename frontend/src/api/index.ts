@@ -61,7 +61,10 @@ import type {
   MachinePage,
   MachineSnapshotPoint,
   MachineTokenRequest,
+  CreateFederationNodeRequest,
   EventRule,
+  FederationNodeView,
+  FederationOverview,
   ImageArtifact,
   ImageAssignment,
   ImageDetail,
@@ -615,6 +618,22 @@ export const api = {
       http.get(
         `/admin/machines/${encodeURIComponent(serial)}/vm/commands/${encodeURIComponent(requestId)}`,
       ),
+    ),
+
+  // ---- 总控联邦（阶段 2）----
+  federationOverview: () => unwrap<FederationOverview>(http.get('/admin/federation/overview')),
+
+  listFederationNodes: () => unwrap<FederationNodeView[]>(http.get('/admin/federation/nodes')),
+
+  createFederationNode: (input: CreateFederationNodeRequest) =>
+    unwrap<FederationNodeView>(http.post('/admin/federation/nodes', input)),
+
+  deleteFederationNode: (id: string) =>
+    unwrap<void>(http.delete(`/admin/federation/nodes/${encodeURIComponent(id)}`)),
+
+  refreshFederationNode: (id: string) =>
+    unwrap<FederationNodeView>(
+      http.post(`/admin/federation/nodes/${encodeURIComponent(id)}/refresh`),
     ),
 
   // ---- 设备在线事件 ----

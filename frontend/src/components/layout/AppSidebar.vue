@@ -19,6 +19,8 @@ interface NavItem {
   to: string
   permission?: string
   permissionAny?: string[]
+  /** 仅系统管理员可见（如总控联邦）。 */
+  adminOnly?: boolean
 }
 
 const navGroups: { label: string; items: NavItem[] }[] = [
@@ -32,6 +34,19 @@ const navGroups: { label: string; items: NavItem[] }[] = [
         icon: 'spark',
         to: '/teacher',
         permission: PERMISSIONS.roomRead,
+      },
+    ],
+  },
+  {
+    label: '总控',
+    items: [
+      {
+        name: 'federation',
+        label: '总控联邦',
+        icon: 'server',
+        to: '/federation',
+        permission: PERMISSIONS.deviceRead,
+        adminOnly: true,
       },
     ],
   },
@@ -213,6 +228,7 @@ const visibleGroups = computed(() =>
       ...group,
       items: group.items.filter(
         (item) =>
+          (!item.adminOnly || auth.roles.includes('admin')) &&
           (!item.permission || auth.can(item.permission)) &&
           (!item.permissionAny?.length || item.permissionAny.some((code) => auth.can(code))),
       ),

@@ -182,6 +182,9 @@ impl IntoResponse for AppError {
         }
         let message = if status == StatusCode::SERVICE_UNAVAILABLE {
             "服务暂时不可用，请稍后重试".to_owned()
+        } else if matches!(self, Self::BadGateway(_)) {
+            // 502 只用于「上游/联邦节点不可达」这类可安全外传的原因，便于前端提示。
+            self.to_string()
         } else if status.is_server_error() {
             "服务器内部错误".to_owned()
         } else {

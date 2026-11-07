@@ -343,7 +343,9 @@ mod tests {
             ""
         );
         assert_eq!(
-            parse_vnc_info(Some(&serde_json::json!({"port": 5901}))).unwrap().2,
+            parse_vnc_info(Some(&serde_json::json!({"port": 5901})))
+                .unwrap()
+                .2,
             ""
         );
     }

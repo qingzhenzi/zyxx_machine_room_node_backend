@@ -12,6 +12,7 @@ use crate::{
         announcements::AnnouncementRepo,
         audit::AuditLogRepo,
         device::DeviceRepo,
+        federation::FederationRepo,
         machine::MachineRepo,
         presence::{PresenceEventRecord, PresenceRepo},
         roles::RoleRepo,
@@ -85,6 +86,8 @@ pub struct AppState {
     pub instance_id: String,
     /// noVNC 阶段 2：一次性 VNC 会话/ticket（内存、单副本）。
     pub vnc_sessions: Arc<crate::vnc::VncSessionStore>,
+    /// 总控阶段 2：多控制节点联邦注册表。
+    pub federation: FederationRepo,
 }
 
 impl AppState {
@@ -113,6 +116,7 @@ impl AppState {
             schedule_plans: PlanRepo::new(db.pool().clone()),
             devices: DeviceRepo::new(db.pool().clone()),
             machines: MachineRepo::new(db.pool().clone()),
+            federation: FederationRepo::new(db.pool().clone()),
             tickets: TicketRepo::new(db.pool().clone()),
             ticket_rules: TicketRuleRepo::new(db.pool().clone()),
             ticket_scopes: TicketScopeRepo::new(db.pool().clone()),

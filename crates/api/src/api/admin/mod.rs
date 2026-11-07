@@ -4,6 +4,7 @@ pub mod areas;
 pub mod audit;
 pub mod device_events;
 pub mod devices;
+pub mod federation;
 pub mod images;
 pub mod machines;
 pub mod roles;
@@ -224,6 +225,18 @@ pub fn router() -> Router<AppState> {
         // noVNC 阶段 2：VNC 控制台会话 + 浏览器 WS 代理（vm:control）。
         .route("/machines/{serial}/vnc/session", post(vnc::create_session))
         .route("/machines/{serial}/vnc/ws", get(vnc::ws_proxy))
+        // ---- 总控阶段 2：多控制节点联邦（注册/刷新/只读聚合）----
+        .route("/federation/summary", get(federation::summary))
+        .route("/federation/overview", get(federation::overview))
+        .route(
+            "/federation/nodes",
+            get(federation::list).post(federation::create),
+        )
+        .route(
+            "/federation/nodes/{id}",
+            axum::routing::delete(federation::delete),
+        )
+        .route("/federation/nodes/{id}/refresh", post(federation::refresh))
         // ---- 节点配置（P2）----
         .route(
             "/agent-configs",

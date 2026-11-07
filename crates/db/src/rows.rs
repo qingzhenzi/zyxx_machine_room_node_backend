@@ -226,3 +226,18 @@ impl From<UserSessionRow> for UserSession {
         }
     }
 }
+
+/// `federation_nodes` 行（总控阶段 2）。
+#[derive(Debug, Clone, FromRow)]
+pub struct FederationNodeRow {
+    pub id: Uuid,
+    pub name: String,
+    pub base_url: String,
+    pub token: String,
+    pub enabled: bool,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub last_status: Option<String>,
+    pub cached_summary: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

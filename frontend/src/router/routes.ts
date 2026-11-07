@@ -103,6 +103,12 @@ export const routes: RouteRecordRaw[] = [
         meta: { title: '触发事件', permission: PERMISSIONS.scheduleEventRead },
       },
       {
+        path: 'federation',
+        name: 'federation',
+        component: () => import('@/views/FederationView.vue'),
+        meta: { title: '总控联邦', permission: PERMISSIONS.deviceRead, adminOnly: true },
+      },
+      {
         path: 'machines',
         name: 'machines',
         component: () => import('@/views/MachinesView.vue'),

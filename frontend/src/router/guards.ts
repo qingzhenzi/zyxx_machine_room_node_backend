@@ -45,6 +45,12 @@ export function installRouterGuards(router: Router) {
       return { name: 'forbidden', query: { from: to.fullPath } }
     }
 
+    // 仅系统管理员可见的页面（如总控联邦）；API 侧仍是 device:read。
+    const adminOnly = to.meta.adminOnly as boolean | undefined
+    if (adminOnly && !auth.roles.includes('admin')) {
+      return { name: 'forbidden', query: { from: to.fullPath } }
+    }
+
     return true
   })
 
