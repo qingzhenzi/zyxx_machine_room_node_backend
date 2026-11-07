@@ -32,6 +32,9 @@ x-api-environment: &api-environment
   SMTP_FROM: ${SMTP_FROM:-QEStudio <no-reply@qestudio.local>}
   CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173}
   RUN_MIGRATIONS: "true"
+  # 工单附件代理上传需要 20MiB + 余量；必须与 nginx client_max_body_size（25m）对齐。
+  # 注意：api 默认值只有 2MiB（config.rs），不在这里显式传就会让 >2MiB 附件 413。
+  MAX_BODY_BYTES: ${MAX_BODY_BYTES:-26214400}
   BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
   BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-Admin@12345}
   BOOTSTRAP_ADMIN_DISPLAY_NAME: ${BOOTSTRAP_ADMIN_DISPLAY_NAME:-Administrator}
@@ -124,6 +127,60 @@ services:
           memory: 512M
     restart: unless-stopped
     init: true
+    logging: *default-logging
+    networks:
+      - backend
+
+  # 可选：设备注册 / mTLS 通讯服务（qe-device-pki）。默认不启动，profile=pki 手动开启。
+  # 1) 生成开发证书：bash scripts/dev-pki-certs.sh（写到 deploy/device-pki/certs/，勿提交）
+  # 2) 启动：docker compose --profile pki up -d --build device-pki
+  # 复用 api 构建镜像（单镜像内含 qe-api + qe-device-pki 两个二进制，entrypoint 覆盖）。
+  # 设备注册与 mTLS 遥测依赖它；不启用时其余功能不受影响。
+  device-pki:
+    image: ${BACKEND_IMAGE:-qestudio/backend:local}
+    entrypoint: ["/usr/local/bin/qe-device-pki"]
+    profiles: ["pki"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-qestudio}:${POSTGRES_PASSWORD:-qestudio}@postgres:5432/${POSTGRES_DB:-qestudio}
+      ENROLL_ADDR: 0.0.0.0:4440
+      MTLS_ADDR: 0.0.0.0:4441
+      ENROLL_TLS_CERT: /certs/enroll.pem
+      ENROLL_TLS_KEY: /certs/enroll-key.pem
+      MTLS_TLS_CERT: /certs/mtls.pem
+      MTLS_TLS_KEY: /certs/mtls-key.pem
+      CA_KEY: /certs/ca-key.pem
+      CA_CERT: /certs/ca.pem
+      # 管理端静态 Bearer token（/admin/*）：生产必须换强随机值；profile 未启用时不会被使用。
+      ADMIN_TOKEN: ${DEVICE_PKI_ADMIN_TOKEN:-dev-admin-token-change-me}
+      ADMIN_RATE_LIMIT: ${DEVICE_PKI_ADMIN_RATE_LIMIT:-30}
+      PUBLIC_ENROLL_ENDPOINT: ${PUBLIC_ENROLL_ENDPOINT:-https://localhost:4440}
+      PUBLIC_MTLS_ENDPOINT: ${PUBLIC_MTLS_ENDPOINT:-https://localhost:4441}
+      # 资源/镜像预签名与 qe-api 必须用同一套 S3 + 签名密钥，否则 manifest 验签失败。
+      S3_ENDPOINT: ${S3_ENDPOINT_DOCKER:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+      S3_PATH_STYLE: ${S3_PATH_STYLE:-true}
+      STORAGE_SIGNING_KEY_BASE64: ${STORAGE_SIGNING_KEY_BASE64:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # 开发自签证书（gen_test_ca 生成），只读挂载。
+      - ./deploy/device-pki/certs:/certs:ro
+    ports:
+      - "127.0.0.1:${DEVICE_PKI_ENROLL_PORT:-4440}:4440"
+      - "127.0.0.1:${DEVICE_PKI_MTLS_PORT:-4441}:4441"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # 注册 listener 是单向 TLS，-k 跳过开发自签证书校验。
+      test: ["CMD", "curl", "-kfsS", "https://127.0.0.1:4440/crl"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
     logging: *default-logging
     networks:
       - backend

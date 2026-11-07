@@ -3,8 +3,9 @@
 > 目标：房间内的「子机器端」周期性采集主机清单 + 健康结论 + 诊断结果，上报到服务端，
 > 管理控制台在「机器总览」里看到每台机器的实时状态与历史快照。
 >
-> 本文是 **v1.1 契约**；`room-agent` 实现、`qe-device-pki` 的 mTLS handler 与
-> `qe-api` 的管理端接口都以本文为准。相对 v1 的变化见 §0。
+> 本文是 **v1.2 契约**；`room-agent` 实现、`qe-device-pki` 的 mTLS handler 与
+> `qe-api` 的管理端接口都以本文为准。相对 v1/v1.1 的变化见 §0（v1.2 为 device_id 身份勘误，
+> 身份模型以 `docs/device-pki-protocol.md` v0.2 为准）。
 
 ## 0. v1.1 相对 v1 的变化
 
@@ -15,6 +16,23 @@
 | payload `tier` | 无 | `"fast"` / `"full"`（`machine_snapshots.tier`，0016） |
 | 频率配置 | 只能改本地 env | 服务端 `agent_configs` 下发：**global → area → room → device** 合并（0017） |
 | 契约版本 | `schema: 1` | 仍为 `schema: 1`（新增字段向后兼容；旧 agent 不带 `tier` 按 full 处理） |
+
+### 0.1 v1.2（2026-11-07）：device_id 身份勘误（不破坏 v1.1）
+
+v1.1 文中"证书 CN 就是 device_slot"的表述已过时；HEAD 起设备身份改为 **`device_id`（UUID）**，
+详细协议见 `docs/device-pki-protocol.md` v0.2。本节为对 v1.1 的勘误，`schema` 版本号仍为 `1`：
+
+- **证书身份**：新签发证书的 Subject CN = `device_id`（UUID）；`device_slot` 降级为房间内
+  绑定名/展示名，由服务端按证书 serial 反查 `device_enrollment.device_slot` 得到。
+  历史证书（CN=slot）仍走 serial/slot 兼容回退，并回填 `device_id`（迁移 0027/0028）。
+- **请求体 `device_slot`**：mTLS 入口可省略；若携带，必须等于服务端解析出的**展示 slot**
+  （不是证书 CN），否则 400。只有 Bearer 兼容入口仍强制要求 `device_slot`。
+- **服务端注入/返回 `device_id`**：mTLS 入口落库前向快照 payload 注入 `device_id`，
+  202 响应在既有字段外增加 `device_id`：
+  `{snapshot_id, serial, device_id, device_slot, received_at}`。客户端忽略未知字段即可，向后兼容。
+- **`/agent/config` 的 device 层匹配**：用解析出的 `device_slot` 匹配 `agent_configs.scope_key`，
+  不是证书 CN。
+- v1.1 的 `tier`（fast/full）、两档间隔与服务端下发语义完全不变，无需迁移动作。
 
 ## 1. 角色与链路
 
@@ -31,9 +49,9 @@ room-agent（每个房间机器）
                        管理控制台 /machines ◄── /api/v1/admin/machines ─────┘
 ```
 
-- **默认（mTLS）**：身份来自设备证书（`device-pki` 从证书 CN/serial 解析
-  `device_slot`/`serial`），请求体不需要 `Authorization`；`device_slot` 可省略，
-  若带上则必须与证书 CN 一致。
+- **默认（mTLS）**：身份来自设备证书（证书 CN = `device_id` UUID，`device_slot` 由服务端按
+  serial 反查 `device_enrollment` 得到；旧证书 CN=slot 走兼容回退），请求体不需要 `Authorization`；
+  `device_slot` 可省略，若带上则必须与服务端解析出的展示 `device_slot` 一致（见 §0.1）。
 - **兼容（Bearer）**：`REPORT_MODE=bearer` 时继续 `POST /api/v1/machine/report` +
   `Authorization: Bearer <MACHINE_AGENT_TOKEN>`；服务端按 `device_slot` 找
   `device_enrollment`（`status` 为 `issued`/`active`）。
@@ -51,13 +69,14 @@ room-agent（每个房间机器）
 {
   "snapshot_id": 123,
   "serial": "4f40ccef...",
+  "device_id": "0f0f7f0e-...-uuid",
   "device_slot": "room-101",
   "received_at": "2026-10-31T14:53:02Z"
 }
 ```
 
 - 幂等：同一 `(serial, collected_at)` 重复上报只保留一条。
-- 错误：`400` 校验失败 / 槽位与证书不一致；`401` 证书无存活注册记录；`500` 内部错误。
+- 错误：`400` 校验失败 / `device_slot` 与证书解析出的展示槽位不一致；`401` 证书无存活注册记录；`500` 内部错误。
 - 每台机器保留最近 `MACHINE_SNAPSHOT_KEEP` 条（默认 100，10..=1000）。
 
 ### 2.2 兼容：qe-api Bearer `POST /api/v1/machine/report`
@@ -118,7 +137,8 @@ room-agent（每个房间机器）
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `schema` | 是 | 固定 `1`（未知版本 400） |
-| `device_slot` | mTLS 可省 / Bearer 必填 | 1–128 字符；mTLS 下若出现必须等于证书 CN |
+| `device_slot` | mTLS 可省 / Bearer 必填 | 1–128 字符；mTLS 下若出现必须等于服务端解析出的展示 slot（不是证书 CN） |
+| `device_id` | 否（服务端注入） | UUID；mTLS 入口落库前由服务端注入 payload，请求体无需携带（见 §0.1） |
 | `agent_version` | 是 | 1–64 字符 |
 | `collected_at` | 否 | RFC3339；缺省 `now()`，未来 >5 分钟视为非法 |
 | `hostname` | 是 | 1–255 字符 |
@@ -165,7 +185,7 @@ room-agent（每个房间机器）
 
 - 身份只来自客户端证书（不接受请求体/查询参数覆盖）：
   `serial → device_enrollment(issued/active) → device_slot → (rooms | room_devices) → room+area`；
-- 合并 `global → area → room → device`（device 行用证书 CN 匹配 `scope_key`）；
+- 合并 `global → area → room → device`（device 行用解析出的 `device_slot` 匹配 `scope_key`，不是证书 CN）；
 - `revision` 取实际应用行的最大值（无行 0）；未绑定房间时只应用 global（+device）；
 - 响应：
 

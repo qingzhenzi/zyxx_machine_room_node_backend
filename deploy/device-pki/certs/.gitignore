@@ -1,0 +1,3 @@
+# 开发证书产物（scripts/dev-pki-certs.sh 生成），不入库
+*
+!.gitignore

@@ -1,4 +1,4 @@
-.PHONY: help init fmt fmt-check clippy test check build run dev-up dev-down mail-up integration up down logs ps migrate secret obs-up obs-down obs-logs web-dev web-build web-check web-docker room-agent-build agent-build agent-e2e
+.PHONY: help init fmt fmt-check clippy test check build run dev-up dev-down mail-up integration up down logs ps migrate secret obs-up obs-down obs-logs web-dev web-build web-check web-docker room-agent-build agent-build agent-e2e pki-certs pki-dev
 
 init: ## 从模板初始化（make init SLUG=acme NAME="Acme"）
 	@test -n "$(SLUG)" || (echo "用法: make init SLUG=acme NAME='Acme' [REPO=https://github.com/acme/backend]"; exit 1)
@@ -21,8 +21,8 @@ test: ## 运行单元测试
 
 check: fmt-check clippy test ## 本地完整检查
 
-build: ## 构建 release 二进制
-	cargo build --release --locked -p qe-api
+build: ## 构建 release 二进制（qe-api + qe-device-pki，与 Dockerfile 一致）
+	cargo build --release --locked -p qe-api -p qe-device-pki
 
 run: ## 本地启动（需要 .env 中的 PG/Redis）
 	cargo run -p qe-api
@@ -74,17 +74,25 @@ web-build: ## 构建管理控制台静态资源到 frontend/dist
 	cd frontend && ./node_modules/.bin/vite build
 
 web-check: ## 管理控制台类型检查 + 单元测试
-	cd frontend && ./node_modules/.bin/vue-tsc --noEmit -p tsconfig.app.json
+	cd frontend && ./node_modules/.bin/vue-tsc --build
 	cd frontend && ./node_modules/.bin/vitest run
 
-room-agent-build: ## 构建 room-agent（房间机器遥测 agent）
-	cargo build -p qe-room-agent
+room-agent-build: ## 构建统一 agent 客户端（room_agent workspace：qe-agent）
+	cargo build --manifest-path ../room_agent/Cargo.toml -p qe-agent
 
-agent-build: ## 构建统一 agent 客户端（qe-agent：enroll / node / machine）
-	cargo build -p qe-agent
+agent-build: ## 构建统一 agent 客户端（qe-agent：serve / cli enroll + node/machine 角色）
+	cargo build --manifest-path ../room_agent/Cargo.toml -p qe-agent
 
 agent-e2e: ## 统一 agent 端到端回归（device-pki + enroll + mTLS + IPC；需要本地 PG）
 	bash scripts/test-agent-e2e.sh
+
+pki-certs: ## 生成 device-pki 开发自签证书（deploy/device-pki/certs/，勿用于生产）
+	bash scripts/dev-pki-certs.sh
+
+pki-dev: pki-certs ## 启动 device-pki 开发服务（profile=pki；4440 注册 / 4441 mTLS，需先 make up）
+	docker compose --profile pki up -d --build device-pki
+	@echo "device-pki: 注册 https://localhost:4440  mTLS https://localhost:4441"
+	@echo "管理端 token: 见 .env 的 DEVICE_PKI_ADMIN_TOKEN"
 
 web-docker: ## 构建并启动控制台容器（http://localhost:8081，需先 make up）
 	docker compose --profile console up -d --build console

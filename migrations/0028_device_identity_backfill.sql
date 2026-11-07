@@ -7,6 +7,10 @@ WHERE device_id IS NULL;
 
 -- token 必须复用同 slot 已有 enrollment 的 device_id，否则客户端用旧 token 注册时
 -- 会签出与该 slot enrollment 不一致的 device_id（证书 CN 与 DB identity 分叉）。
+--
+-- 注意：同一 slot 可能累积多枚历史 token（重复签发/过期重发，实测 p3-room 有 13 枚）。
+-- device_bootstrap_token_device_id_uniq 只允许一个 token 复用该 device_id，
+-- 因此每个 slot 只挑一枚“当前有效”的 token 对齐 enrollment：优先未使用、过期时间最晚。
 UPDATE device_bootstrap_token t
 SET device_id = e.device_id
 FROM (
@@ -18,9 +22,18 @@ FROM (
              activated_at DESC NULLS LAST,
              issued_at DESC NULLS LAST
 ) e
-WHERE t.device_id IS NULL AND t.device_slot = e.device_slot;
+WHERE t.device_id IS NULL
+  AND t.device_slot = e.device_slot
+  AND t.token_hash = (
+      SELECT t2.token_hash
+      FROM device_bootstrap_token t2
+      WHERE t2.device_slot = e.device_slot AND t2.device_id IS NULL
+      ORDER BY (t2.used_at IS NULL) DESC, t2.expires_at DESC
+      LIMIT 1
+  );
 
--- 没有任何 enrollment 的 token（典型是刚签发、还没用到）才分配新 id。
+-- 其余历史 token（未对齐 enrollment 的、已用过的、以及从未注册过的）各自分配独立 id，
+-- 避免多枚 token 共用同一 device_id 触发唯一索引冲突；这些 token 再次注册时会走新身份。
 UPDATE device_bootstrap_token
 SET device_id = gen_random_uuid()
 WHERE device_id IS NULL;

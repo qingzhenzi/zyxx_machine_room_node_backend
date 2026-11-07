@@ -12,3 +12,8 @@ compose.yaml
 compose.prod.yaml
 README.md
 Makefile
+# 前端依赖/构建产物很大（node_modules ~505MB），api 镜像只编译 Rust，不需要它们。
+# 控制台镜像使用 ./frontend 独立构建上下文（frontend/Dockerfile），与此无关。
+frontend/node_modules
+frontend/dist
+frontend/test-results

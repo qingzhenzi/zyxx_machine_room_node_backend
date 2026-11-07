@@ -4,6 +4,7 @@
 #
 # 必须显式提供（compose 会在缺失时直接报错）：
 #   JWT_SECRET、BOOTSTRAP_ADMIN_PASSWORD、POSTGRES_PASSWORD、BACKEND_IMAGE
+# 启用 device-pki profile（--profile pki）时还需要：DEVICE_PKI_ADMIN_TOKEN（强随机值）
 services:
   api:
     build: !reset null
@@ -18,4 +19,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?生产环境必须显式设置 POSTGRES_PASSWORD}
 
   redis:
+    ports: !reset []
+
+  # device-pki：生产不直接把 4440/4441 暴露到宿主机（如确需对外，置前反代/Ingress 做 TLS 终结）。
+  # 仍保留 profile=pki 手动启用；启用前必须先 export DEVICE_PKI_ADMIN_TOKEN 强随机值
+  # （未设置时 base 会回退 dev 默认 token，仅供本地；生产禁用）。
+  device-pki:
+    build: !reset null
     ports: !reset []
