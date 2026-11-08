@@ -220,6 +220,7 @@ async fn main() -> Result<()> {
             qe_device_pki::vnc::VNC_PAIR_TIMEOUT,
         )),
         vnc_internal_token: internal_token.as_deref().map(Arc::from),
+        metrics: Arc::new(qe_device_pki::metrics::MetricsHub::new()),
     };
 
     let enroll_cfg = tls::server_config_enroll(&enroll_cert, &enroll_key)?;

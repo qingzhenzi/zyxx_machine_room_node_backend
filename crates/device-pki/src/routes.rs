@@ -55,6 +55,8 @@ pub struct AppState {
     pub vnc: Arc<crate::vnc::VncHub<axum::extract::ws::WebSocket>>,
     /// 内部 VNC 明文监听 token；`None` = 未启用内部监听。
     pub vnc_internal_token: Option<Arc<str>>,
+    /// 毫秒级实时指标内存广播（不写 DB）。
+    pub metrics: Arc<crate::metrics::MetricsHub>,
 }
 
 // ---------------- /enroll/challenge ----------------
@@ -1363,7 +1365,7 @@ pub fn enroll_router(st: AppState) -> Router {
 
 /// 内部明文 listener 路由（noVNC 阶段 2）：qe-api 中继用，token 校验。
 pub fn internal_router(st: AppState) -> Router {
-    crate::vnc::internal_router(st)
+    crate::vnc::internal_router(st.clone()).merge(crate::metrics::internal_router(st))
 }
 
 /// mTLS 端点路由。
@@ -1374,6 +1376,8 @@ pub fn mtls_router(st: AppState) -> Router {
         .route("/messages", post(receive_message))
         // 机器遥测：与 qe-api 的 Bearer 入口共用校验；身份来自设备证书。
         .route("/machine/report", post(machine_report))
+        // 毫秒级实时指标（内存广播，不写 DB）
+        .route("/metrics", post(crate::metrics::ingest))
         .route("/messages/downlink", get(downlink_pull))
         .route("/messages/downlink/ack", post(downlink_ack))
         // 节点配置：启动时按证书身份拉取 global → area → room 合并后的策略（§17.3）
@@ -1442,6 +1446,7 @@ mod tests {
             storage: None,
             vnc: Arc::new(crate::vnc::VncHub::new(crate::vnc::VNC_PAIR_TIMEOUT)),
             vnc_internal_token: None,
+            metrics: Arc::new(crate::metrics::MetricsHub::new()),
         };
         let mut h = HeaderMap::new();
         h.insert(

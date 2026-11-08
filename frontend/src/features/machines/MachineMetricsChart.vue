@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 
-import type { MachineSnapshotPoint } from '@/api/schema'
+import type { LiveMetricSample, MachineSnapshotPoint } from '@/api/schema'
 
 const props = defineProps<{
   points: MachineSnapshotPoint[]
+  /** 毫秒级实时样本（device-pki 中转，不写 DB）；存在时与历史合并绘制。 */
+  liveSamples?: LiveMetricSample[]
   live?: boolean
 }>()
 
@@ -14,17 +16,22 @@ const series = [
   { key: 'disk' as const, label: '磁盘', color: '#8a7bd8', fill: 'url(#disk-fill)' },
 ]
 
-const rows = computed(() =>
-  [...props.points]
-    .sort((a, b) => Date.parse(a.collected_at) - Date.parse(b.collected_at))
-    .slice(-60)
-    .map((point) => ({
-      at: point.collected_at,
-      cpu: point.cpu_usage_percent ?? null,
-      memory: point.memory_usage_percent ?? null,
-      disk: point.disk_usage_percent ?? null,
-    })),
-)
+const rows = computed(() => {
+  const history = props.points.map((point) => ({
+    at: point.collected_at,
+    cpu: point.cpu_usage_percent ?? null,
+    memory: point.memory_usage_percent ?? null,
+    disk: point.disk_usage_percent ?? null,
+  }))
+  const live = (props.liveSamples ?? []).map((point) => ({
+    at: point.collected_at,
+    cpu: point.cpu_usage_percent ?? null,
+    memory: point.memory_usage_percent ?? null,
+    disk: point.disk_usage_percent ?? null,
+  }))
+  const merged = [...history, ...live].sort((a, b) => Date.parse(a.at) - Date.parse(b.at))
+  return merged.slice(-120)
+})
 
 const W = 760
 const H = 220
@@ -85,7 +92,7 @@ function valueLabel(value: number | null | undefined): string {
         </span>
         <div>
           <h2 class="text-[13px] font-semibold text-ink">实时资源趋势</h2>
-          <p class="text-[10px] text-muted">每次快照到达即更新 · {{ spanLabel }}</p>
+          <p class="text-[10px] text-muted">毫秒级中转 + 快照合并 · {{ spanLabel }}</p>
         </div>
       </div>
       <div class="flex items-center gap-3">

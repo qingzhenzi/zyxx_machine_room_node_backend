@@ -860,6 +860,18 @@ export interface MachineSnapshot extends MachineSnapshotPoint {
   payload: Record<string, unknown>
 }
 
+export interface LiveMetricSample {
+  collected_at: string
+  cpu_usage_percent?: number | null
+  device_slot: string
+  disk_usage_percent?: number | null
+  load1?: number | null
+  memory_usage_percent?: number | null
+  schema?: string
+  serial: string
+  uptime_secs?: number | null
+}
+
 export interface MachineSnapshotPoint {
   agent_version: string
   collected_at: string

@@ -59,6 +59,7 @@ import type {
   EffectiveAgentPolicyReply,
   MachineDetail,
   MachinePage,
+  LiveMetricSample,
   MachineSnapshotPoint,
   MachineTokenRequest,
   CreateFederationNodeRequest,
@@ -1091,6 +1092,64 @@ function parseMachineSseChunk(chunk: string, options: MachineSnapshotStreamOptio
     options.onSnapshot(JSON.parse(dataLines.join('\n')) as MachineSnapshotPoint)
   } catch {
     // 忽略无法解析的帧
+  }
+}
+
+/** 毫秒级实时指标 SSE 流（经 device-pki 中转，不写 DB）。 */
+export interface LiveMetricsStreamOptions {
+  serial: string
+  signal: AbortSignal
+  onOpen?: () => void
+  onMetric: (sample: LiveMetricSample) => void
+  onHeartbeat?: () => void
+}
+
+export async function streamLiveMetrics(options: LiveMetricsStreamOptions): Promise<void> {
+  const token = getAccessToken()
+  const response = await fetch(
+    `${baseURL}/admin/machines/${encodeURIComponent(options.serial)}/metrics/stream`,
+    {
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        Accept: 'text/event-stream',
+      },
+      signal: options.signal,
+    },
+  )
+  if (!response.ok || !response.body) {
+    throw new ApiError('实时指标流连接失败', response.status)
+  }
+  options.onOpen?.()
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let boundary = buffer.indexOf('\n\n')
+    while (boundary >= 0) {
+      const chunk = buffer.slice(0, boundary)
+      buffer = buffer.slice(boundary + 2)
+      boundary = buffer.indexOf('\n\n')
+      let eventName = 'message'
+      const dataLines: string[] = []
+      for (const line of chunk.split('\n')) {
+        if (line.startsWith('event:')) eventName = line.slice(6).trim()
+        else if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+      }
+      if (!dataLines.length) continue
+      if (eventName === 'heartbeat') {
+        options.onHeartbeat?.()
+        continue
+      }
+      if (eventName !== 'metric') continue
+      try {
+        options.onMetric(JSON.parse(dataLines.join('\n')) as LiveMetricSample)
+      } catch {
+        // ignore malformed frames
+      }
+    }
   }
 }
 

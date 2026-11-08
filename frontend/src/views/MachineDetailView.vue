@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 
-import { api, isNotFound } from '@/api'
-import type { ImageArtifact, MachineDetail, VmCommandOp, VmCommandReply } from '@/api/schema'
+import { api, isNotFound, streamLiveMetrics } from '@/api'
+import type { ImageArtifact, LiveMetricSample, MachineDetail, VmCommandOp, VmCommandReply } from '@/api/schema'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
@@ -88,7 +88,8 @@ const notFound = ref(false)
 const autoRefresh = ref(false)
 /** 实时模式：每 2s 请求 agent 立即上报一次 fast 快照（Pterodactyl 风格）。 */
 const liveMode = ref(true)
-const liveBusy = ref(false)
+const liveSamples = ref<LiveMetricSample[]>([])
+const relayStatus = ref<'connecting' | 'live' | 'offline'>('connecting')
 const poweroffOpen = ref(false)
 const poweroffBusy = ref(false)
 const wakeOpen = ref(false)
@@ -122,8 +123,15 @@ const wakeDetail = computed(() =>
 /** 机器是否「Agent 在线」：只看 room-agent 快照新鲜度，与 device-pki 的 mTLS 会话状态相互独立。 */
 const agentOnline = computed(() => report.value !== null && detail.value?.report_stale !== true)
 
+const liveLatest = computed(() => liveSamples.value[liveSamples.value.length - 1] ?? null)
+
+function percentLabel(value: number | null | undefined): string {
+  return value == null ? '—' : `${value.toFixed(1)}%`
+}
+
 const statCards = computed<MetricCardProps[]>(() => {
   const currentReport = report.value
+  const live = liveLatest.value
   return [
     {
       label: '健康分',
@@ -139,37 +147,26 @@ const statCards = computed<MetricCardProps[]>(() => {
     },
     {
       label: 'CPU 使用率',
-      value:
-        currentReport?.cpu_usage_percent === null || currentReport?.cpu_usage_percent === undefined
-          ? '—'
-          : `${currentReport.cpu_usage_percent.toFixed(1)}%`,
-      note: '最新快照',
+      value: percentLabel(live?.cpu_usage_percent ?? currentReport?.cpu_usage_percent),
+      note: live?.cpu_usage_percent != null ? '实时中转' : '最新快照',
       tone: 'accent',
       icon: 'cpu',
       loading: loading.value,
     },
     {
       label: '内存使用率',
-      value:
-        currentReport?.memory_usage_percent === null ||
-        currentReport?.memory_usage_percent === undefined
-          ? '—'
-          : `${currentReport.memory_usage_percent.toFixed(1)}%`,
-      note: '最新快照',
+      value: percentLabel(live?.memory_usage_percent ?? currentReport?.memory_usage_percent),
+      note: live?.memory_usage_percent != null ? '实时中转' : '最新快照',
       tone: 'sky',
       icon: 'database',
       loading: loading.value,
     },
     {
       label: '磁盘使用率',
-      value:
-        currentReport?.disk_usage_percent === null ||
-        currentReport?.disk_usage_percent === undefined
-          ? '—'
-          : `${currentReport.disk_usage_percent.toFixed(1)}%`,
-      note: '根分区 / 最满挂载点',
-      badge: (currentReport?.disk_usage_percent ?? 0) >= 90 ? '快满' : undefined,
-      tone: (currentReport?.disk_usage_percent ?? 0) >= 90 ? 'rose' : 'violet',
+      value: percentLabel(live?.disk_usage_percent ?? currentReport?.disk_usage_percent),
+      note: live?.disk_usage_percent != null ? '实时中转' : '根分区 / 最满挂载点',
+      badge: (live?.disk_usage_percent ?? currentReport?.disk_usage_percent ?? 0) >= 90 ? '快满' : undefined,
+      tone: (live?.disk_usage_percent ?? currentReport?.disk_usage_percent ?? 0) >= 90 ? 'rose' : 'violet',
       icon: 'database',
       loading: loading.value,
     },
@@ -295,6 +292,7 @@ const VM_POLL_MAX_ATTEMPTS = 60
 
 const canVmControl = computed(() => auth.can(PERMISSIONS.vmControl))
 const canRequestTelemetry = computed(() => auth.can(PERMISSIONS.deviceManage))
+const canViewLive = computed(() => auth.can(PERMISSIONS.deviceRead))
 const chartPoints = computed(() => detail.value?.history ?? [])
 /** `list` 命令返回的列表覆盖遥测快照（刷新按钮/操作后的真实状态）。 */
 const vmOverride = ref<VmView[] | null>(null)
@@ -791,19 +789,66 @@ function refresh() {
 
 const telemetryBusy = ref(false)
 
-// 实时模式：页面可见时每 2s 请求一次立即上报；快照经 SSE 回来后由 onSnapshot 刷新详情。
-useInterval(async () => {
-  if (!liveMode.value || !canRequestTelemetry.value) return
-  if (document.visibilityState === 'hidden' || liveBusy.value) return
-  liveBusy.value = true
+// 毫秒级实时指标：经 device-pki 内部中转，SSE 持续推流；不请求/不写 DB。
+let liveAbort: AbortController | null = null
+let liveRetry: ReturnType<typeof setTimeout> | null = null
+let liveDisposed = false
+
+function scheduleLiveReconnect() {
+  if (liveDisposed) return
+  relayStatus.value = 'offline'
+  if (liveRetry) clearTimeout(liveRetry)
+  liveRetry = setTimeout(() => {
+    liveRetry = null
+    void connectLiveMetrics()
+  }, 2_000)
+}
+
+async function connectLiveMetrics() {
+  if (liveDisposed || !liveMode.value || !canViewLive.value) return
+  liveAbort?.abort()
+  const local = new AbortController()
+  liveAbort = local
+  relayStatus.value = 'connecting'
   try {
-    await api.requestTelemetryReport(serial.value)
+    await streamLiveMetrics({
+      serial: serial.value,
+      signal: local.signal,
+      onOpen: () => {
+        relayStatus.value = 'live'
+      },
+      onMetric: (sample) => {
+        relayStatus.value = 'live'
+        const next = [...liveSamples.value, sample]
+        liveSamples.value = next.slice(-240)
+      },
+      onHeartbeat: () => {
+        relayStatus.value = 'live'
+      },
+    })
+    if (!liveDisposed && !local.signal.aborted) scheduleLiveReconnect()
   } catch {
-    // 机器离线/权限变化时静默失败，保留手动刷新和自动刷新。
-  } finally {
-    liveBusy.value = false
+    if (!liveDisposed && !local.signal.aborted) scheduleLiveReconnect()
   }
-}, 2_000)
+}
+
+function stopLiveMetrics() {
+  if (liveRetry) clearTimeout(liveRetry)
+  liveRetry = null
+  liveAbort?.abort()
+  liveAbort = null
+  relayStatus.value = 'offline'
+}
+
+watch(liveMode, (enabled) => {
+  if (enabled) void connectLiveMetrics()
+  else stopLiveMetrics()
+})
+
+onUnmounted(() => {
+  liveDisposed = true
+  stopLiveMetrics()
+})
 
 /** 请求 agent 立即上报一次 fast 快照（走 device_downlink，不依赖定时器）。 */
 async function poweroffMachine() {
@@ -846,7 +891,10 @@ watch(
   },
 )
 
-onMounted(() => void load())
+onMounted(() => {
+  void load()
+  void connectLiveMetrics()
+})
 </script>
 
 <template>
@@ -916,16 +964,25 @@ onMounted(() => void load())
             自动刷新
           </label>
           <label
-            v-if="canRequestTelemetry"
+            v-if="canViewLive"
             class="flex items-center gap-2 text-[11.5px] text-muted"
-            title="页面可见时每 2 秒请求 agent 立即上报一次快照"
+            title="通过 device-pki 中转持续接收毫秒级指标（不写数据库）"
           >
             <input
               v-model="liveMode"
               type="checkbox"
               class="h-3.5 w-3.5 rounded border-line text-accent focus:ring-accent/25"
             />
-            实时 2s
+            <span
+              class="inline-flex items-center gap-1"
+              :class="relayStatus === 'live' ? 'text-emerald-600' : relayStatus === 'offline' ? 'text-rose-600' : 'text-amber-600'"
+            >
+              <span
+                class="h-1.5 w-1.5 rounded-full"
+                :class="relayStatus === 'live' ? 'bg-emerald-500 animate-pulse' : relayStatus === 'offline' ? 'bg-rose-500' : 'bg-amber-500'"
+              />
+              实时指标
+            </span>
           </label>
           <AppButton
             v-if="canRequestTelemetry"
@@ -993,7 +1050,8 @@ onMounted(() => void load())
         v-if="report"
         class="mt-4"
         :points="chartPoints"
-        :live="liveMode && canRequestTelemetry && !detail?.report_stale"
+        :live-samples="liveSamples"
+        :live="liveMode && relayStatus === 'live'"
       />
 
       <div class="mt-4 grid grid-cols-12 items-start gap-4">

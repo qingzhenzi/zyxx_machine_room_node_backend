@@ -25,6 +25,7 @@ pub mod command;
 pub mod error;
 pub mod images;
 pub mod messaging;
+pub mod metrics;
 #[cfg(feature = "redis-notify")]
 pub mod notify_redis;
 pub mod p2p;

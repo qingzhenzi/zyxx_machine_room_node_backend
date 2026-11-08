@@ -6,6 +6,7 @@ pub mod device_events;
 pub mod devices;
 pub mod federation;
 pub mod images;
+pub mod live_metrics;
 pub mod machines;
 pub mod roles;
 pub mod rooms;
@@ -206,6 +207,10 @@ pub fn router() -> Router<AppState> {
         .route("/machines/stream", get(machines::stream))
         .route("/machines/{serial}", get(machines::get))
         .route("/machines/{serial}/snapshots", get(machines::snapshots))
+        .route(
+            "/machines/{serial}/metrics/stream",
+            get(live_metrics::stream),
+        )
         .route(
             "/machines/{serial}/telemetry/report",
             post(machines::request_telemetry_report),
