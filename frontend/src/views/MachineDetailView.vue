@@ -89,6 +89,8 @@ const autoRefresh = ref(false)
 /** 实时模式：每 2s 请求 agent 立即上报一次 fast 快照（Pterodactyl 风格）。 */
 const liveMode = ref(true)
 const liveBusy = ref(false)
+const poweroffOpen = ref(false)
+const poweroffBusy = ref(false)
 const wakeOpen = ref(false)
 const wakeLoading = ref(false)
 
@@ -804,6 +806,20 @@ useInterval(async () => {
 }, 2_000)
 
 /** 请求 agent 立即上报一次 fast 快照（走 device_downlink，不依赖定时器）。 */
+async function poweroffMachine() {
+  if (!serial.value) return
+  poweroffBusy.value = true
+  try {
+    await api.poweroffMachine(serial.value)
+    poweroffOpen.value = false
+    toast.success('关机命令已下发', 'agent 默认禁用电源命令；需在 /etc/qe-agent.env 设置 QE_AGENT_ALLOW_POWEROFF=1')
+  } catch (caught) {
+    toast.error('关机命令下发失败', errorMessage(caught, '请确认机器在线且有权执行'))
+  } finally {
+    poweroffBusy.value = false
+  }
+}
+
 async function requestTelemetryReport() {
   if (!serial.value) return
   telemetryBusy.value = true
@@ -919,6 +935,15 @@ onMounted(() => void load())
             @click="requestTelemetryReport"
           >
             立即上报
+          </AppButton>
+          <AppButton
+            v-if="canRequestTelemetry"
+            icon="power"
+            variant="danger"
+            title="触发 agent 主机系统关机（默认需显式开启）"
+            @click="poweroffOpen = true"
+          >
+            关机
           </AppButton>
           <IconButton
             icon="refresh"
@@ -1201,6 +1226,18 @@ onMounted(() => void load())
       <div v-if="detail" class="mt-4">
         <MachineHistoryTable :points="detail.history ?? []" />
       </div>
+
+      <ConfirmDialog
+        :open="poweroffOpen"
+        title="关闭这台机器？"
+        description="通过 device_downlink 向 agent 下发 poweroff，由 agent 所在系统执行关机。"
+        detail="agent 默认禁用该命令；只有在 /etc/qe-agent.env 设置 QE_AGENT_ALLOW_POWEROFF=1 并重启 daemon 后才会真正关机。"
+        confirm-label="确认关机"
+        danger
+        :loading="poweroffBusy"
+        @confirm="poweroffMachine"
+        @close="poweroffOpen = false"
+      />
 
       <ConfirmDialog
         :open="vmConfirm !== null"

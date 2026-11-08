@@ -591,6 +591,12 @@ export const api = {
       }),
     ),
 
+  /** 触发 agent 主机关机（device:manage；agent 侧默认关闭，需显式启用）。 */
+  poweroffMachine: (serial: string) =>
+    unwrap<VmCommandAccepted>(
+      http.post(`/admin/machines/${encodeURIComponent(serial)}/agent/poweroff`),
+    ),
+
   /** 请求 agent 立即上报一次 fast 快照（device:manage）。 */
   requestTelemetryReport: (serial: string) =>
     unwrap<TelemetryReportReply>(

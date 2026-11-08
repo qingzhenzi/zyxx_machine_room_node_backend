@@ -210,6 +210,10 @@ pub fn router() -> Router<AppState> {
             "/machines/{serial}/telemetry/report",
             post(machines::request_telemetry_report),
         )
+        .route(
+            "/machines/{serial}/agent/poweroff",
+            post(machines::create_agent_poweroff),
+        )
         // WOL：需要 device:wake（迁移 0030 播种；默认仅 admin 角色）。
         .route("/machines/{serial}/wake", post(machines::wake))
         // VM 远程控制（kind=vm.command 经 device_downlink 下发；权限 vm:control，迁移 0032）。

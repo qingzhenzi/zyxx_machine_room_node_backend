@@ -204,6 +204,54 @@ pub struct WakeReply {
 ///   `sections.agent.host.macs`；设备不存在 404、无快照/无 MAC 422；
 /// - 每个 MAC 发 3 次 102 字节 magic packet（6×0xFF + MAC×16）到 UDP 255.255.255.255:9；
 /// - 发送结果写审计 `device.wake`（resource_type=`machine`）。
+/// `POST /api/v1/admin/machines/{serial}/agent/poweroff` —— 触发 agent 所在主机系统关机。
+///
+/// 安全：agent 侧必须显式设置 `QE_AGENT_ALLOW_POWEROFF=1` 才会执行；
+/// 未启用时命令返回失败结果，不会触碰电源。权限 `device:manage`。
+pub async fn create_agent_poweroff(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    Path(serial): Path<String>,
+) -> AppResult<(StatusCode, Json<VmCommandAccepted>)> {
+    authorization::require_permission(&state, id, permissions::DEVICE_MANAGE).await?;
+
+    let serial = serial.trim();
+    if serial.is_empty() {
+        return Err(AppError::bad_request("serial 不能为空"));
+    }
+    let device = state
+        .machines
+        .summary(serial)
+        .await?
+        .ok_or_else(|| AppError::not_found("机器不存在"))?;
+
+    let request_id = Uuid::new_v4();
+    let downlink = serde_json::json!({
+        "request_id": request_id,
+        "op": "poweroff",
+    });
+    insert_pending_command(&state, request_id, &device.serial, "agent.command", &downlink).await?;
+    match enqueue_device_downlink(&state, &device.device_slot, "agent.command", &downlink).await {
+        Ok(()) => {
+            super::audit::record_or_log(
+                &state,
+                id,
+                "device.poweroff",
+                "machine",
+                Some(device.serial.clone()),
+                serde_json::json!({ "serial": device.serial, "request_id": request_id }),
+                None,
+            )
+            .await;
+            Ok((StatusCode::ACCEPTED, Json(VmCommandAccepted { request_id })))
+        }
+        Err(error) => {
+            cleanup_pending_command(&state, request_id).await;
+            Err(error)
+        }
+    }
+}
+
 /// `POST /api/v1/admin/machines/{serial}/telemetry/report` —— 请求 agent 立即上报一次 fast 快照。
 ///
 /// 权限 `device:manage`；通过 `device_downlink` 下发 `telemetry.report`，
