@@ -38,19 +38,6 @@ const navGroups: { label: string; items: NavItem[] }[] = [
     ],
   },
   {
-    label: '总控',
-    items: [
-      {
-        name: 'federation',
-        label: '总控联邦',
-        icon: 'server',
-        to: '/federation',
-        permission: PERMISSIONS.deviceRead,
-        adminOnly: true,
-      },
-    ],
-  },
-  {
     label: '空间与设备',
     items: [
       {
