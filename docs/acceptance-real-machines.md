@@ -169,3 +169,25 @@ noVNC 结果：截图/录屏、输入响应、弱网表现、异常
 - 之前 `real-vm-01` 的底包不可启动（SeaBIOS no bootable device），
   因此普通 VM 的桌面/键鼠要用 cloud 底包复测。
 - Vite 开发代理 `/api` 已加 `ws:true`，否则 noVNC 会一直停在“正在连接控制节点”。
+
+### 5.7 2026-11-12 追加：boot-display 接管/退出、kiosk、关机和伪关机
+
+- 去掉 boot-display 默认 `open_devtools()`，不再出现调试窗口；
+  仅 `QE_BOOT_DISPLAY_DEVTOOLS=1` 时打开。
+- boot-display wrapper 改用 `setpriv` 直接 exec 目标用户，agent kill 能真正结束进程；
+  之前 `runuser` 多 fork 一层，kill 后 boot-display 会变孤儿。
+- 真机重启验证（18:24:05 启动 / 18:24:12 退出）：
+  - `qe-agent` 服务加载后拉起 boot-display 全屏
+  - boot 关键阶段结束后 boot-display 自动退出，无残留进程
+- kiosk 配置已落到真机：
+  - SDDM 自动登录 `roomuser` / `plasma.desktop`
+  - 关闭 Plasma 自动锁屏（`kscreenlockerrc`）
+  - `/etc/systemd/logind.conf.d/90-qestudio-kiosk.conf` `NAutoVTs=0`
+  - mask `getty@tty2..tty6`，阻止 Ctrl+Alt+F2..F6 切 TTY
+- 电源动作新增：
+  - CLI `qe-agent cli power fake` 成功（写 `/run/qe-agent/fake-shutdown`，不断电）
+  - IPC `POST /v1/power {"action":"fake"}` 成功
+  - `shutdown`/`reboot` 会先 `virsh shutdown/destroy` VM、`incus stop -f` 容器；
+    真实断电未执行（会断开真机），仅验证了清理代码与 fake 路径
+  - agent-client 新增「电源」页（关机/重启/伪关机，带确认）
+- 安装器/内嵌安装器已写入 libvirt-guests 30s 关机超时，避免 host 卡 shutdown。
