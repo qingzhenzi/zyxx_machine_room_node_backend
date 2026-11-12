@@ -137,3 +137,23 @@ noVNC 结果：截图/录屏、输入响应、弱网表现、异常
   agent 显式注入用户 DISPLAY/XAUTHORITY。
 - 本次使用 SSH 隧道绕过证书 SAN 限制，**不能视为生产可达性验收**；
   生产需 LAN 监听 + 正确 SAN + 防火墙放行 4440/4441。
+
+### 5.5 2026-11-12 追加：VM / 镜像 / noVNC / boot-display
+
+- 在真机创建 libvirt 池 `default`，复制 2.0GiB 底包 `base-debian.qcow2`；
+  VM `real-vm-01` 创建成功（2 vCPU / 2GiB / 20GiB 差分盘），libvirt 运行。
+- 修复 qemu 用户对 `/var/lib/qe-agent` 的访问：`libvirt-qemu` 加入 `qe-agent` 组，
+  数据目录 0750、磁盘 0660；VM 正常启动。
+- **制作镜像成功**：`image.make` 导出 `real-debian-13:0.1.1`，
+  2,148,073,472 bytes / 65 chunks（64 chunk 去重），manifest digest
+  `2d5800ad15f886f40d76a471bd477f1bea81d22f32d2d0b5a8c81d5f7304c483`。
+- verify 通过（chunk sha256/size/manifest），publish `test` 通道成功，
+  分配到 B104 房间；agent 拉取 transfer `completed`，staging 2.1G。
+- **noVNC 真机打通**：修复 Vite `/api` 代理缺少 `ws:true` 后，
+  真实 VM 控制台成功连接，SeaBIOS 画面可见（截图 `tmp/screenshots/real-novnc.png`）。
+- **boot-display 修复**：新增 `qe-boot-display-session`，自动发现 roomuser 的
+  Plasma/Wayland 会话并以用户身份启动；agent 修复 supervise 重复 spawn。
+  真机实测 boot-display 以 `roomuser` 稳定运行，无 GTK panic。
+- 底包本身不是可启动 OS（SeaBIOS 报 `No bootable device`），因此键鼠注入
+  只能验证到 BIOS/控制台链路；要验证桌面键鼠需换一个可启动的 Debian cloud 底包。
+- WOL 未执行（需要关机后上电条件）。
