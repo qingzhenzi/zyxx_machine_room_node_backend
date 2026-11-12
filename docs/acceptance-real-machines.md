@@ -157,3 +157,15 @@ noVNC 结果：截图/录屏、输入响应、弱网表现、异常
 - 底包本身不是可启动 OS（SeaBIOS 报 `No bootable device`），因此键鼠注入
   只能验证到 BIOS/控制台链路；要验证桌面键鼠需换一个可启动的 Debian cloud 底包。
 - WOL 未执行（需要关机后上电条件）。
+
+### 5.6 2026-11-12 追加：可启动 Debian cloud VM + noVNC 键鼠
+
+- 下载 Debian 13 genericcloud qcow2（326MB，virtual 3GiB）到真机
+  `/var/lib/libvirt/images/debian-13-cloud.qcow2`
+- 创建 `real-vm-cloud`（2 vCPU / 2GiB / 20GiB 差分盘）并启动
+- noVNC 控制台显示 Debian 13 登录界面；通过浏览器向 canvas 发送键盘输入 `root`，
+  VM 登录提示符出现 `root`，证明真实键鼠注入链路可用。
+  截图：`tmp/screenshots/real-novnc-cloud.png`、`real-novnc-keyboard.png`
+- 之前 `real-vm-01` 的底包不可启动（SeaBIOS no bootable device），
+  因此普通 VM 的桌面/键鼠要用 cloud 底包复测。
+- Vite 开发代理 `/api` 已加 `ws:true`，否则 noVNC 会一直停在“正在连接控制节点”。
