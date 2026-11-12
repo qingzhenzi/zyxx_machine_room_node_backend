@@ -21,6 +21,8 @@ export default defineConfig({
       '/api': {
         target: process.env.VITE_BACKEND_ORIGIN || 'http://127.0.0.1:8080',
         changeOrigin: true,
+        // noVNC / 实时指标 WS 也会走 /api；没有 ws:true 时浏览器升级请求会一直卡住。
+        ws: true,
       },
       // Swagger UI 与 OpenAPI JSON 也由后端提供。
       '/docs': {
