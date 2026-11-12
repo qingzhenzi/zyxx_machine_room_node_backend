@@ -206,3 +206,17 @@ noVNC 结果：截图/录屏、输入响应、弱网表现、异常
   或 S5 深度断电；需要现场开机并在 BIOS 打开 WOL 后再测。
 - 注意：CLI 关机的延迟任务必须由 systemd transient timer 执行；
   `tokio::spawn`/detached thread 会随 CLI 进程退出而被取消（已修复）。
+
+### 5.9 2026-11-12 最终 WOL 结论：S5 唤醒不可用
+
+- 已配置：
+  - 开机 `qe-wol.service` 执行 `ethtool -s enp1s0 wol g`
+  - agent 关机前再次 arm WOL（`ethtool` + sysfs `power/wakeup=enabled`）
+  - 关机前实测 `Wake-on: g`、`sysfs enabled`
+- 发送端排除了控制节点 Wi-Fi：
+  - OpenWrt 路由器 `192.168.8.1` 安装 `etherwake`
+  - 从路由器 `br-lan` 有线侧发 `etherwake -i br-lan 24:fb:e3:43:fd:25`
+  - 路由器 ARP 显示目标 `REACHABLE`
+- 结果：等待后仍 100% 丢包、SSH closed。
+- 现象：关机后网口灯完全不亮。
+- 结论：**软件侧 magic packet 与关机前 arm 都正确；这台 HP Pro SFF 280 G9 在 S5 下网卡没有待机供电，WOL 不可用。** 需要 BIOS 深度节能/ErP 设置或硬件待机供电支持；否则应改用智能插座 + BIOS `Power On After Power Loss`。
