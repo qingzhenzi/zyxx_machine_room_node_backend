@@ -94,3 +94,46 @@ WOL 结果：抓包文件、目标机启动时间、agent 上线时间、异常
 noVNC 结果：截图/录屏、输入响应、弱网表现、异常
 结论：可宣称（勾选实际支持项）/不可宣称项：
 ```
+
+## 5. 2026-11-12 真机联动（基础链路，已执行）
+
+### 5.1 被测机器
+
+```text
+地址: 192.168.8.141
+系统: Debian GNU/Linux 13 (trixie)
+桌面: SDDM + graphical.target；普通用户 roomuser；Intel UHD 770
+规格: x86_64 / 15 GiB RAM / 452 GiB NVMe（已用 8.5G）
+```
+
+### 5.2 安装与注册
+
+- 用 release bundle `qestudio-agent-0.1.0`（本地构建版）安装：
+  `install.sh --yes --gui-user roomuser --allow-poweroff ...`
+- 设备：`serial=06386505f8b49f248a27793b2c50a8b44fb1069e`，`slot=dev-b104`
+- 房间：`dev-b104 / B104 创新工坊`，注册状态 `active`
+- 因开发 PKI 证书 SAN 只有 localhost/127.0.0.1，真机通过 **SSH 反向隧道**
+  `localhost:4440/4441 -> 控制节点 127.0.0.1:4440/4441` 完成注册；
+  生产环境应给 PKI 证书加 LAN IP SAN，并绑定 `0.0.0.0`。
+
+### 5.3 已验证结果
+
+- [x] `qe-agent` systemd active (running)
+- [x] 首次 full 遥测上报成功（HTTP 202，snapshot 入库）
+- [x] 控制面 API 返回：`status=active`、`online=online`、`session_online=online`
+- [x] 机器详情显示真实主机名 `DESKTOP-ROOM-AGENT`、Debian 13、CPU/内存/磁盘与运行时长
+- [x] 控制台发起 `telemetry/report` 立即上报命令，API 返回 202
+- [x] 真实机器出现在房间 B104；截图：`tmp/screenshots/real-machine-debian13.png`
+- [ ] WOL 真实唤醒（未测，需关机/上电条件）
+- [ ] P2P 多机（未测，只 1 台真机）
+- [ ] noVNC 真人键鼠（未测）
+- [ ] 客户端制作镜像/下发（未测）
+
+### 5.4 已发现的问题
+
+- `boot-display` 由 root systemd 的 agent 直接 spawn 时没有 `DISPLAY`/`XAUTHORITY`，
+  GTK 初始化失败并 core dump（`Failed to initialize GTK`）。已在真机临时移除
+  `QE_BOOT_DISPLAY_BIN`，避免崩溃重启；后续需要改为在图形会话内启动，或由
+  agent 显式注入用户 DISPLAY/XAUTHORITY。
+- 本次使用 SSH 隧道绕过证书 SAN 限制，**不能视为生产可达性验收**；
+  生产需 LAN 监听 + 正确 SAN + 防火墙放行 4440/4441。
