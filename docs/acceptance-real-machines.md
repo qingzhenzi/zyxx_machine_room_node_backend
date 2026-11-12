@@ -191,3 +191,18 @@ noVNC 结果：截图/录屏、输入响应、弱网表现、异常
     真实断电未执行（会断开真机），仅验证了清理代码与 fake 路径
   - agent-client 新增「电源」页（关机/重启/伪关机，带确认）
 - 安装器/内嵌安装器已写入 libvirt-guests 30s 关机超时，避免 host 卡 shutdown。
+
+### 5.8 2026-11-12 追加：真机优雅关机 / WOL 实测
+
+- 先启用网卡 WOL：`ethtool -s enp1s0 wol g`，`Wake-on: g`、sysfs `enabled`。
+- 执行 `qe-agent cli power shutdown`：
+  - 返回 `scheduled=true`
+  - `systemd-run` 创建 `qe-agent-power-<pid>.timer`
+  - 20 秒内真机 ping/SSH 全部断开，**优雅关机成功，没有卡在 shutdown**
+- 控制面调用 `POST /admin/machines/{serial}/wake` 三次：
+  - API 均返回 200，`macs=["24:fb:e3:43:fd:25"]`
+  - 真机 60 秒内没有恢复 ping/SSH，**WOL 未唤醒**
+- 结论：软件侧 magic packet 已发出；未唤醒更像 BIOS/主板 Wake on LAN 未开，
+  或 S5 深度断电；需要现场开机并在 BIOS 打开 WOL 后再测。
+- 注意：CLI 关机的延迟任务必须由 systemd transient timer 执行；
+  `tokio::spawn`/detached thread 会随 CLI 进程退出而被取消（已修复）。
