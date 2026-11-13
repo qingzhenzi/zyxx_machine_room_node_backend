@@ -18,6 +18,7 @@ pub mod rows;
 pub mod schedule;
 pub mod schedule_plan;
 pub mod security;
+pub mod startup;
 pub mod storage;
 pub mod ticket_attachments;
 pub mod ticket_inspections;

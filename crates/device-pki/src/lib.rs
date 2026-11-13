@@ -8,6 +8,7 @@
 //!   `DELETE /admin/enrollments/{id}`、`POST /admin/enroll/{id}/decide`、`GET /crl`
 //! - 业务 listener（mTLS）：`POST /enroll/confirm`、`POST /messages`、
 //!   `GET /agent/config`（节点配置，契约 §17.3）、
+//!   `GET /agent/startup`（房间启动配置，`docs/startup-provisioning.md` §4.1）、
 //!   `POST /resources/presign`（对象存储预签名，契约 §16.2）、
 //!   `POST /machine/p2p/seed` / `GET /machine/p2p/peers`（P2P 镜像分发种子）、
 //!   `POST /machine/command/result`（机器命令结果回传）、
@@ -34,6 +35,7 @@ pub mod ratelimit;
 pub mod resource;
 pub mod routes;
 pub mod session;
+pub mod startup;
 pub mod tls;
 pub mod token;
 pub mod transfer;

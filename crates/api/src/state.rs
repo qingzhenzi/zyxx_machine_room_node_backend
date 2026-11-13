@@ -19,6 +19,7 @@ use crate::{
         schedule::{AreaRepo, EventRuleRepo, RoomRepo, ScheduleEventRepo, ScheduleRepo},
         schedule_plan::{ClassRepo, CourseRepo, PlanRepo, TeacherRepo, TermRepo},
         security::SecurityRepo,
+        startup::RoomStartupRepo,
         storage::StorageRepo,
         ticket_attachments::TicketAttachmentRepo,
         ticket_inspections::TicketInspectionRepo,
@@ -74,6 +75,8 @@ pub struct AppState {
     pub presence_events: tokio::sync::broadcast::Sender<PresenceEventRecord>,
     // ---- 节点配置（P2：global → area → room）----
     pub agent_configs: AgentConfigRepo,
+    // ---- 房间启动配置（startup provisioning，迁移 0035）----
+    pub startup: RoomStartupRepo,
     // ---- 资源与镜像（S3 兼容对象存储）----
     /// 未配置 `S3_ENDPOINT` + `S3_BUCKET`（或初始化失败）时为 `None`，
     /// 存储/镜像接口统一返回 503。
@@ -125,6 +128,7 @@ impl AppState {
             presence: PresenceRepo::new(db.pool().clone()),
             presence_events,
             agent_configs: AgentConfigRepo::new(db.pool().clone()),
+            startup: RoomStartupRepo::new(db.pool().clone()),
             storage,
             storage_repo: StorageRepo::new(db.pool().clone()),
             email,

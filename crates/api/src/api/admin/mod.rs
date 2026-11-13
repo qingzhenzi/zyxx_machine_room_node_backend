@@ -14,6 +14,7 @@ pub mod schedule_board;
 pub mod schedule_events;
 pub mod schedule_plans;
 pub mod schedules;
+pub mod startup;
 pub mod storage;
 pub mod ticket_attachments;
 pub mod ticket_inspections;
@@ -80,6 +81,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/rooms/{id}/devices/{slot}",
             delete_route(devices::remove_room_machine),
+        )
+        // 房间启动配置（startup provisioning）：agent 自动拉起环境的声明式配置，
+        // 权限 vm:control；契约见 docs/startup-provisioning.md。
+        .route(
+            "/rooms/{room_id}/startup",
+            get(startup::get).put(startup::update),
         )
         .route("/rooms/{id}/occurrences", get(schedules::room_occurrences))
         .route(

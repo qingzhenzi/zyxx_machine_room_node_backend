@@ -235,6 +235,7 @@ async fn ws_channel_connects_and_activates_enrollment() {
             qe_device_pki::vnc::VNC_PAIR_TIMEOUT,
         )),
         vnc_internal_token: None,
+        metrics: Arc::new(qe_device_pki::metrics::MetricsHub::new()),
     };
     let enroll_app = routes::enroll_router(state.clone());
     let mtls_app = routes::mtls_router(state.clone());

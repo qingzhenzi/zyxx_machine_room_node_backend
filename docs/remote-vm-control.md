@@ -145,6 +145,39 @@ register 校验（服务端不信任 agent）：
 - 同一 sha 对象内容寻址，`presign-upload` 命中 `already_exists=true` 时 agent 跳过上传；
 - 若上传/register 中途失败，agent 重试即可（presign/register 幂等；同名镜像重复 register 返回 409）。
 
+### 2.5 房间启动配置：GET/PUT `/api/v1/admin/rooms/{room_id}/startup`
+
+「设备一上线就自动准备好环境」的声明式配置，完整协议（字段/校验/agent 行为）见
+[`startup-provisioning.md`](startup-provisioning.md)。服务端链路：
+
+```text
+管理端 PUT 启动配置
+  → 校验 config（镜像必须 published + manifest 完整；VM 规格按契约 §2）
+  → upsert room_startup_profiles（首次 revision=1，之后 revision+1，写 updated_by）
+  → 每个镜像幂等补 image_assignments(room_id, image_id, channel='prod')
+       ↑ device-pki /resources/presign 的 authorize_image 只放行「已分配到房间」的镜像
+  → 每个镜像幂等补 transfers(direction='download', status='pending')（上报进度用）
+  → 向房间主槽位 + room_devices 各槽位入队 device_downlink kind=startup.update
+       payload={"revision":N}（Redis 唤醒失败只 warn）
+agent 启动 / 收到 startup.update / 周期触发
+  → device-pki mTLS GET /agent/startup（身份=设备证书 serial）
+  → 拉镜像（复用 image.pull 链路）→ 建/启 VM → 写 startup-state.json
+```
+
+- 权限：`vm:control`（与 VM 远程控制一致，不新增权限点）。
+- `GET`：返回 `{room_id, enabled, revision, config, updated_at, images[], targets[]}`；
+  无配置行时 `enabled=false, revision=0, config` 为默认值（`auto_pull/auto_start_vm=true`，
+  空 `images/vms`），HTTP 200。`images[]` 额外带 `transfer_id` 与 `assigned`（是否已分配到
+  房间，便于排障 presign 403）；`targets[]` 为房间主设备 + 子机槽位及最近一次注册 serial。
+- `PUT`：请求体 `{enabled, config}`；房间不存在 404、config 非法/镜像未发布 400；
+  成功后返回与 `GET` 相同结构。重复 PUT 幂等（revision 递增，不重复建 transfer/assignment）。
+- device-pki `GET /agent/startup`（mTLS）：无配置 / `enabled=false` / 槽位未绑房间都返回 200 +
+  `revision=0, enabled=false`；`images[]` 只含已发布且 manifest 完整的镜像，字段名与
+  `image.pull` payload 一致；`vms[]` 原样透传（`base_volume` 可为 null，由 agent 推导
+  `<image.name>-<image.version>`）。
+- 已知边界：启动配置只声明「确保存在 + 启动」，agent 绝不 delete/shutdown；镜像或底包
+  缺失时该轮跳过并告警，下轮 reconcile 重试。
+
 ## 3. 控制台交互
 
 机器详情页「虚拟机」面板（`vm:control` 才显示操作，否则只读）：
@@ -181,3 +214,6 @@ register 校验（服务端不信任 agent）：
   - `status=error` 且含 `libvirt`/`domain`：目标机 libvirt 不可用或 VM 名不存在；
   - `snapshot.*` 报运行中：先 `shutdown`；
   - 一直 pending：device-pki 下行未送达（设备 online 但长连接断开时最多等 2s 兜底轮询）。
+- **启动配置自动拉镜像 403**：确认 `PUT /rooms/{id}/startup` 已执行（它会给镜像补
+  `image_assignments`）；未分配镜像时 presign 返回「镜像未分配到该设备所在房间」。
+  `GET` 响应 `images[].assigned=false` 可直接定位；重新 PUT 一次即可修复。

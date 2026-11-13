@@ -85,6 +85,7 @@ async fn setup_with_limit(admin_limit: u32) -> Option<(AppState, Router, Router)
             qe_device_pki::vnc::VNC_PAIR_TIMEOUT,
         )),
         vnc_internal_token: None,
+        metrics: Arc::new(qe_device_pki::metrics::MetricsHub::new()),
     };
     Some((
         state.clone(),

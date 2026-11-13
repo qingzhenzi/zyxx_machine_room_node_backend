@@ -87,6 +87,7 @@ fn app_state(db: PgPool, storage: Option<Arc<StorageService>>) -> AppState {
             qe_device_pki::vnc::VNC_PAIR_TIMEOUT,
         )),
         vnc_internal_token: None,
+        metrics: Arc::new(qe_device_pki::metrics::MetricsHub::new()),
     }
 }
 

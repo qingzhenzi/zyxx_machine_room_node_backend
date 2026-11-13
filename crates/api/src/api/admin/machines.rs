@@ -230,7 +230,14 @@ pub async fn create_agent_poweroff(
         "request_id": request_id,
         "op": "poweroff",
     });
-    insert_pending_command(&state, request_id, &device.serial, "agent.command", &downlink).await?;
+    insert_pending_command(
+        &state,
+        request_id,
+        &device.serial,
+        "agent.command",
+        &downlink,
+    )
+    .await?;
     match enqueue_device_downlink(&state, &device.device_slot, "agent.command", &downlink).await {
         Ok(()) => {
             super::audit::record_or_log(
@@ -668,7 +675,7 @@ fn validate_volume_name(raw: &str) -> AppResult<String> {
     Ok(value.to_owned())
 }
 
-fn validate_base_path(raw: &str) -> AppResult<String> {
+pub(super) fn validate_base_path(raw: &str) -> AppResult<String> {
     let value = raw.trim();
     if !value.starts_with('/') {
         return Err(bad_arg("base_path 必须是绝对路径"));
@@ -683,7 +690,7 @@ fn validate_base_path(raw: &str) -> AppResult<String> {
 }
 
 /// GPU PCI 直通地址：`dddd:bb:dd.f`（十六进制，function 0-7）。
-fn validate_gpu_address(raw: &str) -> AppResult<String> {
+pub(super) fn validate_gpu_address(raw: &str) -> AppResult<String> {
     let value = raw.trim();
     let invalid = || bad_arg(format!("gpu 地址非法（{value}），应为 dddd:bb:dd.f"));
     let mut parts = value.split(':');
@@ -705,7 +712,7 @@ fn validate_gpu_address(raw: &str) -> AppResult<String> {
     Ok(value.to_owned())
 }
 
-fn check_range(value: u64, field: &str, range: (u64, u64)) -> AppResult<u64> {
+pub(super) fn check_range(value: u64, field: &str, range: (u64, u64)) -> AppResult<u64> {
     if !(range.0..=range.1).contains(&value) {
         return Err(bad_arg(format!(
             "{field} 必须在 {}..={} 之间（当前 {value}）",
@@ -1424,7 +1431,14 @@ pub async fn create_container_command(
 
     let request_id = Uuid::new_v4();
     let downlink = vm_command_downlink_payload(request_id, &command);
-    insert_pending_command(&state, request_id, &device.serial, CONTAINER_COMMAND_DOWNLINK_KIND, &downlink).await?;
+    insert_pending_command(
+        &state,
+        request_id,
+        &device.serial,
+        CONTAINER_COMMAND_DOWNLINK_KIND,
+        &downlink,
+    )
+    .await?;
     match enqueue_device_downlink(
         &state,
         &device.device_slot,
@@ -2139,18 +2153,17 @@ mod tests {
         assert_eq!(ok.args["name"], serde_json::json!("lab-1"));
         assert_eq!(ok.args["remove_disks"], serde_json::json!(true));
         // 缺省不删盘
-        let ok = validate_vm_command(request_args(
-            "delete",
-            serde_json::json!({"name":"lab-1"}),
-        ))
-        .unwrap();
+        let ok = validate_vm_command(request_args("delete", serde_json::json!({"name":"lab-1"})))
+            .unwrap();
         assert!(ok.args.get("remove_disks").is_none());
         // 未知字段 / 缺 name 拒绝
-        assert!(validate_vm_command(request_args(
-            "delete",
-            serde_json::json!({"name":"lab-1","unknown":1})
-        ))
-        .is_err());
+        assert!(
+            validate_vm_command(request_args(
+                "delete",
+                serde_json::json!({"name":"lab-1","unknown":1})
+            ))
+            .is_err()
+        );
         assert!(validate_vm_command(request_args("delete", serde_json::json!({}))).is_err());
     }
 
@@ -2176,21 +2189,26 @@ mod tests {
         .unwrap();
         assert_eq!(ok.args["snapshot"], serde_json::json!("s1"));
         // list 不接受参数；snapshot 缺 snapshot；未知字段/非法 name 拒绝
-        assert!(validate_container_command(request_args("list", serde_json::json!({"x":1}))).is_err());
-        assert!(validate_container_command(request_args(
-            "snapshot.create",
-            serde_json::json!({"name":"c1"})
-        ))
-        .is_err());
-        assert!(validate_container_command(request_args(
-            "start",
-            serde_json::json!({"name":"c1","unknown":1})
-        ))
-        .is_err());
-        assert!(validate_container_command(request_args(
-            "start",
-            serde_json::json!({"name":"../x"})
-        ))
-        .is_err());
+        assert!(
+            validate_container_command(request_args("list", serde_json::json!({"x":1}))).is_err()
+        );
+        assert!(
+            validate_container_command(request_args(
+                "snapshot.create",
+                serde_json::json!({"name":"c1"})
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_container_command(request_args(
+                "start",
+                serde_json::json!({"name":"c1","unknown":1})
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_container_command(request_args("start", serde_json::json!({"name":"../x"})))
+                .is_err()
+        );
     }
 }
