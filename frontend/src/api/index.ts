@@ -686,11 +686,18 @@ export const api = {
       http.post(`/admin/images/${encodeURIComponent(id)}/manifest`, input),
     ),
 
+  /** 同步校验会逐分片 download+sha256，大镜像需要数分钟：单独放宽超时（默认 20s 不够）。 */
   verifyImage: (id: string) =>
-    unwrap<VerifyReply>(http.post(`/admin/images/${encodeURIComponent(id)}/verify`)),
+    unwrap<VerifyReply>(
+      http.post(`/admin/images/${encodeURIComponent(id)}/verify`, undefined, {
+        timeout: 180_000,
+      }),
+    ),
 
   publishImage: (id: string, input: PublishImageRequest) =>
-    unwrap<ImageArtifact>(http.post(`/admin/images/${encodeURIComponent(id)}/publish`, input)),
+    unwrap<ImageArtifact>(
+      http.post(`/admin/images/${encodeURIComponent(id)}/publish`, input, { timeout: 60_000 }),
+    ),
 
   /** 下架已发布镜像（published → deprecated，幂等；其它状态 409；需要 image:manage）。 */
   deprecateImage: (id: string) =>

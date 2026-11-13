@@ -21,6 +21,7 @@ import {
   artifactStatusMeta,
   compressionLabel,
   imageKindLabel,
+  imageReadinessMeta,
 } from '@/features/images/labels'
 import { useAuthStore } from '@/stores/auth'
 import { useToastStore } from '@/stores/toast'
@@ -43,6 +44,8 @@ const error = ref('')
 const kind = ref('')
 const status = ref('')
 const name = ref('')
+/** 归属范围：空=服务端默认（teacher: 我的+公共；admin: 全部）。 */
+const scope = ref<'' | 'mine' | 'public' | 'all'>('')
 
 const createOpen = ref(false)
 
@@ -57,6 +60,7 @@ async function load() {
       kind: kind.value || undefined,
       status: (status.value || undefined) as ArtifactStatus | undefined,
       name: name.value.trim() || undefined,
+      scope: scope.value || undefined,
       page: page.value,
       page_size: PAGE_SIZE,
     })
@@ -134,6 +138,18 @@ onMounted(() => void load())
 
     <div class="mt-4 flex flex-wrap items-center gap-2">
       <select
+        v-model="scope"
+        class="select w-[150px]"
+        aria-label="按归属筛选"
+        @change="reloadFromFirstPage"
+      >
+        <option value="">默认范围</option>
+        <option value="mine">我的镜像</option>
+        <option value="public">公共镜像</option>
+        <option value="all">全部（管理员）</option>
+      </select>
+
+      <select
         v-model="kind"
         class="select w-[150px]"
         aria-label="按类型筛选"
@@ -186,6 +202,7 @@ onMounted(() => void load())
               <th class="table-th pl-5">名称:版本</th>
               <th class="table-th">类型</th>
               <th class="table-th">平台</th>
+              <th class="table-th">归属</th>
               <th class="table-th">格式 / 压缩</th>
               <th class="table-th">状态</th>
               <th class="table-th">总大小</th>
@@ -197,10 +214,10 @@ onMounted(() => void load())
           <tbody v-if="loading">
             <tr v-for="row in 6" :key="row" class="border-b border-line/70 last:border-b-0">
               <td
-                v-for="cell in canManage ? 8 : 7"
+                v-for="cell in canManage ? 9 : 8"
                 :key="cell"
                 class="table-td"
-                :class="cell === 1 ? 'pl-5' : cell === (canManage ? 8 : 7) ? 'pr-5' : ''"
+                :class="cell === 1 ? 'pl-5' : cell === (canManage ? 9 : 8) ? 'pr-5' : ''"
               >
                 <div class="h-3 w-24 animate-pulse rounded bg-line" />
               </td>
@@ -223,12 +240,17 @@ onMounted(() => void load())
               <td class="table-td">{{ imageKindLabel(image.kind) }}</td>
               <td class="table-td font-mono text-[10.5px]">{{ image.platform }}</td>
               <td class="table-td text-[11px]">
+                <span v-if="image.owner_name" class="text-ink-soft">{{ image.owner_name }}</span>
+                <span v-else-if="image.namespace_slug === 'public'" class="text-faint">公共</span>
+                <span v-else class="text-faint">—</span>
+              </td>
+              <td class="table-td text-[11px]">
                 {{ IMAGE_FORMAT_LABELS[image.format] }} / {{ compressionLabel(image.compression) }}
               </td>
               <td class="table-td">
                 <StateBadge
-                  :label="artifactStatusMeta(image.status).label"
-                  :tone="artifactStatusMeta(image.status).tone"
+                  :label="imageReadinessMeta(image).label"
+                  :tone="imageReadinessMeta(image).tone"
                 />
               </td>
               <td class="table-td text-[11px]">{{ formatBytes(image.total_size) }}</td>

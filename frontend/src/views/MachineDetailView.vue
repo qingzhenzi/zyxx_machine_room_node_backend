@@ -650,7 +650,7 @@ const vmMakeForm = ref<VmMakeImageForm>({
   platform: 'linux/amd64',
   baseVolume: '',
   description: '',
-  channel: 'prod',
+  channel: 'dev',
 })
 
 /** VM 名 → 合法镜像名（小写 + 白名单字符；仅用于预填，可编辑）。 */
@@ -677,7 +677,7 @@ function openVmMake(vmName: string) {
     platform: 'linux/amd64',
     baseVolume: '',
     description: '',
-    channel: 'prod',
+    channel: 'dev',
   }
   vmMakeError.value = ''
   vmMakeDone.value = null
@@ -1630,6 +1630,13 @@ onMounted(() => {
         </div>
 
         <p v-if="vmMakeError" class="mt-2 text-[11px] text-rose-600">{{ vmMakeError }}</p>
+        <RouterLink
+          v-if="vmMakeError && vmMakeForm.name"
+          :to="{ name: 'images', query: { name: vmMakeForm.name } }"
+          class="mt-1 inline-block text-[11px] text-accent hover:underline"
+        >
+          去镜像库查看该镜像（若已登记，可只重试校验/发布，避免重复导出上传）
+        </RouterLink>
 
         <ol v-if="vmMakeSteps.length" class="mt-3 flex flex-col gap-1.5">
           <li

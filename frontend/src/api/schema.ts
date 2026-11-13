@@ -4,6 +4,7 @@
 export type AgentConfigScopeType = 'global' | 'area' | 'room'
 
 export type ArtifactStatus =
+  | 'draft'
   | 'uploaded'
   | 'manifest_ready'
   | 'verifying'
@@ -588,7 +589,17 @@ export interface ImageArtifact {
   total_size: number
   updated_at: string
   version: string
+  // 归属 / 可见性 / 分层就绪（image-build-lifecycle.md §1/§3；旧服务端可能不返回）
+  owner_user_id?: string | null
+  owner_name?: string | null
+  namespace_slug?: string | null
+  visibility?: 'private' | 'room' | 'area' | 'public' | string | null
+  readiness?: 'building' | 'uploaded' | 'verified' | 'ready' | 'unavailable' | string | null
 }
+
+export type ImageScope = 'mine' | 'public' | 'all'
+
+export type ImageReadiness = 'building' | 'uploaded' | 'verified' | 'ready' | 'unavailable'
 
 export interface ImageAssignment {
   area_id?: string | null

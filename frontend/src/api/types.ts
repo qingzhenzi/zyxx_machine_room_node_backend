@@ -64,6 +64,8 @@ export interface ImageListParams extends PageParams {
   kind?: string
   status?: ArtifactStatus
   name?: string
+  /** 归属范围：mine（我的）/ public（公共）/ all（全部，仅管理员）。缺省由服务端按角色收敛。 */
+  scope?: 'mine' | 'public' | 'all'
 }
 
 export interface UserListParams extends PageParams {

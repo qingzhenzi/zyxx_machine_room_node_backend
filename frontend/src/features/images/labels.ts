@@ -52,6 +52,7 @@ export const COMPRESSION_LABELS: Record<Compression, string> = {
 }
 
 export const ARTIFACT_STATUS_META: Record<ArtifactStatus, { label: string; tone: BadgeTone }> = {
+  draft: { label: '制作中', tone: 'amber' },
   uploaded: { label: '已上传', tone: 'slate' },
   manifest_ready: { label: 'manifest 就绪', tone: 'sky' },
   verifying: { label: '验证中', tone: 'amber' },
@@ -76,6 +77,26 @@ export const IMAGE_CHANNEL_OPTIONS: { value: ImageChannel; label: string }[] = [
   { value: 'test', label: 'test · 测试' },
   { value: 'prod', label: 'prod · 生产' },
 ]
+
+/** 分层就绪状态（image-build-lifecycle.md §1）：优先用服务端 `readiness`，回退到 status。 */
+export const READINESS_META: Record<string, { label: string; tone: BadgeTone }> = {
+  building: { label: '制作中（未上传）', tone: 'amber' },
+  uploaded: { label: '已上传 · 待校验', tone: 'sky' },
+  verified: { label: '已校验 · 待发布', tone: 'emerald' },
+  ready: { label: '可用（已发布）', tone: 'violet' },
+  unavailable: { label: '不可用', tone: 'slate' },
+}
+
+export function imageReadinessMeta(image: {
+  readiness?: string | null
+  status: ArtifactStatus
+}): { label: string; tone: BadgeTone } {
+  if (image.readiness) {
+    const meta = READINESS_META[image.readiness]
+    if (meta) return meta
+  }
+  return artifactStatusMeta(image.status)
+}
 
 const FALLBACK_META = { label: '—', tone: 'slate' as BadgeTone }
 
