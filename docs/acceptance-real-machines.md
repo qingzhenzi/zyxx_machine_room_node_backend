@@ -220,3 +220,20 @@ noVNC 结果：截图/录屏、输入响应、弱网表现、异常
 - 结果：等待后仍 100% 丢包、SSH closed。
 - 现象：关机后网口灯完全不亮。
 - 结论：**软件侧 magic packet 与关机前 arm 都正确；这台 HP Pro SFF 280 G9 在 S5 下网卡没有待机供电，WOL 不可用。** 需要 BIOS 深度节能/ErP 设置或硬件待机供电支持；否则应改用智能插座 + BIOS `Power On After Power Loss`。
+
+### 5.10 2026-11-13 GRUB 锁定/恢复记录
+
+- 第一次配置 GRUB 密码时，`set superusers` 让所有启动项默认需要认证，
+  真机重启后卡在 GRUB 密码提示；密码为随机生成、只落在磁盘，无法远程取得。
+- 用定制 SystemRescue 13.03 U 盘（内置 SSH + root 公钥）启动：
+  - 自动 DHCP 到 192.168.8.141，SSH 22 可登录
+  - 挂载 `/dev/nvme0n1p2` 到 `/mnt/qe`，chroot
+  - 删除 `/etc/grub.d/40_custom` 密码块，`grub-mkconfig -o /boot/grub/grub.cfg`
+  - 重启恢复正常 Debian
+- 修正后的锁定方案：
+  - GRUB 密码 + 菜单项 `--unrestricted`
+  - 正常启动免密；Esc/Shift 调菜单/编辑需要密码
+  - 备份移到 `/root/qe-grub-backups`，不再放 `/etc/grub.d`（否则会被当脚本执行）
+- 真机重启验证通过；密码保存在 `/root/qe-grub-password` (0600)。
+- 待办：Wayland/Plasma 下 Ctrl+Alt+F 仍无统一 100% 禁用开关；Xorg 已配
+  `DontVTSwitch=true`，并已 mask getty tty2-6、禁 autovt。
