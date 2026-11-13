@@ -243,7 +243,9 @@ services:
     volumes:
       - rustfsdata:/data
     ports:
-      - "127.0.0.1:${RUSTFS_PORT:-9000}:9000"
+      # 9000 需要暴露到 LAN：远程机 qe-agent 通过预签名 URL 直接下载镜像分片
+      - "${RUSTFS_PORT:-9000}:9000"
+      # 9001 控制台仍只在本机
       - "127.0.0.1:${RUSTFS_CONSOLE_PORT:-9001}:9001"
     restart: unless-stopped
     logging: *default-logging

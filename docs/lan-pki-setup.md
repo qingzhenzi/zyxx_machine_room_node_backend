@@ -84,6 +84,23 @@ make pki-dev        # 构建并启动 device-pki（compose 已固定 ENROLL_ADDR
 docker compose --profile pki ps
 ```
 
+### 方式 C（一行脚本，推荐开发/演示）
+
+仓库已带 `scripts/start-device-pki-lan.sh`：自动探测 LAN IP、校验证书 SAN、绑定
+`0.0.0.0:4440/4441`，并把预签名用的 `S3_ENDPOINT` 指向 LAN 地址（远程 agent
+下载镜像分片必需）。
+
+```bash
+cd room_node
+bash scripts/start-device-pki-lan.sh            # 前台；Ctrl-C 退出
+# 或后台：
+nohup setsid bash scripts/start-device-pki-lan.sh > /tmp/qe-device-pki.log 2>&1 &
+```
+
+脚本前置：证书已含 LAN IP SAN（见第 2 步）、`room_node/.env` 已有 S3/签名配置、
+RustFS 9000 对 LAN 可达（compose.yaml 默认已改为 `0.0.0.0:9000`）。
+脚本会拒绝 SAN 缺 LAN IP 的证书与已被占用的 4440/4441 端口。
+
 ### 方式 B（本机二进制）
 
 > **device-pki 不读 `.env`**，所有变量必须 `export`。
