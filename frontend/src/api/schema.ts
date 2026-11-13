@@ -841,6 +841,63 @@ export interface VmEnvironmentReply {
   targets: VmEnvironmentTarget[]
 }
 
+/** 房间启动配置（startup provisioning，契约见 room_node/docs/startup-provisioning.md）。 */
+export interface RoomStartupImageRef {
+  image_id: string
+}
+
+export interface RoomStartupVm {
+  name: string
+  vcpus: number
+  memory_mib: number
+  disk_gb: number
+  base_volume?: string | null
+  base_path?: string | null
+  gpu?: string[]
+  auto_start: boolean
+}
+
+export interface RoomStartupConfig {
+  auto_pull: boolean
+  auto_start_vm: boolean
+  images: RoomStartupImageRef[]
+  vms: RoomStartupVm[]
+}
+
+/** 管理端读取启动配置时回查出的镜像信息；`assigned` 表示已分配到该房间（预签名授权前提）。 */
+export interface RoomStartupImageInfo {
+  image_id: string
+  name: string
+  version: string
+  kind: ImageKind
+  status: ArtifactStatus
+  manifest_digest?: string | null
+  total_size: number
+  transfer_id?: string | null
+  assigned: boolean
+}
+
+/** 启动配置生效目标：房间主设备槽位 + 子机槽位。 */
+export interface RoomStartupTarget {
+  device_slot: string
+  serial: string | null
+}
+
+export interface RoomStartupProfile {
+  room_id: string
+  enabled: boolean
+  revision: number
+  config: RoomStartupConfig
+  updated_at?: string | null
+  images: RoomStartupImageInfo[]
+  targets: RoomStartupTarget[]
+}
+
+export interface RoomStartupSaveRequest {
+  enabled: boolean
+  config: RoomStartupConfig
+}
+
 export interface MachineReportSummary {
   agent_version: string
   collected_at: string

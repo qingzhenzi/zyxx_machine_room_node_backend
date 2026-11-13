@@ -90,6 +90,8 @@ import type {
   RoomDevice,
   RoomMachine,
   RoomPage,
+  RoomStartupProfile,
+  RoomStartupSaveRequest,
   Schedule,
   ScheduleEventDetail,
   ScheduleEventPage,
@@ -389,6 +391,15 @@ export const api = {
     unwrap<Room>(
       http.put(`/admin/rooms/${encodeURIComponent(id)}/device`, { device_slot: deviceSlot }),
     ),
+
+  // ---- 房间启动配置（startup provisioning）----
+  /** 读取房间启动配置（镜像 + 要自动创建/启动的 VM）。 */
+  getRoomStartup: (id: string) =>
+    unwrap<RoomStartupProfile>(http.get(`/admin/rooms/${encodeURIComponent(id)}/startup`)),
+
+  /** 保存房间启动配置：agent 收到 startup.update 后自动拉镜像/建 VM/启动。 */
+  saveRoomStartup: (id: string, input: RoomStartupSaveRequest) =>
+    unwrap<RoomStartupProfile>(http.put(`/admin/rooms/${encodeURIComponent(id)}/startup`, input)),
 
   issueDeviceToken: (id: string, input: DeviceTokenRequest = {}) =>
     unwrap<DeviceTokenReply>(

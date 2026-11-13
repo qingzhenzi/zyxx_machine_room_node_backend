@@ -27,6 +27,7 @@ import ScheduleEventFeed from '@/features/areas/ScheduleEventFeed.vue'
 import RoomDevicePanel from '@/features/rooms/RoomDevicePanel.vue'
 import RoomFormModal from '@/features/rooms/RoomFormModal.vue'
 import RoomSchedulesPanel from '@/features/rooms/RoomSchedulesPanel.vue'
+import RoomStartupPanel from '@/features/rooms/RoomStartupPanel.vue'
 import { useAuthStore } from '@/stores/auth'
 import { errorMessage } from '@/utils/errors'
 import { formatFullDateTime, formatRelative, today } from '@/utils/format'
@@ -86,6 +87,7 @@ const timezone = computed(() => room.value?.timezone || 'Asia/Shanghai')
 const canManage = computed(() => auth.can(PERMISSIONS.roomManage))
 const canManageDevice = computed(() => auth.can(PERMISSIONS.deviceManage))
 const canReadSchedules = computed(() => auth.can(PERMISSIONS.scheduleRead))
+const canControlVm = computed(() => auth.can(PERMISSIONS.vmControl))
 
 const boundDevice = computed<RoomDevice | null>(() => device.value ?? room.value?.device ?? null)
 const lastSeenAt = computed(() => boundDevice.value?.last_seen_at ?? null)
@@ -480,6 +482,8 @@ onMounted(() => {
           当前账号没有课表读取权限（schedule:read），无法查看该房间的课表与排课实例。
         </p>
       </PageSection>
+
+      <RoomStartupPanel class="mt-4" :room-id="room.id" :can-manage="canControlVm" />
 
       <div class="mt-4 grid grid-cols-12 items-start gap-4">
         <div class="col-span-6">
