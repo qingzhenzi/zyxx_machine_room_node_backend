@@ -6,6 +6,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod email;
 pub mod error;
+pub mod image_build;
 pub mod presence;
 pub mod scheduler;
 pub mod state;
@@ -73,6 +74,10 @@ pub async fn run() -> anyhow::Result<()> {
     } else {
         tracing::info!("工单自动建单 worker 已禁用（TICKETS_AUTO_ENABLED=false）");
     }
+
+    // 镜像制作工单过期清理：把 pending 且过期的工单置 expired（幂等，多副本安全）。
+    let _image_build_maintenance = image_build::spawn(state.clone());
+    tracing::info!("镜像制作工单过期清理已启动（60s/轮）");
 
     if config.device_presence_enabled {
         let _presence = presence::spawn(state.clone());

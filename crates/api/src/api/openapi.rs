@@ -838,7 +838,9 @@ pub fn spec() -> Value {
                 "ImageKind": { "type": "string", "enum": ["docker", "oci", "lxc_rootfs", "vm_disk"] },
                 "ImageFormat": { "type": "string", "enum": ["docker_archive", "oci_layout", "tar", "qcow2", "raw"] },
                 "Compression": { "type": "string", "enum": ["none", "zstd", "gzip"], "description": "P0 只接受 none。" },
-                "ArtifactStatus": { "type": "string", "enum": ["uploaded", "manifest_ready", "verifying", "verified", "published", "deprecated", "revoked"] },
+                "ArtifactStatus": { "type": "string", "enum": ["draft", "uploaded", "manifest_ready", "verifying", "verified", "published", "deprecated", "revoked"] },
+                "ImageVisibility": { "type": "string", "enum": ["private", "room", "area", "public"], "description": "可见范围（MVP 只用 private/public；room/area 预留给后续共享）。" },
+                "ImageScope": { "type": "string", "enum": ["mine", "public", "all"], "description": "列表范围：mine=我的，public=公共，all=全部（仅管理员）。缺省 = 我的 + 公共。" },
                 "ImageChannel": { "type": "string", "enum": ["dev", "test", "prod"] },
                 "TransferStatus": { "type": "string", "enum": ["pending", "running", "completed", "failed", "expired"] },
                 "CollectionStatus": { "type": "string", "enum": ["pending", "uploaded", "verified", "rejected"] },
@@ -932,7 +934,7 @@ pub fn spec() -> Value {
                 },
                 "ImageArtifact": {
                     "type": "object",
-                    "required": ["id", "name", "version", "kind", "format", "compression", "platform", "total_size", "status", "created_at", "updated_at"],
+                    "required": ["id", "name", "version", "kind", "format", "compression", "platform", "total_size", "status", "namespace_id", "visibility", "created_at", "updated_at"],
                     "properties": {
                         "id": { "type": "string", "format": "uuid" },
                         "name": { "type": "string" },
@@ -945,14 +947,36 @@ pub fn spec() -> Value {
                         "total_size": { "type": "integer", "format": "int64" },
                         "status": { "$ref": "#/components/schemas/ArtifactStatus" },
                         "created_by": { "type": ["string", "null"], "format": "uuid" },
+                        "namespace_id": { "type": "string", "format": "uuid", "description": "归属命名空间（迁移 0036）。" },
+                        "owner_user_id": { "type": ["string", "null"], "format": "uuid", "description": "归属用户；旧数据回填为 created_by（NULL → admin）。" },
+                        "visibility": { "$ref": "#/components/schemas/ImageVisibility" },
+                        "source_kind": { "type": ["string", "null"], "description": "来源类型，如 vm_export。" },
+                        "source_room_id": { "type": ["string", "null"], "format": "uuid" },
+                        "source_machine_serial": { "type": ["string", "null"] },
+                        "source_vm_name": { "type": ["string", "null"] },
+                        "description": { "type": ["string", "null"] },
+                        "deleted_at": { "type": ["string", "null"], "format": "date-time" },
                         "created_at": { "type": "string", "format": "date-time" },
                         "updated_at": { "type": "string", "format": "date-time" }
                     }
                 },
+                "ImageArtifactView": {
+                    "allOf": [
+                        { "$ref": "#/components/schemas/ImageArtifact" },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "owner_name": { "type": ["string", "null"], "description": "归属用户展示名。" },
+                                "namespace_slug": { "type": "string", "description": "归属命名空间 slug（public / 个人 slug）。" },
+                                "readiness": { "type": "string", "enum": ["building", "uploaded", "verified", "ready", "unavailable"], "description": "契约 §1 的分层就绪状态：draft→building、manifest_ready/uploaded→uploaded、verified→verified、published→ready、deprecated/revoked→unavailable。" }
+                            }
+                        }
+                    ]
+                },
                 "ImagePage": {
                     "type": "object",
                     "properties": {
-                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/ImageArtifact" } },
+                        "items": { "type": "array", "items": { "$ref": "#/components/schemas/ImageArtifactView" } },
                         "total": { "type": "integer" },
                         "page": { "type": "integer" },
                         "page_size": { "type": "integer" }
@@ -1013,7 +1037,7 @@ pub fn spec() -> Value {
                 },
                 "ImageDetail": {
                     "allOf": [
-                        { "$ref": "#/components/schemas/ImageArtifact" },
+                        { "$ref": "#/components/schemas/ImageArtifactView" },
                         {
                             "type": "object",
                             "properties": {
@@ -1115,7 +1139,7 @@ pub fn spec() -> Value {
                     "type": "object",
                     "required": ["artifact", "verification"],
                     "properties": {
-                        "artifact": { "$ref": "#/components/schemas/ImageArtifact" },
+                        "artifact": { "$ref": "#/components/schemas/ImageArtifactView" },
                         "verification": { "$ref": "#/components/schemas/ImageVerification" }
                     }
                 },
@@ -3058,9 +3082,11 @@ pub fn spec() -> Value {
             "/admin/images": {
                 "get": {
                     "tags": ["Images"],
-                    "summary": "镜像分页（kind / status / name）",
+                    "summary": "镜像分页（scope=mine|public|all + kind / status / name）",
+                    "description": "teacher 缺省「我的 + 公共」，管理员缺省全部；scope=all 仅管理员。响应带 owner/namespace/visibility/readiness。",
                     "security": secured(),
                     "parameters": [
+                        { "name": "scope", "in": "query", "schema": { "$ref": "#/components/schemas/ImageScope" }, "description": "mine=我的，public=公共，all=全部（仅管理员）；教师缺省=我的+公共，管理员缺省=全部。" },
                         { "name": "kind", "in": "query", "schema": { "$ref": "#/components/schemas/ImageKind" } },
                         { "name": "status", "in": "query", "schema": { "$ref": "#/components/schemas/ArtifactStatus" } },
                         { "name": "name", "in": "query", "schema": { "type": "string" }, "description": "按名称模糊匹配。" },
@@ -3069,13 +3095,13 @@ pub fn spec() -> Value {
                     ],
                     "responses": {
                         "200": { "description": "镜像分页", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImagePage" } } } },
-                        "400": error_response("kind / status / 分页参数不合法"),
-                        "403": error_response("缺少 image:read")
+                        "400": error_response("scope / kind / status / 分页参数不合法"),
+                        "403": error_response("缺少 image:read 或非管理员使用 scope=all")
                     }
                 },
                 "post": {
                     "tags": ["Images"],
-                    "summary": "创建镜像制品（uploaded；name+version+platform 唯一）",
+                    "summary": "创建镜像制品（uploaded；同命名空间 name+version+platform 唯一）",
                     "security": secured(),
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateImageRequest" } } } },
                     "responses": {
@@ -3093,8 +3119,8 @@ pub fn spec() -> Value {
                     "security": secured(),
                     "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
                     "responses": {
-                        "200": { "description": "镜像详情", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImageDetail" } } } },
-                        "403": error_response("缺少 image:read"),
+                        "200": { "description": "镜像详情（含 owner/namespace/readiness + 分片 + 验证报告 + 通道）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImageDetail" } } } },
+                        "403": error_response("缺少 image:read，或查看他人私有镜像"),
                         "404": error_response("镜像不存在")
                     }
                 }
@@ -3138,7 +3164,7 @@ pub fn spec() -> Value {
                     "responses": {
                         "200": { "description": "验证结果（artifact.status = verified，失败时回到 manifest_ready 且 report.ok=false）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VerifyReply" } } } },
                         "400": error_response("compression 非 none"),
-                        "403": error_response("缺少 image:manage"),
+                        "403": error_response("缺少 image:manage，或非 owner/管理员"),
                         "404": error_response("镜像不存在"),
                         "409": error_response("镜像尚未提交 manifest 或没有分片"),
                         "503": error_response("未配置 S3 或对象存储不可用")
@@ -3153,9 +3179,9 @@ pub fn spec() -> Value {
                     "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PublishImageRequest" } } } },
                     "responses": {
-                        "200": { "description": "已发布", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImageArtifact" } } } },
+                        "200": { "description": "已发布（含 readiness=ready）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImageArtifactView" } } } },
                         "400": error_response("channel 不合法"),
-                        "403": error_response("缺少 image:manage"),
+                        "403": error_response("缺少 image:manage，或非 owner/管理员"),
                         "404": error_response("镜像不存在"),
                         "409": error_response("镜像不是 verified 状态")
                     }
@@ -3174,7 +3200,7 @@ pub fn spec() -> Value {
                     "responses": {
                         "200": { "description": "分配结果", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ImageAssignment" } } } },
                         "400": error_response("channel 不合法"),
-                        "403": error_response("缺少 image:manage"),
+                        "403": error_response("缺少 image:manage，或非 owner/管理员"),
                         "404": error_response("镜像或房间不存在"),
                         "409": error_response("镜像未发布")
                     }
@@ -4582,5 +4608,48 @@ mod tests {
     async fn docs_ui_points_to_the_spec() {
         let Html(html) = ui().await;
         assert!(html.contains("/api-docs/openapi.json"));
+    }
+
+    #[tokio::test]
+    async fn image_ownership_and_readiness_are_documented() {
+        let Json(spec) = json_spec().await;
+        let schemas = spec["components"]["schemas"].as_object().expect("schemas");
+
+        let status = schemas["ArtifactStatus"]["enum"]
+            .as_array()
+            .expect("ArtifactStatus enum");
+        assert!(status.iter().any(|value| value == "draft"));
+        assert!(status.iter().any(|value| value == "published"));
+
+        let readiness = schemas["ImageArtifactView"]["allOf"][1]["properties"]["readiness"]["enum"]
+            .as_array()
+            .expect("readiness enum");
+        for value in ["building", "uploaded", "verified", "ready", "unavailable"] {
+            assert!(
+                readiness.iter().any(|item| item == value),
+                "缺少 readiness：{value}"
+            );
+        }
+
+        let artifact = &schemas["ImageArtifactView"]["allOf"][0]["$ref"];
+        assert_eq!(artifact, "#/components/schemas/ImageArtifact");
+
+        let scope = schemas["ImageScope"]["enum"]
+            .as_array()
+            .expect("ImageScope");
+        for value in ["mine", "public", "all"] {
+            assert!(
+                scope.iter().any(|item| item == value),
+                "缺少 scope：{value}"
+            );
+        }
+
+        let params = spec["paths"]["/admin/images"]["get"]["parameters"]
+            .as_array()
+            .expect("image list parameters");
+        assert!(
+            params.iter().any(|param| param["name"] == "scope"),
+            "GET /admin/images 缺少 scope 参数"
+        );
     }
 }

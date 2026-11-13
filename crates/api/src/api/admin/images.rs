@@ -22,12 +22,14 @@ use crate::{
     auth::authorization,
     domain::{
         models::Page,
-        rbac::permissions,
+        rbac::{is_admin as role_is_admin, permissions},
         storage::{
-            ArtifactStatus, Compression, ImageArtifact, ImageAssignment, ImageChannel,
-            ImageChannelRow, ImageChunk, ImageFilter, ImageFormat, ImageKind, ImageVerification,
-            Manifest, ManifestChunk, ManifestRuntime, NewImage, validate_image_name,
-            validate_image_version, validate_manifest, validate_platform, validate_sha256_hex,
+            ArtifactStatus, Compression, ImageArtifact, ImageArtifactView, ImageAssignment,
+            ImageChannel, ImageChannelRow, ImageChunk, ImageEventActorKind, ImageFilter,
+            ImageFormat, ImageKind, ImageScope, ImageVerification, ImageVisibility, Manifest,
+            ManifestChunk, ManifestRuntime, NewImage, NewImageEvent, can_manage_image,
+            can_read_image, validate_image_name, validate_image_version, validate_manifest,
+            validate_platform, validate_sha256_hex,
         },
         validation,
     },
@@ -48,6 +50,10 @@ pub struct ImageQuery {
     pub status: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// 可见范围：`mine` / `public` / `all`（`all` 仅管理员）。
+    /// 缺省 = 契约默认「我的 + 公共」。
+    #[serde(default)]
+    pub scope: Option<String>,
     #[serde(default)]
     pub page: Option<i64>,
     #[serde(default)]
@@ -140,11 +146,11 @@ pub struct AssignImageRequest {
     pub channel: Option<String>,
 }
 
-/// 镜像详情：制品字段平铺 + 分片 + 最近一次验证 + 已发布通道。
+/// 镜像详情：制品字段 + 归属/readiness + 分片 + 最近一次验证 + 已发布通道。
 #[derive(Debug, Serialize)]
 pub struct ImageDetail {
     #[serde(flatten)]
-    pub artifact: ImageArtifact,
+    pub artifact: ImageArtifactView,
     pub chunks: Vec<ImageChunk>,
     pub latest_verification: Option<ImageVerification>,
     pub channels: Vec<ImageChannelRow>,
@@ -161,7 +167,7 @@ pub struct SubmitManifestReply {
 /// 验证结果：更新后的产物 + 本次验证记录（`report` 里逐项列出检查）。
 #[derive(Debug, Serialize)]
 pub struct VerifyReply {
-    pub artifact: ImageArtifact,
+    pub artifact: ImageArtifactView,
     pub verification: ImageVerification,
 }
 
@@ -221,7 +227,7 @@ fn parse_status(raw: &str) -> AppResult<ArtifactStatus> {
         .parse::<ArtifactStatus>()
         .map_err(|_| {
             AppError::bad_request(
-                "status 只能是 uploaded / manifest_ready / verifying / verified / published / deprecated / revoked",
+                "status 只能是 draft / uploaded / manifest_ready / verifying / verified / published / deprecated / revoked",
             )
         })
 }
@@ -232,6 +238,79 @@ fn parse_channel(raw: Option<&str>) -> AppResult<ImageChannel> {
         Some(value) => value
             .parse::<ImageChannel>()
             .map_err(|_| AppError::bad_request("channel 只能是 dev / test / prod")),
+    }
+}
+
+/// 列表可见范围：缺省 `None`（= 我的 + 公共）；`all` 由 handler 再校验管理员。
+fn parse_scope(raw: Option<&str>) -> AppResult<Option<ImageScope>> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => value
+            .parse::<ImageScope>()
+            .map(Some)
+            .map_err(|_| AppError::bad_request("scope 只能是 mine / public / all")),
+    }
+}
+
+/// 当前用户是否管理员（契约 §3 的 owner/admin 校验）。
+async fn actor_is_admin(state: &AppState, user_id: Uuid) -> AppResult<bool> {
+    Ok(role_is_admin(&state.users.roles_of(user_id).await?))
+}
+
+/// 变更类接口（verify/publish/deprecate/delete/assign/unassign/manifest）：
+/// **owner 或 admin** 才能操作，否则 403「无权操作他人的镜像」。
+async fn require_image_owner_or_admin(
+    state: &AppState,
+    actor: Uuid,
+    artifact: &ImageArtifact,
+) -> AppResult<()> {
+    let is_admin = actor_is_admin(state, actor).await?;
+    if can_manage_image(artifact, actor, is_admin) {
+        Ok(())
+    } else {
+        Err(AppError::forbidden("无权操作他人的镜像"))
+    }
+}
+
+/// 读取校验：owner / admin / public 可读；别人的私有镜像返回 403。
+async fn require_image_readable(
+    state: &AppState,
+    actor: Uuid,
+    artifact: &ImageArtifact,
+) -> AppResult<()> {
+    let is_admin = actor_is_admin(state, actor).await?;
+    if can_read_image(artifact, actor, is_admin) {
+        Ok(())
+    } else {
+        Err(AppError::forbidden("无权查看他人的私有镜像"))
+    }
+}
+
+/// 写一条镜像审计事件；失败只记日志，不影响主流程。
+async fn record_image_event(
+    state: &AppState,
+    actor: Option<Uuid>,
+    image_id: Uuid,
+    event: &str,
+    payload: Value,
+) {
+    if let Err(error) = state
+        .storage_repo
+        .insert_image_event(&NewImageEvent {
+            image_id,
+            actor_kind: if actor.is_some() {
+                ImageEventActorKind::User
+            } else {
+                ImageEventActorKind::System
+            },
+            actor_user_id: actor,
+            actor_serial: None,
+            event: event.to_owned(),
+            payload,
+        })
+        .await
+    {
+        tracing::warn!(%error, %image_id, event, "写入镜像事件失败（忽略）");
     }
 }
 
@@ -371,17 +450,31 @@ fn check_magic(format: ImageFormat, head: &[u8]) -> Result<(), String> {
     }
 }
 
-/// `GET /images`：按 kind / status / name 分页。
+/// `GET /images`：按 kind / status / name + scope 分页。
+///
+/// 契约 §3：`scope=mine|public|all`（all 仅 admin），缺省「我的 + 公共」；
+/// 响应 elements 增加 owner/namespace/visibility/readiness。
 pub async fn list(
     State(state): State<AppState>,
     AuthUser { id }: AuthUser,
     Query(query): Query<ImageQuery>,
-) -> AppResult<Json<Page<ImageArtifact>>> {
+) -> AppResult<Json<Page<ImageArtifactView>>> {
     authorization::require_permission(&state, id, permissions::IMAGE_READ).await?;
     super::storage::service(&state)?;
 
     let (page, page_size) = validation::page_params(query.page, query.page_size)?;
     let name = validation::normalize_keyword(query.name.as_deref())?;
+    let mut scope = parse_scope(query.scope.as_deref())?;
+    let is_admin = actor_is_admin(&state, id).await?;
+    if scope == Some(ImageScope::All) && !is_admin {
+        return Err(AppError::forbidden(
+            "scope=all 需要管理员权限（教师请使用 scope=mine / public）",
+        ));
+    }
+    // 管理员不传 scope 时保持旧行为（全量）；教师缺省「我的 + 公共」（契约 §3）。
+    if scope.is_none() && is_admin {
+        scope = Some(ImageScope::All);
+    }
     let filter = ImageFilter {
         kind: query
             .kind
@@ -398,6 +491,9 @@ pub async fn list(
             .map(parse_status)
             .transpose()?,
         name: (!name.is_empty()).then_some(name),
+        scope,
+        viewer_user_id: Some(id),
+        viewer_is_admin: is_admin,
     };
 
     Ok(Json(
@@ -409,6 +505,8 @@ pub async fn list(
 }
 
 /// `GET /images/{id}`：详情 + 分片 + 最近验证 + 通道。
+///
+/// 契约 §3：仅 owner / admin / public 可读；别人的私有镜像返回 403。
 pub async fn get(
     State(state): State<AppState>,
     AuthUser { id }: AuthUser,
@@ -422,6 +520,12 @@ pub async fn get(
         .get_image(image_id)
         .await?
         .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    require_image_readable(&state, id, &artifact).await?;
+    let view = state
+        .storage_repo
+        .get_image_view(image_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("镜像不存在"))?;
     let chunks = match artifact.manifest_digest.as_deref() {
         Some(digest) => state.storage_repo.chunks(digest).await?,
         None => Vec::new(),
@@ -430,26 +534,30 @@ pub async fn get(
     let channels = state.storage_repo.channels(image_id).await?;
 
     Ok(Json(ImageDetail {
-        artifact,
+        artifact: view,
         chunks,
         latest_verification,
         channels,
     }))
 }
 
-/// `POST /images`：创建 artifact（`uploaded`），同名同版本同平台唯一（409）。
+/// `POST /images`：创建 artifact（`uploaded`），同命名空间同名同版本同平台唯一（409）。
+///
+/// 契约 §2/§3：归属当前用户 + 个人命名空间，默认可视范围 private
+/// （仅自己可见；发布后仍只对 owner/admin 可见，公共可见需要后续共享能力）。
 pub async fn create(
     State(state): State<AppState>,
     AuthUser { id }: AuthUser,
     ClientIp(ip): ClientIp,
     ApiJson(request): ApiJson<CreateImageRequest>,
-) -> AppResult<(StatusCode, Json<ImageArtifact>)> {
+) -> AppResult<(StatusCode, Json<ImageArtifactView>)> {
     authorization::require_permission(&state, id, permissions::IMAGE_MANAGE).await?;
     super::storage::service(&state)?;
 
     let kind = parse_kind(&request.kind)?;
     let format = parse_format(&request.format)?;
     ensure_kind_format(kind, format)?;
+    let namespace = state.storage_repo.ensure_personal_namespace(id).await?;
     let input = NewImage {
         name: validate_image_name(&request.name)?,
         version: validate_image_version(&request.version)?,
@@ -458,8 +566,26 @@ pub async fn create(
         compression: parse_compression(request.compression.as_deref())?,
         platform: validate_platform(&request.platform)?,
         created_by: Some(id),
+        namespace_id: namespace.id,
+        owner_user_id: Some(id),
+        visibility: ImageVisibility::Private,
+        status: ArtifactStatus::Uploaded,
+        source_kind: None,
+        source_room_id: None,
+        source_machine_serial: None,
+        source_vm_name: None,
+        description: None,
     };
-    let artifact = state.storage_repo.create_image(&input).await?;
+    let artifact = state
+        .storage_repo
+        .create_image(&input)
+        .await
+        .map_err(|error| match error {
+            qe_db::error::DbError::Conflict(_) => {
+                AppError::conflict("image_name_taken：同名同版本同平台的镜像已存在")
+            }
+            other => AppError::from(other),
+        })?;
 
     super::audit::record_or_log(
         &state,
@@ -473,12 +599,26 @@ pub async fn create(
             "kind": artifact.kind,
             "format": artifact.format,
             "platform": artifact.platform,
+            "namespace_slug": namespace.slug,
         }),
         ip.as_deref(),
     )
     .await;
+    record_image_event(
+        &state,
+        Some(id),
+        artifact.id,
+        "create",
+        json!({ "namespace_slug": namespace.slug }),
+    )
+    .await;
 
-    Ok((StatusCode::CREATED, Json(artifact)))
+    let view = state
+        .storage_repo
+        .get_image_view(artifact.id)
+        .await?
+        .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    Ok((StatusCode::CREATED, Json(view)))
 }
 
 /// `POST /images/{id}/manifest`：提交分片清单。
@@ -499,6 +639,7 @@ pub async fn submit_manifest(
         .get_image(image_id)
         .await?
         .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    require_image_owner_or_admin(&state, id, &artifact).await?;
     if matches!(
         artifact.status,
         ArtifactStatus::Published | ArtifactStatus::Deprecated | ArtifactStatus::Revoked
@@ -622,6 +763,7 @@ pub async fn verify(
         .get_image(image_id)
         .await?
         .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    require_image_owner_or_admin(&state, id, &artifact).await?;
     let manifest_digest = artifact
         .manifest_digest
         .clone()
@@ -800,6 +942,11 @@ pub async fn verify(
     )
     .await;
 
+    let artifact = state
+        .storage_repo
+        .get_image_view(image_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("镜像不存在"))?;
     Ok(Json(VerifyReply {
         artifact,
         verification,
@@ -813,7 +960,7 @@ pub async fn publish(
     ClientIp(ip): ClientIp,
     Path(image_id): Path<Uuid>,
     ApiJson(request): ApiJson<PublishImageRequest>,
-) -> AppResult<Json<ImageArtifact>> {
+) -> AppResult<Json<ImageArtifactView>> {
     authorization::require_permission(&state, id, permissions::IMAGE_MANAGE).await?;
     super::storage::service(&state)?;
 
@@ -823,6 +970,7 @@ pub async fn publish(
         .get_image(image_id)
         .await?
         .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    require_image_owner_or_admin(&state, id, &artifact).await?;
     if artifact.status != ArtifactStatus::Verified {
         return Err(AppError::conflict("仅 verified 状态的镜像可以发布"));
     }
@@ -847,7 +995,12 @@ pub async fn publish(
     )
     .await;
 
-    Ok(Json(artifact))
+    let view = state
+        .storage_repo
+        .get_image_view(image_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    Ok(Json(view))
 }
 
 /// `GET /images/{id}/manifest`：manifest JSON + 预签名原始下载地址。
@@ -863,6 +1016,7 @@ pub async fn get_manifest(
         .get_image(image_id)
         .await?
         .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    require_image_readable(&state, id, &artifact).await?;
     let manifest_digest = artifact
         .manifest_digest
         .clone()
@@ -1005,6 +1159,7 @@ pub async fn assign_room(
         .get_image(image_id)
         .await?
         .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    require_image_owner_or_admin(&state, id, &artifact).await?;
     if artifact.status != ArtifactStatus::Published {
         return Err(AppError::conflict(
             "仅 published 状态的镜像可以分配到房间，请先发布通道",
@@ -1049,6 +1204,13 @@ pub async fn unassign_room(
     authorization::require_permission(&state, id, permissions::IMAGE_MANAGE).await?;
     super::storage::service(&state)?;
 
+    let artifact = state
+        .storage_repo
+        .get_image(image_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    require_image_owner_or_admin(&state, id, &artifact).await?;
+
     if !state.storage_repo.unassign_room(image_id, room_id).await? {
         return Err(AppError::not_found("该房间未分配此镜像"));
     }
@@ -1079,7 +1241,7 @@ pub async fn deprecate(
     AuthUser { id }: AuthUser,
     ClientIp(ip): ClientIp,
     Path(image_id): Path<Uuid>,
-) -> AppResult<Json<ImageArtifact>> {
+) -> AppResult<Json<ImageArtifactView>> {
     authorization::require_permission(&state, id, permissions::IMAGE_MANAGE).await?;
 
     let artifact = state
@@ -1087,6 +1249,7 @@ pub async fn deprecate(
         .get_image(image_id)
         .await?
         .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    require_image_owner_or_admin(&state, id, &artifact).await?;
 
     let artifact = match artifact.status {
         ArtifactStatus::Deprecated => artifact,
@@ -1111,7 +1274,12 @@ pub async fn deprecate(
     )
     .await;
 
-    Ok(Json(artifact))
+    let view = state
+        .storage_repo
+        .get_image_view(image_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    Ok(Json(view))
 }
 
 /// `DELETE /images/{id}`：删除镜像（已发布需先下架）。
@@ -1133,6 +1301,7 @@ pub async fn remove(
         .get_image(image_id)
         .await?
         .ok_or_else(|| AppError::not_found("镜像不存在"))?;
+    require_image_owner_or_admin(&state, id, &artifact).await?;
     if artifact.status == ArtifactStatus::Published {
         return Err(AppError::conflict(
             "已发布镜像不能直接删除，请先下架（POST /images/{id}/deprecate）",
@@ -1209,4 +1378,82 @@ pub async fn remove(
     .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_parsing_matches_contract() {
+        assert_eq!(parse_scope(None).unwrap(), None);
+        assert_eq!(parse_scope(Some("")).unwrap(), None);
+        assert_eq!(parse_scope(Some(" mine ")).unwrap(), Some(ImageScope::Mine));
+        assert_eq!(
+            parse_scope(Some("public")).unwrap(),
+            Some(ImageScope::Public)
+        );
+        assert_eq!(parse_scope(Some("all")).unwrap(), Some(ImageScope::All));
+        assert!(matches!(
+            parse_scope(Some("shared")),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn status_parsing_accepts_draft_and_legacy_values() {
+        assert_eq!(parse_status("draft").unwrap(), ArtifactStatus::Draft);
+        for raw in [
+            "uploaded",
+            "manifest_ready",
+            "manifest-ready",
+            "verifying",
+            "verified",
+            "published",
+            "deprecated",
+            "revoked",
+        ] {
+            assert!(parse_status(raw).is_ok(), "{raw} 应被接受");
+        }
+        assert!(matches!(
+            parse_status("bogus"),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn readiness_is_exposed_on_the_view_payload() {
+        // 详情/列表用 ImageArtifactView 平铺输出 readiness，序列化必须带该字段。
+        let now = Utc::now();
+        let artifact = ImageArtifact {
+            id: Uuid::new_v4(),
+            name: "lab-base".to_owned(),
+            version: "1.0.0".to_owned(),
+            kind: ImageKind::VmDisk,
+            format: ImageFormat::Qcow2,
+            compression: Compression::None,
+            platform: "linux/amd64".to_owned(),
+            manifest_digest: None,
+            total_size: 0,
+            status: ArtifactStatus::Draft,
+            created_by: Some(Uuid::new_v4()),
+            namespace_id: Uuid::new_v4(),
+            owner_user_id: Some(Uuid::new_v4()),
+            visibility: ImageVisibility::Private,
+            source_kind: Some("vm_export".to_owned()),
+            source_room_id: None,
+            source_machine_serial: Some("serial-1".to_owned()),
+            source_vm_name: Some("vm-1".to_owned()),
+            description: None,
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let view = ImageArtifactView::new(artifact, Some("李老师".to_owned()), "li");
+        let value = serde_json::to_value(&view).unwrap();
+        assert_eq!(value["readiness"], serde_json::json!("building"));
+        assert_eq!(value["owner_name"], serde_json::json!("李老师"));
+        assert_eq!(value["namespace_slug"], serde_json::json!("li"));
+        assert_eq!(value["visibility"], serde_json::json!("private"));
+    }
 }

@@ -19,7 +19,10 @@ use tokio::net::UdpSocket;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use qe_db::machine::{MachineSnapshotMeta, MachineSnapshotRecord, MachineSummary};
+use qe_db::{
+    machine::{MachineSnapshotMeta, MachineSnapshotRecord, MachineSummary},
+    storage::BUILD_REQUEST_TTL_MINUTES,
+};
 
 use crate::{
     api::extractors::{ApiJson, AuthUser, ClientIp},
@@ -27,7 +30,11 @@ use crate::{
     domain::{
         models::Page,
         rbac::permissions,
-        storage::{validate_image_name, validate_image_version, validate_platform},
+        storage::{
+            ArtifactStatus, Compression, ImageEventActorKind, ImageFormat, ImageKind,
+            ImageVisibility, NewImage, NewImageBuildRequest, NewImageEvent, name_conflict,
+            validate_image_name, validate_image_version, validate_platform,
+        },
         validation, wol,
     },
     error::{AppError, AppResult},
@@ -803,6 +810,12 @@ fn build_create_args(
 fn build_image_make_args(
     args: &serde_json::Map<String, serde_json::Value>,
 ) -> AppResult<serde_json::Map<String, serde_json::Value>> {
+    // 契约 §4.1：build_request_id 只能由服务端注入，客户端传即 400。
+    if args.contains_key("build_request_id") {
+        return Err(bad_arg(
+            "build_request_id 由服务端注入，客户端不得传入（请去掉该参数后重试）",
+        ));
+    }
     reject_unknown_args(
         args,
         &[
@@ -827,10 +840,13 @@ fn build_image_make_args(
     let version = validate_image_version(&version).map_err(|error| bad_arg(error.to_string()))?;
     out.insert("version".to_owned(), serde_json::json!(version));
 
-    if let Some(platform) = expect_string(args, "platform")?.filter(|value| !value.is_empty()) {
-        let platform = validate_platform(&platform).map_err(|error| bad_arg(error.to_string()))?;
-        out.insert("platform".to_owned(), serde_json::json!(platform));
-    }
+    // 平台缺省 linux/amd64（与 agent 侧默认一致），并显式下发，保证控制面
+    // 预创建 draft 的 platform 与设备 register 的快照完全一致。
+    let platform = expect_string(args, "platform")?
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "linux/amd64".to_owned());
+    let platform = validate_platform(&platform).map_err(|error| bad_arg(error.to_string()))?;
+    out.insert("platform".to_owned(), serde_json::json!(platform));
     if let Some(base_volume) = expect_string(args, "base_volume")?.filter(|value| !value.is_empty())
     {
         let base_volume = validate_volume_name(&base_volume)?;
@@ -1203,6 +1219,188 @@ async fn enqueue_vm_downlink(
     }
 }
 
+// ---- image.make 制作工单（契约 docs/image-build-lifecycle.md §4.1：身份桥） ----
+
+/// 预创建的 draft 镜像 + 制作工单。
+#[derive(Debug, Clone, Copy)]
+struct ImageMakeDraft {
+    image_id: Uuid,
+}
+
+/// 服务端在入队前预创建 draft artifact + build_request，并把工单 id 注入下行 args。
+///
+/// 顺序（契约 §4.1）：解析 actor 个人命名空间 → 同名预检（非 deprecated/revoked）→
+/// 插入 draft artifact → 插入 pending 工单（30min 有效）。调用方在入队失败时用
+/// [`cleanup_image_make_draft`] 回滚 draft。
+async fn prepare_image_make(
+    state: &AppState,
+    actor: Uuid,
+    device: &MachineSummary,
+    command: &mut ValidatedVmCommand,
+) -> AppResult<ImageMakeDraft> {
+    let args = &command.args;
+    let vm_name = args
+        .get("vm_name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| bad_arg("缺少 vm_name"))?
+        .to_owned();
+    let name = args
+        .get("name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| bad_arg("缺少镜像名 name"))?
+        .to_owned();
+    let version = args
+        .get("version")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| bad_arg("缺少镜像版本 version"))?
+        .to_owned();
+    let platform = args
+        .get("platform")
+        .and_then(|value| value.as_str())
+        .unwrap_or("linux/amd64")
+        .to_owned();
+    let description = args
+        .get("description")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned);
+
+    // 1. actor 的个人命名空间。
+    let namespace = state.storage_repo.ensure_personal_namespace(actor).await?;
+
+    // 2. 同名预检：同命名空间 + 同名同版本同平台，状态非 deprecated/revoked → 409。
+    if let Some(existing) = state
+        .storage_repo
+        .find_name_conflict(namespace.id, &name, &version, &platform)
+        .await?
+        && name_conflict(Some(&existing))
+    {
+        return Err(AppError::conflict(format!(
+            "image_name_taken：@{} 下 {}:{}（{}）已存在，请更换版本；已上传的内容不会重复上传",
+            namespace.slug, name, version, platform
+        )));
+    }
+
+    // 3. 插入 draft artifact（owner=actor、personal namespace、source_*）。
+    let artifact = state
+        .storage_repo
+        .create_image(&NewImage {
+            name: name.clone(),
+            version: version.clone(),
+            kind: ImageKind::VmDisk,
+            format: ImageFormat::Qcow2,
+            compression: Compression::None,
+            platform: platform.clone(),
+            created_by: Some(actor),
+            namespace_id: namespace.id,
+            owner_user_id: Some(actor),
+            visibility: ImageVisibility::Private,
+            status: ArtifactStatus::Draft,
+            source_kind: Some("vm_export".to_owned()),
+            source_room_id: device.room_id,
+            source_machine_serial: Some(device.serial.clone()),
+            source_vm_name: Some(vm_name.clone()),
+            description,
+        })
+        .await
+        .map_err(|error| match error {
+            qe_db::error::DbError::Conflict(_) => AppError::conflict(format!(
+                "image_name_taken：@{} 下 {}:{}（{}）已存在，请更换版本",
+                namespace.slug, name, version, platform
+            )),
+            other => AppError::from(other),
+        })?;
+
+    // 4. 插入 pending 制作工单（过期时间 now()+30min）。失败回滚 draft。
+    let build_request = match state
+        .storage_repo
+        .create_build_request(&NewImageBuildRequest {
+            image_id: artifact.id,
+            machine_serial: device.serial.clone(),
+            room_id: device.room_id,
+            name: name.clone(),
+            version: version.clone(),
+            platform: platform.clone(),
+            expires_at: Utc::now() + chrono::Duration::minutes(BUILD_REQUEST_TTL_MINUTES),
+            created_by: Some(actor),
+        })
+        .await
+    {
+        Ok(build_request) => build_request,
+        Err(error) => {
+            cleanup_image_make_draft(state, artifact.id).await;
+            return Err(AppError::from(error));
+        }
+    };
+
+    // 5. 由服务端注入 build_request_id（客户端传会被 400 拒绝）。
+    command.args.insert(
+        "build_request_id".to_owned(),
+        serde_json::json!(build_request.id),
+    );
+
+    let event = NewImageEvent {
+        image_id: artifact.id,
+        actor_kind: ImageEventActorKind::User,
+        actor_user_id: Some(actor),
+        actor_serial: None,
+        event: "build.requested".to_owned(),
+        payload: serde_json::json!({
+            "build_request_id": build_request.id,
+            "machine_serial": device.serial,
+            "room_id": device.room_id,
+            "vm_name": vm_name,
+            "name": name,
+            "version": version,
+            "platform": platform,
+            "expires_at": build_request.expires_at,
+        }),
+    };
+    if let Err(error) = state.storage_repo.insert_image_event(&event).await {
+        tracing::warn!(%error, image_id = %artifact.id, "写入 build.requested 事件失败（忽略）");
+    }
+
+    Ok(ImageMakeDraft {
+        image_id: artifact.id,
+    })
+}
+
+/// 入队失败回滚 draft artifact（工单随 FK 级联删除）。
+async fn cleanup_image_make_draft(state: &AppState, image_id: Uuid) {
+    if let Err(error) = state.storage_repo.delete_image_cascade(image_id).await {
+        tracing::warn!(%error, %image_id, "回滚 image.make draft 镜像失败（需人工清理）");
+    }
+}
+
+/// `image.make` 结果补齐：把服务端注入的 `build_request_id` / draft `image_id`
+/// 合并进 agent 回传的 data（旧 agent 不回显这两个字段也能拿到）。
+fn enrich_image_make_result(
+    data: Option<serde_json::Value>,
+    build_request_id: Option<Uuid>,
+    image_id: Option<Uuid>,
+) -> Option<serde_json::Value> {
+    let data = data?;
+    let Some(build_request_id) = build_request_id else {
+        return Some(data);
+    };
+    let mut object = match data {
+        serde_json::Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("agent_result".to_owned(), other);
+            map
+        }
+    };
+    object
+        .entry("build_request_id".to_owned())
+        .or_insert_with(|| serde_json::json!(build_request_id));
+    if let Some(image_id) = image_id {
+        object
+            .entry("image_id".to_owned())
+            .or_insert_with(|| serde_json::json!(image_id));
+    }
+    Some(serde_json::Value::Object(object))
+}
+
 /// 入队失败时清掉刚插入的 pending 行，避免留下永远不会被处理的命令。
 async fn cleanup_pending_vm_command(state: &AppState, request_id: Uuid) {
     if let Err(error) = sqlx::query(
@@ -1381,28 +1579,49 @@ pub async fn create_vm_command(
     if serial.is_empty() {
         return Err(AppError::bad_request("serial 不能为空"));
     }
-    let command = validate_vm_command(request)?;
+    let mut command = validate_vm_command(request)?;
     let device = state
         .machines
         .summary(serial)
         .await?
         .ok_or_else(|| AppError::not_found("机器不存在"))?;
 
+    // image.make：契约 §4.1 的身份桥 —— 入队前预创建 draft 镜像 + 制作工单，
+    // 并把 build_request_id 由服务端注入下行 args。需要 vm:control + image:manage。
+    let mut image_draft: Option<ImageMakeDraft> = None;
+    if command.op == "image.make" {
+        authorization::require_permission(&state, id, permissions::IMAGE_MANAGE).await?;
+        image_draft = Some(prepare_image_make(&state, id, &device, &mut command).await?);
+    }
+
     let request_id = Uuid::new_v4();
     let downlink = vm_command_downlink_payload(request_id, &command);
-    insert_pending_vm_command(&state, request_id, &device.serial, &downlink).await?;
+    if let Err(error) =
+        insert_pending_vm_command(&state, request_id, &device.serial, &downlink).await
+    {
+        if let Some(draft) = image_draft {
+            cleanup_image_make_draft(&state, draft.image_id).await;
+        }
+        return Err(error);
+    }
 
     let downlink_text = downlink.to_string();
     match enqueue_vm_downlink(&state, &device.device_slot, &downlink_text).await {
         Ok(Some(_)) => Ok((StatusCode::ACCEPTED, Json(VmCommandAccepted { request_id }))),
         Ok(None) => {
             cleanup_pending_vm_command(&state, request_id).await;
+            if let Some(draft) = image_draft {
+                cleanup_image_make_draft(&state, draft.image_id).await;
+            }
             Err(AppError::service_unavailable(
                 "设备当前没有存活证书，VM 命令未下发",
             ))
         }
         Err(error) => {
             cleanup_pending_vm_command(&state, request_id).await;
+            if let Some(draft) = image_draft {
+                cleanup_image_make_draft(&state, draft.image_id).await;
+            }
             Err(error)
         }
     }
@@ -1582,13 +1801,14 @@ pub async fn get_vm_command(
 
     let mut status = row.status;
     let mut updated_at = row.updated_at;
-    // image.make 要做「导出 qcow2 + 分片上传」，耗时远高于普通命令（设计 §8.5 超时 600s）。
-    let pending_timeout_secs = match row
+    let op = row
         .payload
         .as_ref()
         .and_then(|payload| payload.get("op"))
         .and_then(|op| op.as_str())
-    {
+        .map(str::to_owned);
+    // image.make 要做「导出 qcow2 + 分片上传」，耗时远高于普通命令（设计 §8.5 超时 600s）。
+    let pending_timeout_secs = match op.as_deref() {
         Some("image.make") => VM_COMMAND_IMAGE_MAKE_TIMEOUT_SECS,
         _ => VM_COMMAND_PENDING_TIMEOUT_SECS,
     };
@@ -1608,10 +1828,35 @@ pub async fn get_vm_command(
         updated_at = Utc::now();
     }
 
+    // image.make 结果透传 image_id / build_request_id / manifest_digest：
+    // manifest_digest 由 agent 回传；build_request_id / image_id 服务端从下行 payload 补齐。
+    let data = if op.as_deref() == Some("image.make") {
+        let build_request_id = row
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("args"))
+            .and_then(|args| args.get("build_request_id"))
+            .and_then(|value| value.as_str())
+            .and_then(|raw| raw.parse::<Uuid>().ok());
+        let image_id = match build_request_id {
+            Some(build_request_id) => state
+                .storage_repo
+                .get_build_request(build_request_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|build| build.image_id),
+            None => None,
+        };
+        enrich_image_make_result(row.result.clone(), build_request_id, image_id)
+    } else {
+        row.result
+    };
+
     Ok(Json(VmCommandReply {
         request_id: row.request_id,
         status,
-        data: row.result,
+        data,
         error: row.error,
         created_at: row.created_at,
         updated_at,
@@ -2209,6 +2454,71 @@ mod tests {
         assert!(
             validate_container_command(request_args("start", serde_json::json!({"name":"../x"})))
                 .is_err()
+        );
+    }
+
+    // ---- 2026-11 image.make 制作工单 ----
+
+    #[test]
+    fn image_make_args_default_platform_and_reject_client_build_request() {
+        // 缺省 platform 由服务端补 linux/amd64（与 agent 默认一致）。
+        let command = validate_vm_command(request_args(
+            "image.make",
+            serde_json::json!({"vm_name":"lab-1","name":"lab-base","version":"1.0.0"}),
+        ))
+        .unwrap();
+        assert_eq!(command.args["platform"], serde_json::json!("linux/amd64"));
+
+        // build_request_id 只能由服务端注入：客户端传 → 400。
+        let error = validate_vm_command(request_args(
+            "image.make",
+            serde_json::json!({
+                "vm_name":"lab-1","name":"lab-base","version":"1.0.0",
+                "build_request_id":"0b6f9d4e-4a41-4b6e-9d0b-4f8b0f3c2a11"
+            }),
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(error, AppError::BadRequest(_)),
+            "应返回 400：{error:?}"
+        );
+    }
+
+    #[test]
+    fn image_make_result_is_enriched_with_build_request_id() {
+        let build_request_id = Uuid::new_v4();
+        let image_id = Uuid::new_v4();
+        let data = serde_json::json!({
+            "manifest_digest": "ab".repeat(32),
+            "image_id": image_id,
+        });
+        let enriched =
+            enrich_image_make_result(Some(data.clone()), Some(build_request_id), Some(image_id))
+                .unwrap();
+        assert_eq!(
+            enriched["build_request_id"],
+            serde_json::json!(build_request_id)
+        );
+        assert_eq!(enriched["image_id"], serde_json::json!(image_id));
+        assert_eq!(enriched["manifest_digest"], data["manifest_digest"]);
+
+        // 老 agent 不回传 image_id 时用服务端工单补。
+        let enriched = enrich_image_make_result(
+            Some(serde_json::json!({"manifest_digest": "ab".repeat(32)})),
+            Some(build_request_id),
+            Some(image_id),
+        )
+        .unwrap();
+        assert_eq!(enriched["image_id"], serde_json::json!(image_id));
+
+        // 非 image.make / 没有工单：原样返回。
+        assert_eq!(
+            enrich_image_make_result(Some(data.clone()), None, None),
+            Some(data)
+        );
+        assert_eq!(
+            enrich_image_make_result(None, Some(build_request_id), None),
+            None
         );
     }
 }

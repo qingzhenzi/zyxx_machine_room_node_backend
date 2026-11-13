@@ -18,9 +18,12 @@ use uuid::Uuid;
 use qe_domain::{
     models::Page,
     storage::{
-        ArtifactStatus, Collection, CollectionStatus, Compression, ImageArtifact, ImageAssignment,
-        ImageChannel, ImageChannelRow, ImageChunk, ImageFilter, ImageFormat, ImageKind,
-        ImageVerification, NewImage, StorageObject, Transfer, TransferDirection, TransferStatus,
+        ArtifactStatus, Collection, CollectionStatus, Compression, ImageArtifact,
+        ImageArtifactView, ImageAssignment, ImageBuildRequest, ImageBuildState, ImageChannel,
+        ImageChannelRow, ImageChunk, ImageEventActorKind, ImageFilter, ImageFormat, ImageKind,
+        ImageNamespace, ImageNamespaceKind, ImageScope, ImageVerification, ImageVisibility,
+        NewImage, NewImageBuildRequest, NewImageEvent, StorageObject, Transfer, TransferDirection,
+        TransferStatus,
     },
 };
 
@@ -86,6 +89,7 @@ fn compression_from_str(raw: &str) -> Compression {
 
 fn artifact_status_str(status: ArtifactStatus) -> &'static str {
     match status {
+        ArtifactStatus::Draft => "draft",
         ArtifactStatus::Uploaded => "uploaded",
         ArtifactStatus::ManifestReady => "manifest_ready",
         ArtifactStatus::Verifying => "verifying",
@@ -98,6 +102,7 @@ fn artifact_status_str(status: ArtifactStatus) -> &'static str {
 
 fn artifact_status_from_str(raw: &str) -> ArtifactStatus {
     match raw {
+        "draft" => ArtifactStatus::Draft,
         "manifest_ready" => ArtifactStatus::ManifestReady,
         "verifying" => ArtifactStatus::Verifying,
         "verified" => ArtifactStatus::Verified,
@@ -106,6 +111,36 @@ fn artifact_status_from_str(raw: &str) -> ArtifactStatus {
         "revoked" => ArtifactStatus::Revoked,
         _ => ArtifactStatus::Uploaded,
     }
+}
+
+fn visibility_str(visibility: ImageVisibility) -> &'static str {
+    visibility.as_str()
+}
+
+fn visibility_from_str(raw: &str) -> ImageVisibility {
+    raw.parse().unwrap_or(ImageVisibility::Public)
+}
+
+#[cfg(test)]
+fn namespace_kind_str(kind: ImageNamespaceKind) -> &'static str {
+    kind.as_str()
+}
+
+fn namespace_kind_from_str(raw: &str) -> ImageNamespaceKind {
+    raw.parse().unwrap_or(ImageNamespaceKind::Personal)
+}
+
+#[cfg(test)]
+fn build_state_str(state: ImageBuildState) -> &'static str {
+    state.as_str()
+}
+
+fn build_state_from_str(raw: &str) -> ImageBuildState {
+    raw.parse().unwrap_or(ImageBuildState::Pending)
+}
+
+fn event_actor_kind_str(kind: ImageEventActorKind) -> &'static str {
+    kind.as_str()
 }
 
 #[cfg(test)]
@@ -221,6 +256,15 @@ struct ImageArtifactRow {
     total_size: i64,
     status: String,
     created_by: Option<Uuid>,
+    namespace_id: Uuid,
+    owner_user_id: Option<Uuid>,
+    visibility: String,
+    source_kind: Option<String>,
+    source_room_id: Option<Uuid>,
+    source_machine_serial: Option<String>,
+    source_vm_name: Option<String>,
+    description: Option<String>,
+    deleted_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -239,8 +283,94 @@ impl From<ImageArtifactRow> for ImageArtifact {
             total_size: row.total_size,
             status: artifact_status_from_str(&row.status),
             created_by: row.created_by,
+            namespace_id: row.namespace_id,
+            owner_user_id: row.owner_user_id,
+            visibility: visibility_from_str(&row.visibility),
+            source_kind: row.source_kind,
+            source_room_id: row.source_room_id,
+            source_machine_serial: row.source_machine_serial,
+            source_vm_name: row.source_vm_name,
+            description: row.description,
+            deleted_at: row.deleted_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
+        }
+    }
+}
+
+/// `image_artifacts` 左联 `image_namespaces` / `users` 的列表行。
+#[derive(Debug, Clone, FromRow)]
+struct ImageArtifactViewRow {
+    #[sqlx(flatten)]
+    artifact: ImageArtifactRow,
+    owner_name: Option<String>,
+    namespace_slug: Option<String>,
+}
+
+impl From<ImageArtifactViewRow> for ImageArtifactView {
+    fn from(row: ImageArtifactViewRow) -> Self {
+        ImageArtifactView::new(
+            ImageArtifact::from(row.artifact),
+            row.owner_name,
+            row.namespace_slug.unwrap_or_else(|| "public".to_owned()),
+        )
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct ImageNamespaceRow {
+    id: Uuid,
+    kind: String,
+    owner_user_id: Option<Uuid>,
+    slug: String,
+    display_name: String,
+    created_at: DateTime<Utc>,
+}
+
+impl From<ImageNamespaceRow> for ImageNamespace {
+    fn from(row: ImageNamespaceRow) -> Self {
+        Self {
+            id: row.id,
+            kind: namespace_kind_from_str(&row.kind),
+            owner_user_id: row.owner_user_id,
+            slug: row.slug,
+            display_name: row.display_name,
+            created_at: row.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct ImageBuildRequestRow {
+    id: Uuid,
+    image_id: Uuid,
+    machine_serial: String,
+    room_id: Option<Uuid>,
+    name: String,
+    version: String,
+    platform: String,
+    state: String,
+    expires_at: DateTime<Utc>,
+    created_by: Option<Uuid>,
+    created_at: DateTime<Utc>,
+    consumed_at: Option<DateTime<Utc>>,
+}
+
+impl From<ImageBuildRequestRow> for ImageBuildRequest {
+    fn from(row: ImageBuildRequestRow) -> Self {
+        Self {
+            id: row.id,
+            image_id: row.image_id,
+            machine_serial: row.machine_serial,
+            room_id: row.room_id,
+            name: row.name,
+            version: row.version,
+            platform: row.platform,
+            state: build_state_from_str(&row.state),
+            expires_at: row.expires_at,
+            created_by: row.created_by,
+            created_at: row.created_at,
+            consumed_at: row.consumed_at,
         }
     }
 }
@@ -421,7 +551,40 @@ const STORAGE_OBJECT_COLUMNS: &str =
     "id, bucket, object_key, sha256, size, content_type, created_at";
 
 const IMAGE_COLUMNS: &str = "id, name, version, kind, format, compression, platform,
-     manifest_digest, total_size, status, created_by, created_at, updated_at";
+     manifest_digest, total_size, status, created_by, namespace_id, owner_user_id, visibility,
+     source_kind, source_room_id, source_machine_serial, source_vm_name, description, deleted_at,
+     created_at, updated_at";
+
+const IMAGE_VIEW_COLUMNS: &str = "a.id, a.name, a.version, a.kind, a.format, a.compression,
+     a.platform, a.manifest_digest, a.total_size, a.status, a.created_by, a.namespace_id,
+     a.owner_user_id, a.visibility, a.source_kind, a.source_room_id, a.source_machine_serial,
+     a.source_vm_name, a.description, a.deleted_at, a.created_at, a.updated_at,
+     u.display_name AS owner_name, n.slug AS namespace_slug";
+
+/// 镜像列表基础过滤（参数顺序：kind、status、name、viewer_user_id）。
+const IMAGE_FILTER_BASE: &str = "($1::text IS NULL OR a.kind = $1)
+   AND ($2::text IS NULL OR a.status = $2)
+   AND ($3::text IS NULL OR $3::text = '' OR a.name ILIKE '%' || $3::text || '%')
+   AND a.deleted_at IS NULL";
+
+/// 契约 §3 的可见范围条件（`$4` 为当前用户 id；未传 scope 时默认「我的 + 公共」）。
+///
+/// `scope=all` 非管理员在这里退化为「我的 + 公共」，真正的 403 由 API 层给出；
+/// 这样即使调用方忘了解析权限，也不会泄露别人私有镜像。
+fn scope_condition(scope: Option<ImageScope>, viewer_is_admin: bool) -> &'static str {
+    match scope {
+        None => "(a.owner_user_id = $4 OR a.visibility = 'public')",
+        Some(ImageScope::Mine) => "a.owner_user_id = $4",
+        Some(ImageScope::Public) => "a.visibility = 'public'",
+        Some(ImageScope::All) => {
+            if viewer_is_admin {
+                "TRUE"
+            } else {
+                "(a.owner_user_id = $4 OR a.visibility = 'public')"
+            }
+        }
+    }
+}
 
 const CHUNK_COLUMNS: &str = "manifest_digest, index, object_key, sha256, size, \"offset\"";
 
@@ -437,11 +600,6 @@ const TRANSFER_COLUMNS: &str = "id, direction, room_id, image_id, manifest_diges
 
 const COLLECTION_COLUMNS: &str = "id, area_id, room_id, kind, object_key, sha256,
      size, status, created_at";
-
-/// `list_images` 的过滤条件（参数顺序：kind、status、name）。
-const IMAGE_FILTER: &str = "($1::text IS NULL OR kind = $1)
-   AND ($2::text IS NULL OR status = $2)
-   AND ($3::text IS NULL OR $3::text = '' OR name ILIKE '%' || $3::text || '%')";
 
 // ---------------------------------------------------------------------------
 // 下行投递
@@ -538,11 +696,21 @@ impl StorageRepo {
 
     // ---- 镜像制品 ----------------------------------------------------------
 
+    /// 创建镜像制品。
+    ///
+    /// 归属（namespace/owner/visibility/source_*）与初始状态由调用方给出：
+    /// - 管理台 `POST /images`：status=uploaded，personal namespace，owner=actor；
+    /// - `image.make` 预创建：status=draft，personal namespace，owner=actor，source_*=VM；
+    /// - 设备旧 register 路径：status=uploaded→manifest_ready，public namespace，owner=NULL。
+    ///
+    /// `(namespace_id, name, version, platform)` 冲突时返回 `DbError::Conflict`。
     pub async fn create_image(&self, input: &NewImage) -> DbResult<ImageArtifact> {
         let sql = format!(
             "INSERT INTO image_artifacts
-                (name, version, kind, format, compression, platform, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (name, version, kind, format, compression, platform, status, created_by,
+                 namespace_id, owner_user_id, visibility, source_kind, source_room_id,
+                 source_machine_serial, source_vm_name, description)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
              RETURNING {IMAGE_COLUMNS}"
         );
         let row = sqlx::query_as::<_, ImageArtifactRow>(&sql)
@@ -552,48 +720,67 @@ impl StorageRepo {
             .bind(format_str(input.format))
             .bind(compression_str(input.compression))
             .bind(&input.platform)
+            .bind(artifact_status_str(input.status))
             .bind(input.created_by)
+            .bind(input.namespace_id)
+            .bind(input.owner_user_id)
+            .bind(visibility_str(input.visibility))
+            .bind(input.source_kind.as_deref())
+            .bind(input.source_room_id)
+            .bind(input.source_machine_serial.as_deref())
+            .bind(input.source_vm_name.as_deref())
+            .bind(input.description.as_deref())
             .fetch_one(&self.db)
             .await?;
         Ok(ImageArtifact::from(row))
     }
 
+    /// 按 scope 分页查询镜像（契约 §3）。
+    ///
+    /// `scope=None` 默认「我的 + 公共」；`scope=all` 是否真的返回全部由 API 层先做
+    /// 管理员校验，这里对非管理员退化为「我的 + 公共」以防越权。
     pub async fn list_images(
         &self,
         filter: &ImageFilter,
         page: i64,
         page_size: i64,
-    ) -> DbResult<Page<ImageArtifact>> {
+    ) -> DbResult<Page<ImageArtifactView>> {
         let offset = (page - 1) * page_size;
         let kind = filter.kind.map(kind_str);
         let status = filter.status.map(artifact_status_str);
+        let scope = scope_condition(filter.scope, filter.viewer_is_admin);
+        let where_clause = format!("{IMAGE_FILTER_BASE} AND {scope}");
 
-        let count_sql = format!("SELECT count(*) FROM image_artifacts WHERE {IMAGE_FILTER}");
+        let count_sql = format!("SELECT count(*) FROM image_artifacts a WHERE {where_clause}");
         let total: i64 = sqlx::query_scalar(&count_sql)
             .bind(kind)
             .bind(status)
             .bind(filter.name.as_deref())
+            .bind(filter.viewer_user_id)
             .fetch_one(&self.db)
             .await?;
 
         let sql = format!(
-            "SELECT {IMAGE_COLUMNS}
-             FROM image_artifacts
-             WHERE {IMAGE_FILTER}
-             ORDER BY created_at DESC, id
-             LIMIT $4 OFFSET $5"
+            "SELECT {IMAGE_VIEW_COLUMNS}
+             FROM image_artifacts a
+             JOIN image_namespaces n ON n.id = a.namespace_id
+             LEFT JOIN users u ON u.id = a.owner_user_id
+             WHERE {where_clause}
+             ORDER BY a.created_at DESC, a.id
+             LIMIT $5 OFFSET $6"
         );
-        let rows = sqlx::query_as::<_, ImageArtifactRow>(&sql)
+        let rows = sqlx::query_as::<_, ImageArtifactViewRow>(&sql)
             .bind(kind)
             .bind(status)
             .bind(filter.name.as_deref())
+            .bind(filter.viewer_user_id)
             .bind(page_size)
             .bind(offset)
             .fetch_all(&self.db)
             .await?;
 
         Ok(Page::new(
-            rows.into_iter().map(ImageArtifact::from).collect(),
+            rows.into_iter().map(ImageArtifactView::from).collect(),
             total,
             page,
             page_size,
@@ -604,6 +791,51 @@ impl StorageRepo {
         let sql = format!("SELECT {IMAGE_COLUMNS} FROM image_artifacts WHERE id = $1");
         let row = sqlx::query_as::<_, ImageArtifactRow>(&sql)
             .bind(id)
+            .fetch_optional(&self.db)
+            .await?;
+        Ok(row.map(ImageArtifact::from))
+    }
+
+    /// 详情视图：制品 + `owner_name` / `namespace_slug` / `readiness`。
+    pub async fn get_image_view(&self, id: Uuid) -> DbResult<Option<ImageArtifactView>> {
+        let sql = format!(
+            "SELECT {IMAGE_VIEW_COLUMNS}
+             FROM image_artifacts a
+             JOIN image_namespaces n ON n.id = a.namespace_id
+             LEFT JOIN users u ON u.id = a.owner_user_id
+             WHERE a.id = $1"
+        );
+        let row = sqlx::query_as::<_, ImageArtifactViewRow>(&sql)
+            .bind(id)
+            .fetch_optional(&self.db)
+            .await?;
+        Ok(row.map(ImageArtifactView::from))
+    }
+
+    /// 同命名空间内 `(name, version, platform)` 的有效镜像（`FOR UPDATE` 之外的预检）。
+    ///
+    /// `deprecated` / `revoked` 不占用名字，返回 `None`（契约 §4.1 步骤 2）。
+    pub async fn find_name_conflict(
+        &self,
+        namespace_id: Uuid,
+        name: &str,
+        version: &str,
+        platform: &str,
+    ) -> DbResult<Option<ImageArtifact>> {
+        let sql = format!(
+            "SELECT {IMAGE_COLUMNS}
+             FROM image_artifacts
+             WHERE namespace_id = $1 AND name = $2 AND version = $3 AND platform = $4
+               AND deleted_at IS NULL
+               AND status NOT IN ('deprecated', 'revoked')
+             ORDER BY created_at DESC, id
+             LIMIT 1"
+        );
+        let row = sqlx::query_as::<_, ImageArtifactRow>(&sql)
+            .bind(namespace_id)
+            .bind(name)
+            .bind(version)
+            .bind(platform)
             .fetch_optional(&self.db)
             .await?;
         Ok(row.map(ImageArtifact::from))
@@ -1077,8 +1309,409 @@ impl StorageRepo {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 命名空间 / 制作工单 / 镜像事件（迁移 0036 / 0038，契约 docs/image-build-lifecycle.md）
+// ---------------------------------------------------------------------------
+
+const NAMESPACE_COLUMNS: &str = "id, kind, owner_user_id, slug, display_name, created_at";
+
+const BUILD_COLUMNS: &str = "id, image_id, machine_serial, room_id, name, version, platform,
+     state, expires_at, created_by, created_at, consumed_at";
+
+/// 制作工单默认有效期（契约 §4.1：now()+30min）。
+pub const BUILD_REQUEST_TTL_MINUTES: i64 = 30;
+
+/// 把用户名规范化为命名空间 slug（与迁移 0036 的 SQL 口径一致）：
+/// 小写；只保留 `[a-z0-9._-]`，其它字符折叠为 `-`；去掉首尾 `-` / `.`；
+/// 空值或保留字 `public` 退回 `user`（调用方再追加序号去重）。
+pub fn normalize_namespace_slug(raw: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for character in raw.trim().chars() {
+        let lower = character.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() || matches!(lower, '.' | '_' | '-') {
+            slug.push(lower);
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let slug = slug
+        .trim_matches(|character| matches!(character, '-' | '.'))
+        .to_owned();
+    if slug.is_empty() || slug == "public" {
+        return "user".to_owned();
+    }
+    slug.chars().take(48).collect()
+}
+
+/// 制作工单在 `register` 时的纯校验（便于单测；DB 事务内复用同一逻辑）。
+///
+/// 校验顺序与错误文案对齐契约 §4.2：状态 → 过期 → 设备 serial → 房间 → 参数快照。
+pub fn validate_build_request_for_register(
+    build: &ImageBuildRequest,
+    serial: &str,
+    room_id: Option<Uuid>,
+    name: &str,
+    version: &str,
+    platform: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    match build.state {
+        ImageBuildState::Pending => {}
+        ImageBuildState::Consumed => return Err("制作工单已被使用".to_owned()),
+        ImageBuildState::Failed => return Err("制作工单已失败，请重新发起制作".to_owned()),
+        ImageBuildState::Expired => return Err("制作工单已过期".to_owned()),
+    }
+    if build.expires_at <= now {
+        return Err("制作工单已过期".to_owned());
+    }
+    if build.machine_serial != serial {
+        return Err("制作工单不属于该设备".to_owned());
+    }
+    if let Some(expected_room) = build.room_id
+        && room_id != Some(expected_room)
+    {
+        return Err("制作工单与设备所在房间不一致".to_owned());
+    }
+    if build.name != name || build.version != version || build.platform != platform {
+        return Err(format!(
+            "登记参数与制作工单不一致：工单为 {}:{} ({})",
+            build.name, build.version, build.platform
+        ));
+    }
+    Ok(())
+}
+
+impl StorageRepo {
+    // ---- 命名空间 ----------------------------------------------------------
+
+    /// 取用户个人命名空间；不存在时按 username 规范化创建（并发安全：slug 冲突重试）。
+    pub async fn ensure_personal_namespace(&self, user_id: Uuid) -> DbResult<ImageNamespace> {
+        let sql = format!(
+            "SELECT {NAMESPACE_COLUMNS}
+             FROM image_namespaces
+             WHERE owner_user_id = $1 AND kind = 'personal'
+             ORDER BY created_at, id
+             LIMIT 1"
+        );
+        if let Some(row) = sqlx::query_as::<_, ImageNamespaceRow>(&sql)
+            .bind(user_id)
+            .fetch_optional(&self.db)
+            .await?
+        {
+            return Ok(ImageNamespace::from(row));
+        }
+
+        let user: Option<(String, String)> =
+            sqlx::query_as("SELECT username, display_name FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(&self.db)
+                .await?;
+        let Some((username, display_name)) = user else {
+            return Err(DbError::not_found("用户不存在，无法创建个人命名空间"));
+        };
+
+        let base = normalize_namespace_slug(&username);
+        for attempt in 1..=50_i32 {
+            let slug = if attempt == 1 {
+                base.clone()
+            } else {
+                format!("{base}-{attempt}")
+            };
+            let sql = format!(
+                "INSERT INTO image_namespaces (kind, owner_user_id, slug, display_name)
+                 VALUES ('personal', $1, $2, $3)
+                 ON CONFLICT (slug) DO NOTHING
+                 RETURNING {NAMESPACE_COLUMNS}"
+            );
+            let row = sqlx::query_as::<_, ImageNamespaceRow>(&sql)
+                .bind(user_id)
+                .bind(&slug)
+                .bind(&display_name)
+                .fetch_optional(&self.db)
+                .await?;
+            if let Some(row) = row {
+                return Ok(ImageNamespace::from(row));
+            }
+        }
+        Err(DbError::internal(
+            "无法创建个人命名空间：slug 冲突次数超过上限",
+        ))
+    }
+
+    /// 内置公共命名空间（迁移 0036 已创建；兜底补建）。
+    pub async fn public_namespace(&self) -> DbResult<ImageNamespace> {
+        let sql = format!(
+            "SELECT {NAMESPACE_COLUMNS}
+             FROM image_namespaces
+             WHERE kind = 'public'
+             ORDER BY created_at, id
+             LIMIT 1"
+        );
+        if let Some(row) = sqlx::query_as::<_, ImageNamespaceRow>(&sql)
+            .fetch_optional(&self.db)
+            .await?
+        {
+            return Ok(ImageNamespace::from(row));
+        }
+        let insert = format!(
+            "INSERT INTO image_namespaces (kind, owner_user_id, slug, display_name, created_at)
+             VALUES ('public', NULL, 'public', '公共镜像', '1970-01-01T00:00:00Z')
+             ON CONFLICT (slug) DO NOTHING
+             RETURNING {NAMESPACE_COLUMNS}"
+        );
+        if let Some(row) = sqlx::query_as::<_, ImageNamespaceRow>(&insert)
+            .fetch_optional(&self.db)
+            .await?
+        {
+            return Ok(ImageNamespace::from(row));
+        }
+        let row = sqlx::query_as::<_, ImageNamespaceRow>(&sql)
+            .fetch_optional(&self.db)
+            .await?
+            .ok_or_else(|| DbError::internal("公共命名空间不可用"))?;
+        Ok(ImageNamespace::from(row))
+    }
+
+    pub async fn get_namespace(&self, id: Uuid) -> DbResult<Option<ImageNamespace>> {
+        let sql = format!("SELECT {NAMESPACE_COLUMNS} FROM image_namespaces WHERE id = $1");
+        let row = sqlx::query_as::<_, ImageNamespaceRow>(&sql)
+            .bind(id)
+            .fetch_optional(&self.db)
+            .await?;
+        Ok(row.map(ImageNamespace::from))
+    }
+
+    // ---- 制作工单 ----------------------------------------------------------
+
+    pub async fn create_build_request(
+        &self,
+        input: &NewImageBuildRequest,
+    ) -> DbResult<ImageBuildRequest> {
+        let sql = format!(
+            "INSERT INTO image_build_requests
+                (image_id, machine_serial, room_id, name, version, platform,
+                 state, expires_at, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)
+             RETURNING {BUILD_COLUMNS}"
+        );
+        let row = sqlx::query_as::<_, ImageBuildRequestRow>(&sql)
+            .bind(input.image_id)
+            .bind(&input.machine_serial)
+            .bind(input.room_id)
+            .bind(&input.name)
+            .bind(&input.version)
+            .bind(&input.platform)
+            .bind(input.expires_at)
+            .bind(input.created_by)
+            .fetch_one(&self.db)
+            .await?;
+        Ok(ImageBuildRequest::from(row))
+    }
+
+    pub async fn get_build_request(&self, id: Uuid) -> DbResult<Option<ImageBuildRequest>> {
+        let sql = format!("SELECT {BUILD_COLUMNS} FROM image_build_requests WHERE id = $1");
+        let row = sqlx::query_as::<_, ImageBuildRequestRow>(&sql)
+            .bind(id)
+            .fetch_optional(&self.db)
+            .await?;
+        Ok(row.map(ImageBuildRequest::from))
+    }
+
+    /// 仅返回 `pending` 工单（设备 register 预检用）。
+    pub async fn get_pending_build_request(&self, id: Uuid) -> DbResult<Option<ImageBuildRequest>> {
+        let sql = format!(
+            "SELECT {BUILD_COLUMNS}
+             FROM image_build_requests
+             WHERE id = $1 AND state = 'pending'"
+        );
+        let row = sqlx::query_as::<_, ImageBuildRequestRow>(&sql)
+            .bind(id)
+            .fetch_optional(&self.db)
+            .await?;
+        Ok(row.map(ImageBuildRequest::from))
+    }
+
+    /// 制作失败：`pending → failed`（draft 保留，可重试 register/verify）。
+    pub async fn fail_build_request(&self, id: Uuid, reason: &str) -> DbResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE image_build_requests
+                SET state = 'failed', failed_reason = $2
+              WHERE id = $1 AND state = 'pending'",
+        )
+        .bind(id)
+        .bind(reason)
+        .execute(&self.db)
+        .await?
+        .rows_affected();
+        Ok(updated > 0)
+    }
+
+    /// 过期清理：`pending AND expires_at <= now()` → `expired`（返回处理行数）。
+    pub async fn expire_build_requests(&self) -> DbResult<i64> {
+        let updated = sqlx::query(
+            "UPDATE image_build_requests
+                SET state = 'expired'
+              WHERE state = 'pending' AND expires_at <= now()",
+        )
+        .execute(&self.db)
+        .await?
+        .rows_affected();
+        Ok(updated as i64)
+    }
+
+    /// 设备 register：锁定工单 → 校验 → 把对应 draft 推进到 `manifest_ready`
+    /// → 工单置 `consumed` → 写 `image_events(device)`，全部在同一事务内。
+    ///
+    /// 失败返回 `DbError::Conflict`（工单不存在/过期/参数不一致等），draft 保留。
+    pub async fn consume_build_request_for_register(
+        &self,
+        id: Uuid,
+        serial: &str,
+        room_id: Option<Uuid>,
+        name: &str,
+        version: &str,
+        platform: &str,
+        manifest_digest: &str,
+        total_size: i64,
+    ) -> DbResult<ImageArtifact> {
+        let now = Utc::now();
+        let mut tx = self.db.begin().await?;
+
+        let sql =
+            format!("SELECT {BUILD_COLUMNS} FROM image_build_requests WHERE id = $1 FOR UPDATE");
+        let row = sqlx::query_as::<_, ImageBuildRequestRow>(&sql)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Err(DbError::conflict("制作工单不存在或已被清理"));
+        };
+        let build = ImageBuildRequest::from(row);
+
+        if let Err(reason) = validate_build_request_for_register(
+            &build, serial, room_id, name, version, platform, now,
+        ) {
+            let expired = build.state == ImageBuildState::Pending && build.expires_at <= now;
+            if expired {
+                sqlx::query(
+                    "UPDATE image_build_requests SET state = 'expired'
+                      WHERE id = $1 AND state = 'pending'",
+                )
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+            } else {
+                tx.rollback().await?;
+            }
+            return Err(DbError::conflict(reason));
+        }
+
+        let sql = format!(
+            "UPDATE image_artifacts
+                SET status = $2, manifest_digest = $3, total_size = $4, updated_at = now()
+              WHERE id = $1 AND deleted_at IS NULL AND status IN ('draft', 'manifest_ready')
+              RETURNING {IMAGE_COLUMNS}"
+        );
+        let artifact = sqlx::query_as::<_, ImageArtifactRow>(&sql)
+            .bind(build.image_id)
+            .bind(artifact_status_str(ArtifactStatus::ManifestReady))
+            .bind(manifest_digest)
+            .bind(total_size)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(artifact) = artifact else {
+            tx.rollback().await?;
+            return Err(DbError::conflict(
+                "制作工单对应的镜像草稿不存在或状态已变化",
+            ));
+        };
+
+        let consumed = sqlx::query(
+            "UPDATE image_build_requests
+                SET state = 'consumed', consumed_at = now()
+              WHERE id = $1 AND state = 'pending'",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if consumed == 0 {
+            tx.rollback().await?;
+            return Err(DbError::conflict("制作工单已被使用"));
+        }
+
+        sqlx::query(
+            "INSERT INTO image_events
+                (image_id, actor_kind, actor_serial, event, payload)
+             VALUES ($1, 'device', $2, 'register', $3)",
+        )
+        .bind(build.image_id)
+        .bind(serial)
+        .bind(serde_json::json!({
+            "manifest_digest": manifest_digest,
+            "total_size": total_size,
+            "build_request_id": id,
+            "machine_serial": serial,
+        }))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(ImageArtifact::from(artifact))
+    }
+
+    /// 下发失败回滚：删除 pending 工单 + draft artifact（`image_events` 随 artifact 级联删除）。
+    pub async fn delete_build_draft(&self, image_id: Uuid, build_request_id: Uuid) -> DbResult<()> {
+        let mut tx = self.db.begin().await?;
+        if let Some(artifact) = self.get_image(image_id).await? {
+            if let Some(digest) = artifact.manifest_digest.as_deref() {
+                sqlx::query("DELETE FROM image_chunks WHERE manifest_digest = $1")
+                    .bind(digest)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        sqlx::query("DELETE FROM image_build_requests WHERE id = $1 AND state = 'pending'")
+            .bind(build_request_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM image_artifacts WHERE id = $1 AND status = 'draft'")
+            .bind(image_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // ---- 镜像事件 ----------------------------------------------------------
+
+    pub async fn insert_image_event(&self, event: &NewImageEvent) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO image_events
+                (image_id, actor_kind, actor_user_id, actor_serial, event, payload)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(event.image_id)
+        .bind(event_actor_kind_str(event.actor_kind))
+        .bind(event.actor_user_id)
+        .bind(event.actor_serial.as_deref())
+        .bind(&event.event)
+        .bind(&event.payload)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     #[test]
@@ -1107,6 +1740,7 @@ mod tests {
             );
         }
         for status in [
+            ArtifactStatus::Draft,
             ArtifactStatus::Uploaded,
             ArtifactStatus::ManifestReady,
             ArtifactStatus::Verifying,
@@ -1119,6 +1753,38 @@ mod tests {
                 artifact_status_from_str(artifact_status_str(status)),
                 status
             );
+        }
+        for visibility in [
+            ImageVisibility::Private,
+            ImageVisibility::Public,
+            ImageVisibility::Room,
+            ImageVisibility::Area,
+        ] {
+            assert_eq!(visibility_from_str(visibility_str(visibility)), visibility);
+        }
+        for kind in [
+            ImageNamespaceKind::Personal,
+            ImageNamespaceKind::Public,
+            ImageNamespaceKind::Team,
+            ImageNamespaceKind::Area,
+            ImageNamespaceKind::Room,
+        ] {
+            assert_eq!(namespace_kind_from_str(namespace_kind_str(kind)), kind);
+        }
+        for state in [
+            ImageBuildState::Pending,
+            ImageBuildState::Consumed,
+            ImageBuildState::Failed,
+            ImageBuildState::Expired,
+        ] {
+            assert_eq!(build_state_from_str(build_state_str(state)), state);
+        }
+        for actor in [
+            ImageEventActorKind::User,
+            ImageEventActorKind::Device,
+            ImageEventActorKind::System,
+        ] {
+            assert_eq!(ImageEventActorKind::from_str(actor.as_str()), Ok(actor));
         }
         for direction in [TransferDirection::Download, TransferDirection::Upload] {
             assert_eq!(
@@ -1213,6 +1879,177 @@ mod tests {
         assert_eq!(
             transfer_direction_from_str("bogus"),
             TransferDirection::Download
+        );
+        assert_eq!(
+            visibility_from_str("bogus"),
+            ImageVisibility::Public,
+            "未知 visibility 退化为 public，避免私有镜像意外泄露"
+        );
+        assert_eq!(
+            namespace_kind_from_str("bogus"),
+            ImageNamespaceKind::Personal
+        );
+        assert_eq!(build_state_from_str("bogus"), ImageBuildState::Pending);
+    }
+
+    // ---- 2026-11 镜像所有权 / 制作工单 ----
+
+    #[test]
+    fn namespace_slug_is_normalized() {
+        assert_eq!(normalize_namespace_slug("Teacher Li"), "teacher-li");
+        assert_eq!(normalize_namespace_slug("  Li.Wei_01  "), "li.wei_01");
+        assert_eq!(normalize_namespace_slug("张三"), "user");
+        assert_eq!(normalize_namespace_slug(""), "user");
+        // 保留字 public 不能作为个人 slug（与公共命名空间冲突）。
+        assert_eq!(normalize_namespace_slug("public"), "user");
+        assert_eq!(normalize_namespace_slug("a/b//c"), "a-b-c");
+        assert!(normalize_namespace_slug(&"x".repeat(80)).chars().count() <= 48);
+    }
+
+    fn sample_build_request() -> ImageBuildRequest {
+        let now = Utc::now();
+        ImageBuildRequest {
+            id: Uuid::new_v4(),
+            image_id: Uuid::new_v4(),
+            machine_serial: "serial-1".to_owned(),
+            room_id: Some(Uuid::new_v4()),
+            name: "lab-base".to_owned(),
+            version: "1.0.0".to_owned(),
+            platform: "linux/amd64".to_owned(),
+            state: ImageBuildState::Pending,
+            expires_at: now + chrono::Duration::minutes(30),
+            created_by: Some(Uuid::new_v4()),
+            created_at: now,
+            consumed_at: None,
+        }
+    }
+
+    #[test]
+    fn build_request_state_machine_validation() {
+        let build = sample_build_request();
+        let room = build.room_id;
+        let now = Utc::now();
+
+        // 正常 pending 工单：serial / 房间 / 参数一致。
+        assert!(
+            validate_build_request_for_register(
+                &build,
+                "serial-1",
+                room,
+                "lab-base",
+                "1.0.0",
+                "linux/amd64",
+                now
+            )
+            .is_ok()
+        );
+
+        // 已消费 / 失败 / 过期状态。
+        let mut consumed = build.clone();
+        consumed.state = ImageBuildState::Consumed;
+        assert!(
+            validate_build_request_for_register(
+                &consumed,
+                "serial-1",
+                room,
+                "lab-base",
+                "1.0.0",
+                "linux/amd64",
+                now
+            )
+            .is_err()
+        );
+        let mut failed = build.clone();
+        failed.state = ImageBuildState::Failed;
+        assert!(
+            validate_build_request_for_register(
+                &failed,
+                "serial-1",
+                room,
+                "lab-base",
+                "1.0.0",
+                "linux/amd64",
+                now
+            )
+            .is_err()
+        );
+
+        // expires_at 已过期（状态还是 pending）。
+        let mut expired = build.clone();
+        expired.expires_at = now - chrono::Duration::seconds(1);
+        let error = validate_build_request_for_register(
+            &expired,
+            "serial-1",
+            room,
+            "lab-base",
+            "1.0.0",
+            "linux/amd64",
+            now,
+        )
+        .unwrap_err();
+        assert!(error.contains("过期"), "{error}");
+
+        // serial 不一致。
+        assert!(
+            validate_build_request_for_register(
+                &build,
+                "serial-2",
+                room,
+                "lab-base",
+                "1.0.0",
+                "linux/amd64",
+                now
+            )
+            .is_err()
+        );
+        // 房间不一致。
+        assert!(
+            validate_build_request_for_register(
+                &build,
+                "serial-1",
+                Some(Uuid::new_v4()),
+                "lab-base",
+                "1.0.0",
+                "linux/amd64",
+                now
+            )
+            .is_err()
+        );
+        // 参数快照不一致（name / version / platform 各一种）。
+        for (name, version, platform) in [
+            ("other", "1.0.0", "linux/amd64"),
+            ("lab-base", "2.0.0", "linux/amd64"),
+            ("lab-base", "1.0.0", "linux/arm64"),
+        ] {
+            assert!(
+                validate_build_request_for_register(
+                    &build, "serial-1", room, name, version, platform, now
+                )
+                .is_err(),
+                "{name}:{version} ({platform}) 应被拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn scope_condition_matches_contract() {
+        // 默认：我的 + 公共。
+        assert!(scope_condition(None, false).contains("owner_user_id = $4"));
+        assert!(scope_condition(None, false).contains("visibility = 'public'"));
+        // mine / public 各自收窄。
+        assert_eq!(
+            scope_condition(Some(ImageScope::Mine), false),
+            "a.owner_user_id = $4"
+        );
+        assert_eq!(
+            scope_condition(Some(ImageScope::Public), false),
+            "a.visibility = 'public'"
+        );
+        // all：管理员放开，非管理员退化为我的 + 公共。
+        assert_eq!(scope_condition(Some(ImageScope::All), true), "TRUE");
+        assert_eq!(
+            scope_condition(Some(ImageScope::All), false),
+            "(a.owner_user_id = $4 OR a.visibility = 'public')"
         );
     }
 }

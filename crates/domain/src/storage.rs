@@ -136,10 +136,15 @@ impl FromStr for Compression {
     }
 }
 
-/// 镜像产物状态机：`uploaded → manifest_ready → verifying → verified → published → deprecated/revoked`。
+/// 镜像产物状态机（契约 `docs/image-build-lifecycle.md` §1）：
+/// `draft → manifest_ready → verifying → verified → published → deprecated/revoked`。
+///
+/// `draft` 是 2026-11 新增的制作中状态：控制面下发 `image.make` 时预创建，
+/// 设备 `register` 成功后推进到 `manifest_ready`。旧状态值保持不变（完全兼容旧数据）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactStatus {
+    Draft,
     Uploaded,
     ManifestReady,
     Verifying,
@@ -152,6 +157,7 @@ pub enum ArtifactStatus {
 impl ArtifactStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Draft => "draft",
             Self::Uploaded => "uploaded",
             Self::ManifestReady => "manifest_ready",
             Self::Verifying => "verifying",
@@ -160,6 +166,28 @@ impl ArtifactStatus {
             Self::Deprecated => "deprecated",
             Self::Revoked => "revoked",
         }
+    }
+
+    /// 对外 `readiness` 映射（契约 §1）：前端只认这 5 个值，不再把
+    /// `manifest_ready` 当成「就绪」。
+    pub const fn readiness(self) -> &'static str {
+        match self {
+            Self::Draft => "building",
+            Self::Uploaded | Self::ManifestReady | Self::Verifying => "uploaded",
+            Self::Verified => "verified",
+            Self::Published => "ready",
+            Self::Deprecated | Self::Revoked => "unavailable",
+        }
+    }
+
+    /// 是否占用「同名同版本」的名字。`deprecated` / `revoked` 允许重新制作同名镜像。
+    pub const fn blocks_image_name(self) -> bool {
+        !matches!(self, Self::Deprecated | Self::Revoked)
+    }
+
+    /// 能否被分配到房间（只有 `published` 是「就绪」）。
+    pub const fn is_assignable(self) -> bool {
+        matches!(self, Self::Published)
     }
 }
 
@@ -174,6 +202,7 @@ impl FromStr for ArtifactStatus {
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "draft" => Ok(Self::Draft),
             "uploaded" => Ok(Self::Uploaded),
             "manifest_ready" => Ok(Self::ManifestReady),
             "verifying" => Ok(Self::Verifying),
@@ -184,6 +213,265 @@ impl FromStr for ArtifactStatus {
             _ => Err(()),
         }
     }
+}
+
+/// 镜像可见范围（MVP：`private` / `public`；room/area 预留给 M4 共享）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageVisibility {
+    Private,
+    Room,
+    Area,
+    #[default]
+    Public,
+}
+
+impl ImageVisibility {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Room => "room",
+            Self::Area => "area",
+            Self::Public => "public",
+        }
+    }
+
+    pub const fn is_public(self) -> bool {
+        matches!(self, Self::Public)
+    }
+}
+
+impl fmt::Display for ImageVisibility {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ImageVisibility {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "private" => Ok(Self::Private),
+            "room" => Ok(Self::Room),
+            "area" => Ok(Self::Area),
+            "public" => Ok(Self::Public),
+            _ => Err(()),
+        }
+    }
+}
+
+/// 镜像命名空间类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageNamespaceKind {
+    Personal,
+    Public,
+    Team,
+    Area,
+    Room,
+}
+
+impl ImageNamespaceKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Personal => "personal",
+            Self::Public => "public",
+            Self::Team => "team",
+            Self::Area => "area",
+            Self::Room => "room",
+        }
+    }
+}
+
+impl fmt::Display for ImageNamespaceKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ImageNamespaceKind {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "personal" => Ok(Self::Personal),
+            "public" => Ok(Self::Public),
+            "team" => Ok(Self::Team),
+            "area" => Ok(Self::Area),
+            "room" => Ok(Self::Room),
+            _ => Err(()),
+        }
+    }
+}
+
+/// 镜像命名空间（`image_namespaces`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageNamespace {
+    pub id: Uuid,
+    pub kind: ImageNamespaceKind,
+    pub owner_user_id: Option<Uuid>,
+    pub slug: String,
+    pub display_name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 列表/详情查询范围（契约 §3）：`mine` / `public` / `all`（all 仅管理员）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageScope {
+    Mine,
+    Public,
+    All,
+}
+
+impl ImageScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mine => "mine",
+            Self::Public => "public",
+            Self::All => "all",
+        }
+    }
+}
+
+impl fmt::Display for ImageScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ImageScope {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "mine" => Ok(Self::Mine),
+            "public" => Ok(Self::Public),
+            "all" => Ok(Self::All),
+            _ => Err(()),
+        }
+    }
+}
+
+/// 制作工单状态机：`pending → consumed / failed / expired`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageBuildState {
+    Pending,
+    Consumed,
+    Failed,
+    Expired,
+}
+
+impl ImageBuildState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Consumed => "consumed",
+            Self::Failed => "failed",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+impl fmt::Display for ImageBuildState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ImageBuildState {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "pending" => Ok(Self::Pending),
+            "consumed" => Ok(Self::Consumed),
+            "failed" => Ok(Self::Failed),
+            "expired" => Ok(Self::Expired),
+            _ => Err(()),
+        }
+    }
+}
+
+/// 审计事件主体类型：控制面用户 / mTLS 设备 / 系统定时任务。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageEventActorKind {
+    User,
+    Device,
+    System,
+}
+
+impl ImageEventActorKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Device => "device",
+            Self::System => "system",
+        }
+    }
+}
+
+impl fmt::Display for ImageEventActorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ImageEventActorKind {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "user" => Ok(Self::User),
+            "device" => Ok(Self::Device),
+            "system" => Ok(Self::System),
+            _ => Err(()),
+        }
+    }
+}
+
+/// 镜像制作工单（`image_build_requests`，契约 §4）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageBuildRequest {
+    pub id: Uuid,
+    pub image_id: Uuid,
+    pub machine_serial: String,
+    pub room_id: Option<Uuid>,
+    pub name: String,
+    pub version: String,
+    pub platform: String,
+    pub state: ImageBuildState,
+    pub expires_at: DateTime<Utc>,
+    pub created_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+/// 新建制作工单的输入。
+#[derive(Debug, Clone)]
+pub struct NewImageBuildRequest {
+    pub image_id: Uuid,
+    pub machine_serial: String,
+    pub room_id: Option<Uuid>,
+    pub name: String,
+    pub version: String,
+    pub platform: String,
+    pub expires_at: DateTime<Utc>,
+    pub created_by: Option<Uuid>,
+}
+
+/// 追加一条镜像审计事件（`image_events`）。
+#[derive(Debug, Clone)]
+pub struct NewImageEvent {
+    pub image_id: Uuid,
+    pub actor_kind: ImageEventActorKind,
+    pub actor_user_id: Option<Uuid>,
+    pub actor_serial: Option<String>,
+    pub event: String,
+    pub payload: serde_json::Value,
 }
 
 /// 传输方向：`download` 分发到房间，`upload` 从房间收集。
@@ -421,8 +709,50 @@ pub struct ImageArtifact {
     pub total_size: i64,
     pub status: ArtifactStatus,
     pub created_by: Option<Uuid>,
+    /// 归属命名空间（迁移 0036 后非空）。
+    pub namespace_id: Uuid,
+    /// 归属用户；旧数据回填为 `created_by`（NULL → admin），无主时可为空。
+    pub owner_user_id: Option<Uuid>,
+    pub visibility: ImageVisibility,
+    /// 来源类型：`vm_export` 等（制作工单路径写入）。
+    pub source_kind: Option<String>,
+    pub source_room_id: Option<Uuid>,
+    pub source_machine_serial: Option<String>,
+    pub source_vm_name: Option<String>,
+    pub description: Option<String>,
+    /// 软删除预留列（当前删除仍为硬删除）。
+    pub deleted_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// 列表/详情返回的镜像视图：制品字段 + 归属展示字段 + 对外 `readiness`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageArtifactView {
+    #[serde(flatten)]
+    pub artifact: ImageArtifact,
+    /// 归属用户的展示名（users.display_name；无主为 null）。
+    pub owner_name: Option<String>,
+    /// 归属命名空间 slug（如 `public` / 个人 slug）。
+    pub namespace_slug: String,
+    /// 契约 §1 的 readiness 映射：building / uploaded / verified / ready / unavailable。
+    pub readiness: String,
+}
+
+impl ImageArtifactView {
+    pub fn new(
+        artifact: ImageArtifact,
+        owner_name: Option<String>,
+        namespace_slug: impl Into<String>,
+    ) -> Self {
+        let readiness = artifact.status.readiness().to_owned();
+        Self {
+            artifact,
+            owner_name,
+            namespace_slug: namespace_slug.into(),
+            readiness,
+        }
+    }
 }
 
 /// 镜像分片（`image_chunks`），由 manifest 落库而来。
@@ -510,14 +840,50 @@ pub struct NewImage {
     pub compression: Compression,
     pub platform: String,
     pub created_by: Option<Uuid>,
+    /// 归属命名空间（必填；旧 register 路径使用 public 命名空间）。
+    pub namespace_id: Uuid,
+    /// 归属用户；旧 register 路径为 NULL。
+    pub owner_user_id: Option<Uuid>,
+    pub visibility: ImageVisibility,
+    /// 初始状态：普通创建 `uploaded`，制作工单预创建 `draft`。
+    pub status: ArtifactStatus,
+    pub source_kind: Option<String>,
+    pub source_room_id: Option<Uuid>,
+    pub source_machine_serial: Option<String>,
+    pub source_vm_name: Option<String>,
+    pub description: Option<String>,
 }
 
 /// 镜像列表过滤条件。
+///
+/// `scope` 为 `None` 时按契约默认「我的 + 公共」（`mine + public`）；
+/// `scope=all` 仅管理员可用（API 层校验后才会传入）。
 #[derive(Debug, Clone, Default)]
 pub struct ImageFilter {
     pub kind: Option<ImageKind>,
     pub status: Option<ArtifactStatus>,
     pub name: Option<String>,
+    pub scope: Option<ImageScope>,
+    /// 当前查看者（用于 mine 过滤 / 私有可见性判断）。
+    pub viewer_user_id: Option<Uuid>,
+    /// 当前查看者是否管理员（`scope=all` / 私有可见）。
+    pub viewer_is_admin: bool,
+}
+
+/// 归属校验（契约 §3）：owner 或 admin 才能操作变更类接口。
+pub fn can_manage_image(artifact: &ImageArtifact, user_id: Uuid, is_admin: bool) -> bool {
+    is_admin || artifact.owner_user_id == Some(user_id)
+}
+
+/// 读取校验（契约 §3）：owner / admin / public 可读。
+pub fn can_read_image(artifact: &ImageArtifact, user_id: Uuid, is_admin: bool) -> bool {
+    is_admin || artifact.owner_user_id == Some(user_id) || artifact.visibility.is_public()
+}
+
+/// 同名冲突判定（契约 §4.1）：同命名空间 + 同名同版本同平台，且状态非
+/// deprecated/revoked。`None` 表示没有冲突。
+pub fn name_conflict(artifact: Option<&ImageArtifact>) -> bool {
+    artifact.is_some_and(|artifact| artifact.status.blocks_image_name())
 }
 
 /// 校验镜像名称：1..=64，只允许小写字母、数字与 `- _ .`，返回去空白后的名称。
@@ -1093,5 +1459,157 @@ mod tests {
         assert!(validate_object_key("objects/a b").is_err());
         assert!(validate_object_key("objects/a?b").is_err());
         assert!(validate_object_key("objects/镜像").is_err());
+    }
+
+    // ---- 2026-11 镜像所有权 / 就绪状态 ----
+
+    fn sample_artifact(owner: Option<Uuid>, visibility: ImageVisibility) -> ImageArtifact {
+        let now = Utc.with_ymd_and_hms(2026, 11, 13, 12, 0, 0).unwrap();
+        ImageArtifact {
+            id: Uuid::nil(),
+            name: "lab-base".to_owned(),
+            version: "1.0.0".to_owned(),
+            kind: ImageKind::VmDisk,
+            format: ImageFormat::Qcow2,
+            compression: Compression::None,
+            platform: "linux/amd64".to_owned(),
+            manifest_digest: None,
+            total_size: 0,
+            status: ArtifactStatus::Draft,
+            created_by: owner,
+            namespace_id: Uuid::nil(),
+            owner_user_id: owner,
+            visibility,
+            source_kind: Some("vm_export".to_owned()),
+            source_room_id: None,
+            source_machine_serial: Some("serial-1".to_owned()),
+            source_vm_name: Some("vm-1".to_owned()),
+            description: None,
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn artifact_status_draft_and_readiness_mapping() {
+        // 旧状态值保持兼容；draft 为新增状态。
+        for status in [
+            ArtifactStatus::Draft,
+            ArtifactStatus::Uploaded,
+            ArtifactStatus::ManifestReady,
+            ArtifactStatus::Verifying,
+            ArtifactStatus::Verified,
+            ArtifactStatus::Published,
+            ArtifactStatus::Deprecated,
+            ArtifactStatus::Revoked,
+        ] {
+            assert_eq!(status.as_str().parse::<ArtifactStatus>(), Ok(status));
+        }
+        assert_eq!(ArtifactStatus::Draft.as_str(), "draft");
+        assert_eq!(
+            serde_json::to_string(&ArtifactStatus::Draft).unwrap(),
+            "\"draft\""
+        );
+
+        // 契约 §1 的 readiness 映射。
+        assert_eq!(ArtifactStatus::Draft.readiness(), "building");
+        assert_eq!(ArtifactStatus::Uploaded.readiness(), "uploaded");
+        assert_eq!(ArtifactStatus::ManifestReady.readiness(), "uploaded");
+        assert_eq!(ArtifactStatus::Verifying.readiness(), "uploaded");
+        assert_eq!(ArtifactStatus::Verified.readiness(), "verified");
+        assert_eq!(ArtifactStatus::Published.readiness(), "ready");
+        assert_eq!(ArtifactStatus::Deprecated.readiness(), "unavailable");
+        assert_eq!(ArtifactStatus::Revoked.readiness(), "unavailable");
+
+        // 只有 published 可分配；deprecated/revoked 不占用名字。
+        assert!(ArtifactStatus::Published.is_assignable());
+        assert!(!ArtifactStatus::ManifestReady.is_assignable());
+        assert!(!ArtifactStatus::Draft.is_assignable());
+        assert!(ArtifactStatus::Draft.blocks_image_name());
+        assert!(!ArtifactStatus::Deprecated.blocks_image_name());
+        assert!(!ArtifactStatus::Revoked.blocks_image_name());
+    }
+
+    #[test]
+    fn visibility_scope_and_namespace_kind_round_trip() {
+        for visibility in [
+            ImageVisibility::Private,
+            ImageVisibility::Room,
+            ImageVisibility::Area,
+            ImageVisibility::Public,
+        ] {
+            assert_eq!(
+                visibility.as_str().parse::<ImageVisibility>(),
+                Ok(visibility)
+            );
+        }
+        assert_eq!(ImageVisibility::default(), ImageVisibility::Public);
+        assert!(ImageVisibility::Public.is_public());
+        assert!(!ImageVisibility::Private.is_public());
+
+        for scope in [ImageScope::Mine, ImageScope::Public, ImageScope::All] {
+            assert_eq!(scope.as_str().parse::<ImageScope>(), Ok(scope));
+        }
+        for kind in [
+            ImageNamespaceKind::Personal,
+            ImageNamespaceKind::Public,
+            ImageNamespaceKind::Team,
+            ImageNamespaceKind::Area,
+            ImageNamespaceKind::Room,
+        ] {
+            assert_eq!(kind.as_str().parse::<ImageNamespaceKind>(), Ok(kind));
+        }
+        for state in [
+            ImageBuildState::Pending,
+            ImageBuildState::Consumed,
+            ImageBuildState::Failed,
+            ImageBuildState::Expired,
+        ] {
+            assert_eq!(state.as_str().parse::<ImageBuildState>(), Ok(state));
+        }
+        for actor in [
+            ImageEventActorKind::User,
+            ImageEventActorKind::Device,
+            ImageEventActorKind::System,
+        ] {
+            assert_eq!(actor.as_str().parse::<ImageEventActorKind>(), Ok(actor));
+        }
+    }
+
+    #[test]
+    fn owner_and_visibility_gate_manage_and_read() {
+        let owner = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        let private = sample_artifact(Some(owner), ImageVisibility::Private);
+        assert!(can_manage_image(&private, owner, false));
+        assert!(!can_manage_image(&private, other, false));
+        assert!(can_manage_image(&private, other, true));
+        assert!(can_read_image(&private, owner, false));
+        assert!(!can_read_image(&private, other, false));
+        assert!(can_read_image(&private, other, true));
+
+        let public = sample_artifact(Some(owner), ImageVisibility::Public);
+        assert!(can_read_image(&public, other, false));
+        // 公共镜像可读但非 owner 仍不可变更。
+        assert!(!can_manage_image(&public, other, false));
+
+        // 旧数据 owner=admin：管理员可管理，普通教师不可。
+        let legacy = sample_artifact(None, ImageVisibility::Public);
+        assert!(!can_manage_image(&legacy, other, false));
+        assert!(can_manage_image(&legacy, other, true));
+    }
+
+    #[test]
+    fn name_conflict_excludes_deprecated_and_revoked() {
+        let mut artifact = sample_artifact(Some(Uuid::new_v4()), ImageVisibility::Private);
+        artifact.status = ArtifactStatus::ManifestReady;
+        assert!(name_conflict(Some(&artifact)));
+        artifact.status = ArtifactStatus::Deprecated;
+        assert!(!name_conflict(Some(&artifact)));
+        artifact.status = ArtifactStatus::Revoked;
+        assert!(!name_conflict(Some(&artifact)));
+        assert!(!name_conflict(None));
     }
 }
