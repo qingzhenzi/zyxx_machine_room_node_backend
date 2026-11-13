@@ -13,6 +13,7 @@ use crate::{
         audit::AuditLogRepo,
         device::DeviceRepo,
         federation::FederationRepo,
+        image_studio::ImageStudioRepo,
         machine::MachineRepo,
         presence::{PresenceEventRecord, PresenceRepo},
         roles::RoleRepo,
@@ -77,6 +78,8 @@ pub struct AppState {
     pub agent_configs: AgentConfigRepo,
     // ---- 房间启动配置（startup provisioning，迁移 0035）----
     pub startup: RoomStartupRepo,
+    // ---- 教师端镜像制作工作台（迁移 0039：构建会话 + 房间默认底包）----
+    pub image_studio: ImageStudioRepo,
     // ---- 资源与镜像（S3 兼容对象存储）----
     /// 未配置 `S3_ENDPOINT` + `S3_BUCKET`（或初始化失败）时为 `None`，
     /// 存储/镜像接口统一返回 503。
@@ -129,6 +132,7 @@ impl AppState {
             presence_events,
             agent_configs: AgentConfigRepo::new(db.pool().clone()),
             startup: RoomStartupRepo::new(db.pool().clone()),
+            image_studio: ImageStudioRepo::new(db.pool().clone()),
             storage,
             storage_repo: StorageRepo::new(db.pool().clone()),
             email,

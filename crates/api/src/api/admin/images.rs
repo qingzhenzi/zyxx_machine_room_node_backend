@@ -253,7 +253,7 @@ fn parse_scope(raw: Option<&str>) -> AppResult<Option<ImageScope>> {
 }
 
 /// 当前用户是否管理员（契约 §3 的 owner/admin 校验）。
-async fn actor_is_admin(state: &AppState, user_id: Uuid) -> AppResult<bool> {
+pub(crate) async fn actor_is_admin(state: &AppState, user_id: Uuid) -> AppResult<bool> {
     Ok(role_is_admin(&state.users.roles_of(user_id).await?))
 }
 
@@ -1046,7 +1046,12 @@ pub async fn get_manifest(
 ///
 /// 尽力而为：无槽位、无存活设备、入队失败或 Redis 通知失败都只记 `warn!`，
 /// 不影响分配结果；transfer 保持 pending，等待设备上线后补偿。
-async fn dispatch_image_pull(state: &AppState, room_id: Uuid, image_id: Uuid, transfer_id: Uuid) {
+pub(crate) async fn dispatch_image_pull(
+    state: &AppState,
+    room_id: Uuid,
+    image_id: Uuid,
+    transfer_id: Uuid,
+) {
     let slot = match state.rooms.get(room_id).await {
         Ok(Some(room)) => room.device_slot,
         Ok(None) => {
@@ -1065,21 +1070,31 @@ async fn dispatch_image_pull(state: &AppState, room_id: Uuid, image_id: Uuid, tr
         tracing::warn!(%room_id, "房间未绑定设备槽位，image.pull 未投递");
         return;
     };
+    dispatch_image_pull_to_slot(state, &slot, image_id, transfer_id).await;
+}
 
+/// 向指定设备槽位投递 `image.pull`（构建会话的目标可能是 `room_devices` 子机，
+/// 不能固定投给房间主设备）。payload 字段与 §16.1 严格一致。
+pub(crate) async fn dispatch_image_pull_to_slot(
+    state: &AppState,
+    slot: &str,
+    image_id: Uuid,
+    transfer_id: Uuid,
+) {
     let artifact = match state.storage_repo.get_image(image_id).await {
         Ok(Some(artifact)) => artifact,
         Ok(None) => {
-            tracing::warn!(%room_id, %image_id, "镜像不存在，跳过 image.pull 投递");
+            tracing::warn!(%slot, %image_id, "镜像不存在，跳过 image.pull 投递");
             return;
         }
         Err(error) => {
-            tracing::warn!(%error, %room_id, %image_id, "加载镜像失败，跳过 image.pull 投递");
+            tracing::warn!(%error, %slot, %image_id, "加载镜像失败，跳过 image.pull 投递");
             return;
         }
     };
     if artifact.status != ArtifactStatus::Published {
         tracing::warn!(
-            %room_id,
+            %slot,
             %image_id,
             status = %artifact.status,
             "镜像不是 published 状态，跳过 image.pull 投递"
@@ -1088,7 +1103,7 @@ async fn dispatch_image_pull(state: &AppState, room_id: Uuid, image_id: Uuid, tr
     }
     let Some(manifest_digest) = artifact.manifest_digest.clone() else {
         tracing::warn!(
-            %room_id,
+            %slot,
             %image_id,
             "镜像缺少 manifest_digest，跳过 image.pull 投递"
         );
@@ -1097,7 +1112,7 @@ async fn dispatch_image_pull(state: &AppState, room_id: Uuid, image_id: Uuid, tr
     let chunk_count = match state.storage_repo.chunk_count(&manifest_digest).await {
         Ok(chunk_count) => chunk_count,
         Err(error) => {
-            tracing::warn!(%error, %room_id, %image_id, "统计镜像分片数失败，跳过 image.pull 投递");
+            tracing::warn!(%error, %slot, %image_id, "统计镜像分片数失败，跳过 image.pull 投递");
             return;
         }
     };
@@ -1120,7 +1135,7 @@ async fn dispatch_image_pull(state: &AppState, room_id: Uuid, image_id: Uuid, tr
 
     match state
         .storage_repo
-        .enqueue_downlink_for_slot(&slot, "image.pull", &payload)
+        .enqueue_downlink_for_slot(slot, "image.pull", &payload)
         .await
     {
         Ok(Some(serial)) => {
@@ -1134,10 +1149,10 @@ async fn dispatch_image_pull(state: &AppState, room_id: Uuid, image_id: Uuid, tr
             }
         }
         Ok(None) => {
-            tracing::warn!(%room_id, %slot, "设备槽位当前没有存活设备，image.pull 未投递");
+            tracing::warn!(%slot, "设备槽位当前没有存活设备，image.pull 未投递");
         }
         Err(error) => {
-            tracing::warn!(%error, %room_id, %slot, "image.pull 入队失败");
+            tracing::warn!(%error, %slot, "image.pull 入队失败");
         }
     }
 }

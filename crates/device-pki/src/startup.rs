@@ -18,11 +18,16 @@
 use axum::Json;
 use axum::extract::State;
 use serde::Serialize;
-use serde_json::Value;
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use qe_db::startup::{StartupConfig, StartupVm};
+use qe_db::{
+    image_studio::ImageStudioRepo,
+    startup::{RoomStartupProfile, RoomStartupRepo, StartupVm},
+};
+use qe_domain::image_studio::{
+    RoomImageDefault, merge_default_image_ids, synthesized_defaults_revision,
+};
 
 use crate::error::{Error, Result};
 use crate::routes::AppState;
@@ -70,14 +75,6 @@ impl StartupReply {
             vms: Vec::new(),
         }
     }
-}
-
-/// 配置行（只需要下发用到的列）。
-#[derive(Debug, Clone, FromRow)]
-struct ProfileRow {
-    enabled: bool,
-    config: Value,
-    revision: i64,
 }
 
 /// 镜像行的查询结果（JOIN 已经把缺列/未发布的镜像过滤掉）。
@@ -151,27 +148,22 @@ pub async fn get_startup(State(st): State<AppState>, peer: PeerCert) -> Result<J
         return Ok(Json(StartupReply::disabled()));
     };
 
-    let profile = load_profile(&st.db, room_id).await?;
-    let Some(profile) = profile else {
-        tracing::debug!(%serial, %slot, %room_id, "startup: 房间无启动配置，返回空配置");
-        return Ok(Json(StartupReply::disabled()));
-    };
-    if !profile.enabled {
-        tracing::debug!(%serial, %slot, %room_id, revision = profile.revision, "startup: 配置已禁用，返回空配置");
+    // 房间默认底包（image-studio.md §3.1）：即使没有 startup profile 也要下发，
+    // 保证 agent 连上后自动拉取默认底包/增量包。
+    let defaults = ImageStudioRepo::new(st.db.clone())
+        .get_room_default(room_id)
+        .await?;
+    let profile = RoomStartupRepo::new(st.db.clone()).get(room_id).await?;
+    let effective = effective_startup(profile.as_ref(), defaults.as_ref());
+    if !effective.enabled {
+        tracing::debug!(%serial, %slot, %room_id, "startup: 房间无启用配置，返回空配置");
         return Ok(Json(StartupReply::disabled()));
     }
 
-    let config: StartupConfig = serde_json::from_value(profile.config).map_err(|error| {
-        Error::Internal(anyhow::anyhow!(
-            "room_startup_profiles.config 不是合法启动配置（room_id={room_id}）: {error}"
-        ))
-    })?;
-
-    let image_ids: Vec<Uuid> = config.images.iter().map(|image| image.image_id).collect();
-    let images = if image_ids.is_empty() {
+    let images = if effective.image_ids.is_empty() {
         Vec::new()
     } else {
-        load_published_images(&st.db, room_id, &image_ids).await?
+        load_published_images(&st.db, room_id, &effective.image_ids).await?
     };
 
     // 周期 reconcile 每 60s 一次，成功路径用 debug 避免把日志刷满。
@@ -179,33 +171,89 @@ pub async fn get_startup(State(st): State<AppState>, peer: PeerCert) -> Result<J
         %serial,
         %slot,
         %room_id,
-        revision = profile.revision,
+        revision = effective.revision,
         images = images.len(),
-        vms = config.vms.len(),
+        vms = effective.vms.len(),
+        from_defaults = defaults.is_some(),
         "startup 配置下发"
     );
 
     Ok(Json(StartupReply {
-        revision: profile.revision,
+        revision: effective.revision,
         enabled: true,
-        auto_pull: config.auto_pull,
-        auto_start_vm: config.auto_start_vm,
+        auto_pull: effective.auto_pull,
+        auto_start_vm: effective.auto_start_vm,
         images,
-        vms: config.vms,
+        vms: effective.vms,
     }))
 }
 
-/// 读取房间配置行；无行返回 `None`。
-async fn load_profile(db: &PgPool, room_id: Uuid) -> Result<Option<ProfileRow>> {
-    let row = sqlx::query_as::<_, ProfileRow>(
-        "SELECT enabled, config, revision
-           FROM room_startup_profiles
-          WHERE room_id = $1",
-    )
-    .bind(room_id)
-    .fetch_optional(db)
-    .await?;
-    Ok(row)
+/// 生效的启动配置：startup profile 与房间默认底包合成后的纯数据（便于单测）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveStartup {
+    enabled: bool,
+    revision: i64,
+    auto_pull: bool,
+    auto_start_vm: bool,
+    image_ids: Vec<Uuid>,
+    vms: Vec<StartupVm>,
+}
+
+impl EffectiveStartup {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            revision: 0,
+            auto_pull: true,
+            auto_start_vm: true,
+            image_ids: Vec::new(),
+            vms: Vec::new(),
+        }
+    }
+}
+
+/// 合成规则（契约 image-studio.md §3.1 + startup-provisioning.md §4.1）：
+///
+/// 1. 有 startup profile 且 `enabled=true`：revision/auto_*/vms 取 profile，`images`
+///    额外并入房间默认底包/增量包（按 image_id 去重）；
+/// 2. 有 profile 但 `enabled=false`：尊重显式禁用，返回空配置（不下发默认底包）；
+/// 3. 无 profile、有默认底包：`enabled=true`，revision 由默认底包 `updated_at` 派生
+///    （恒 >0，默认底包变更时变化），auto 全开、vms 为空；
+/// 4. 都没有：空配置（200 + revision=0）。
+fn effective_startup(
+    profile: Option<&RoomStartupProfile>,
+    defaults: Option<&RoomImageDefault>,
+) -> EffectiveStartup {
+    match profile {
+        Some(profile) if profile.enabled => {
+            let configured: Vec<Uuid> = profile
+                .config
+                .images
+                .iter()
+                .map(|image| image.image_id)
+                .collect();
+            EffectiveStartup {
+                enabled: true,
+                revision: profile.revision,
+                auto_pull: profile.config.auto_pull,
+                auto_start_vm: profile.config.auto_start_vm,
+                image_ids: merge_default_image_ids(&configured, defaults),
+                vms: profile.config.vms.clone(),
+            }
+        }
+        Some(_) => EffectiveStartup::disabled(),
+        None => match defaults {
+            Some(defaults) => EffectiveStartup {
+                enabled: true,
+                revision: synthesized_defaults_revision(defaults.updated_at),
+                auto_pull: true,
+                auto_start_vm: true,
+                image_ids: merge_default_image_ids(&[], Some(defaults)),
+                vms: Vec::new(),
+            },
+            None => EffectiveStartup::disabled(),
+        },
+    }
 }
 
 /// 按配置顺序之外的稳定顺序返回「已发布且 manifest 完整」的镜像条目。
@@ -266,6 +314,7 @@ async fn load_published_images(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qe_db::startup::StartupConfig;
 
     fn image_row() -> StartupImageRow {
         StartupImageRow {
@@ -380,6 +429,117 @@ mod tests {
         // 契约里的下划线字段名不能被写成 camelCase。
         assert!(value.get("autoStartVm").is_none());
         assert!(value.get("auto_start_vm").is_some());
+    }
+
+    fn profile(enabled: bool, revision: i64, images: Vec<Uuid>) -> RoomStartupProfile {
+        RoomStartupProfile {
+            room_id: Uuid::new_v4(),
+            enabled,
+            config: StartupConfig {
+                auto_pull: false,
+                auto_start_vm: true,
+                images: images
+                    .into_iter()
+                    .map(|image_id| qe_db::startup::StartupImageRef { image_id })
+                    .collect(),
+                vms: vec![StartupVm {
+                    name: "lab-104".to_owned(),
+                    vcpus: 2,
+                    memory_mib: 2_048,
+                    disk_gb: 20,
+                    base_volume: None,
+                    base_path: None,
+                    gpu: Vec::new(),
+                    auto_start: true,
+                }],
+            },
+            revision,
+            updated_by: Some(Uuid::new_v4()),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn defaults(
+        base: Uuid,
+        delta: Option<Uuid>,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> RoomImageDefault {
+        RoomImageDefault {
+            room_id: Uuid::new_v4(),
+            base_image_id: base,
+            delta_image_id: delta,
+            updated_by: None,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn effective_startup_defaults_only_is_enabled_with_positive_revision() {
+        let base = Uuid::new_v4();
+        let delta = Uuid::new_v4();
+        let updated_at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let effective = effective_startup(None, Some(&defaults(base, Some(delta), updated_at)));
+        assert!(effective.enabled);
+        assert!(effective.revision > 0);
+        assert_eq!(effective.revision, 1_700_000_000);
+        assert!(effective.auto_pull);
+        assert!(effective.auto_start_vm);
+        assert_eq!(effective.image_ids, vec![base, delta]);
+        assert!(effective.vms.is_empty());
+    }
+
+    #[test]
+    fn effective_startup_merges_profile_images_with_defaults() {
+        let configured = Uuid::new_v4();
+        let base = configured; // 与默认底包重复 → 去重
+        let delta = Uuid::new_v4();
+        let profile = profile(true, 5, vec![configured]);
+        let effective = effective_startup(
+            Some(&profile),
+            Some(&defaults(base, Some(delta), chrono::Utc::now())),
+        );
+        assert!(effective.enabled);
+        assert_eq!(effective.revision, 5);
+        assert!(!effective.auto_pull);
+        assert!(effective.auto_start_vm);
+        assert_eq!(effective.image_ids, vec![configured, delta]);
+        assert_eq!(effective.vms.len(), 1);
+    }
+
+    #[test]
+    fn effective_startup_respects_disabled_profile_and_empty_room() {
+        // 显式 disabled：即使有默认底包也不下发（尊重用户禁用）。
+        let disabled = profile(false, 3, Vec::new());
+        let effective = effective_startup(
+            Some(&disabled),
+            Some(&defaults(Uuid::new_v4(), None, chrono::Utc::now())),
+        );
+        assert!(!effective.enabled);
+        assert_eq!(effective.revision, 0);
+        assert!(effective.image_ids.is_empty());
+
+        // 无 profile 无默认底包：空配置。
+        let empty = effective_startup(None, None);
+        assert!(!empty.enabled);
+        assert_eq!(empty.revision, 0);
+        assert!(empty.image_ids.is_empty());
+    }
+
+    #[test]
+    fn default_image_merge_dedupes_preserving_order() {
+        let base = Uuid::new_v4();
+        let delta = Uuid::new_v4();
+        let default = defaults(base, Some(delta), chrono::Utc::now());
+        // 配置里已有 base，合并后不重复追加。
+        assert_eq!(
+            merge_default_image_ids(&[base], Some(&default)),
+            vec![base, delta]
+        );
+        assert_eq!(
+            merge_default_image_ids(&[], Some(&default)),
+            vec![base, delta]
+        );
+        assert!(merge_default_image_ids(&[], None).is_empty());
     }
 
     #[test]

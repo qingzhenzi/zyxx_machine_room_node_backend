@@ -145,6 +145,12 @@ impl From<sqlx::Error> for Error {
     }
 }
 
+impl From<qe_db::error::DbError> for Error {
+    fn from(error: qe_db::error::DbError) -> Self {
+        Error::Internal(anyhow::anyhow!("数据库错误: {error}"))
+    }
+}
+
 impl From<rcgen::Error> for Error {
     fn from(e: rcgen::Error) -> Self {
         Error::Internal(e.into())

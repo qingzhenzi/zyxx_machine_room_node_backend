@@ -5,6 +5,7 @@ pub mod audit;
 pub mod device_events;
 pub mod devices;
 pub mod federation;
+pub mod image_studio;
 pub mod images;
 pub mod live_metrics;
 pub mod machines;
@@ -87,6 +88,25 @@ pub fn router() -> Router<AppState> {
         .route(
             "/rooms/{room_id}/startup",
             get(startup::get).put(startup::update),
+        )
+        // 教师端镜像制作工作台（image-studio.md §3）：
+        // 房间默认底包 + 构建会话（服务端统一创建/回收构建 VM）。
+        .route(
+            "/rooms/{room_id}/image-default",
+            get(image_studio::get_image_default).put(image_studio::update_image_default),
+        )
+        .route(
+            "/image-builds",
+            get(image_studio::list_build_sessions).post(image_studio::create_build_session),
+        )
+        .route("/image-builds/{id}", get(image_studio::get_build_session))
+        .route(
+            "/image-builds/{id}/finish",
+            post(image_studio::finish_build_session),
+        )
+        .route(
+            "/image-builds/{id}/cancel",
+            post(image_studio::cancel_build_session),
         )
         .route("/rooms/{id}/occurrences", get(schedules::room_occurrences))
         .route(

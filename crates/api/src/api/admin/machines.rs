@@ -1560,6 +1560,104 @@ pub(crate) async fn execute_vm_command(
     }
 }
 
+// ---- 内部命令入队（镜像构建会话 image_build_sessions 专用）----
+//
+// 会话由服务端自己推进状态机，没有 HTTP 权限上下文，但命令仍必须：
+// 1) 走同一套 args 校验（validate_vm_command，服务端不信任任何调用方）；
+// 2) 落 `machine_command_results(pending)` 再用 `device_downlink` 下发；
+// 3) 入队失败时清理 pending 行（以及 image.make 的 draft/工单），避免留孤儿。
+
+/// 解析槽位当前存活 serial 并下发一条 vm.command；返回 request_id。
+pub(crate) async fn enqueue_internal_vm_command(
+    state: &AppState,
+    device_slot: &str,
+    op: &str,
+    args: serde_json::Value,
+) -> AppResult<Uuid> {
+    let serial = resolve_live_serial(state, device_slot)
+        .await?
+        .ok_or_else(|| AppError::service_unavailable("设备槽位当前没有存活证书，命令未下发"))?;
+    let command = validate_vm_command(VmCommandRequest {
+        op: op.to_owned(),
+        name: None,
+        args: args.as_object().cloned(),
+    })?;
+    let request_id = Uuid::new_v4();
+    let downlink = vm_command_downlink_payload(request_id, &command);
+    insert_pending_vm_command(state, request_id, &serial, &downlink).await?;
+    match enqueue_vm_downlink(state, device_slot, &downlink.to_string()).await {
+        Ok(Some(_)) => Ok(request_id),
+        Ok(None) => {
+            cleanup_pending_vm_command(state, request_id).await;
+            Err(AppError::service_unavailable(
+                "设备槽位当前没有存活证书，命令未下发",
+            ))
+        }
+        Err(error) => {
+            cleanup_pending_vm_command(state, request_id).await;
+            Err(error)
+        }
+    }
+}
+
+/// `image.make` 内部下发结果：命令 request_id + 服务端预创建的 draft 镜像 id。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedImageMake {
+    pub request_id: Uuid,
+    pub image_id: Uuid,
+}
+
+/// 构建会话专用：下发 `image.make`（复用 draft 镜像 + 制作工单身份桥）。
+///
+/// owner 固定为 `actor`（会话创建者），与 HTTP 路径的 `create_vm_command` 完全同源。
+pub(crate) async fn enqueue_image_make_for_session(
+    state: &AppState,
+    actor: Uuid,
+    device_slot: &str,
+    args: serde_json::Value,
+) -> AppResult<PreparedImageMake> {
+    let serial = resolve_live_serial(state, device_slot)
+        .await?
+        .ok_or_else(|| AppError::service_unavailable("设备槽位当前没有存活证书，命令未下发"))?;
+    let device = state
+        .machines
+        .summary(&serial)
+        .await?
+        .ok_or_else(|| AppError::not_found("构建目标机器不存在"))?;
+    let mut command = validate_vm_command(VmCommandRequest {
+        op: "image.make".to_owned(),
+        name: None,
+        args: args.as_object().cloned(),
+    })?;
+    let draft = prepare_image_make(state, actor, &device, &mut command).await?;
+    let request_id = Uuid::new_v4();
+    let downlink = vm_command_downlink_payload(request_id, &command);
+    if let Err(error) =
+        insert_pending_vm_command(state, request_id, &device.serial, &downlink).await
+    {
+        cleanup_image_make_draft(state, draft.image_id).await;
+        return Err(error);
+    }
+    match enqueue_vm_downlink(state, device_slot, &downlink.to_string()).await {
+        Ok(Some(_)) => Ok(PreparedImageMake {
+            request_id,
+            image_id: draft.image_id,
+        }),
+        Ok(None) => {
+            cleanup_pending_vm_command(state, request_id).await;
+            cleanup_image_make_draft(state, draft.image_id).await;
+            Err(AppError::service_unavailable(
+                "设备槽位当前没有存活证书，制作命令未下发",
+            ))
+        }
+        Err(error) => {
+            cleanup_pending_vm_command(state, request_id).await;
+            cleanup_image_make_draft(state, draft.image_id).await;
+            Err(error)
+        }
+    }
+}
+
 // ---- HTTP handlers ----
 
 /// `POST /api/v1/admin/machines/{serial}/vm/commands` —— 下发 VM 远程控制命令。

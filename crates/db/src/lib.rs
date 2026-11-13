@@ -11,6 +11,7 @@ mod db;
 pub mod device;
 pub mod error;
 pub mod federation;
+pub mod image_studio;
 pub mod machine;
 pub mod presence;
 pub mod roles;

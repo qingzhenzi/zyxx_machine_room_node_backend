@@ -7,6 +7,7 @@ pub mod config;
 pub mod email;
 pub mod error;
 pub mod image_build;
+pub mod image_studio_worker;
 pub mod presence;
 pub mod scheduler;
 pub mod state;
@@ -78,6 +79,10 @@ pub async fn run() -> anyhow::Result<()> {
     // 镜像制作工单过期清理：把 pending 且过期的工单置 expired（幂等，多副本安全）。
     let _image_build_maintenance = image_build::spawn(state.clone());
     tracing::info!("镜像制作工单过期清理已启动（60s/轮）");
+
+    // 镜像构建会话超时回收：>2h 非终态会话 → 回收构建 VM + expired（契约 image-studio.md §3.2）。
+    let _image_studio_reaper = image_studio_worker::spawn(state.clone());
+    tracing::info!("镜像构建会话超时回收已启动（60s/轮）");
 
     if config.device_presence_enabled {
         let _presence = presence::spawn(state.clone());
