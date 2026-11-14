@@ -341,3 +341,35 @@ wmic path win32_VideoController get Name,DriverVersion
 - Sunshine 安装并选 QuickSync；
 - 若 Sunshine 捕获黑屏，加 `ramfb=on` 或虚拟显示驱动；
 - 当前 RDP kiosk 仍可用，作为回退。
+
+## 11. Sunshine / Moonlight（2026-11-14 安装）
+
+Windows 内 GPU 已工作后安装 Sunshine：
+
+- 版本：`v2026.1113.231225`（Windows AMD64 installer）；
+- MSI 通过 7890 代理下载，大小约 51MB；
+- guest 内：
+  ```bat
+  curl -L -o C:\Users\qe\sunshine.msi http://10.77.148.1:18080/Sunshine-Windows.msi
+  msiexec /i C:\Users\qe\sunshine.msi /qn
+  ```
+- 安装目录 `C:\Program Files\Sunshine`，包含 `sunshine.exe`/`tools`/`config`；
+- 已验证 Web UI 端口从宿主可达：
+
+```text
+47984 open
+47989 open
+47990 open (https 307 -> /welcome)
+```
+
+任务管理器 GPU 页已显示：
+
+```text
+Intel(R) UHD Graphics 770
+Driver 32.0.101...
+Video Decode / Video Processing / 3D 可见
+```
+
+因此 QuickSync 硬件编码路径已具备；下一步是首次打开 `https://localhost:47990/welcome`
+设置 Sunshine 用户名/密码，配置 encoder = QuickSync，再用 Moonlight 1080p60 实测。
+当前未配置 Sunshine 凭据/串流参数，不能宣称已通过 QSV 串流验收。
