@@ -86,7 +86,10 @@ pub struct Config {
     pub device_presence_tick_secs: u64,
     /// webhook 请求超时（秒）。
     pub device_presence_webhook_timeout_secs: u64,
-    /// 是否同时通知 `device.online`（默认只通知 offline）。
+    /// 是否同时通知 `device.online`。
+    ///
+    /// 默认开启：控制台/事件流需要在设备恢复在线时也能看到状态变化；
+    /// 只要恢复在线（`notify_online=true`）才会产生事件，仍受 250ms 去抖约束。
     pub device_presence_notify_online: bool,
     /// 房间/区域都未配置 webhook 时的全局回退地址。
     pub device_presence_global_webhook_url: Option<String>,
@@ -234,7 +237,7 @@ impl Config {
         if !(1..=60).contains(&device_presence_webhook_timeout_secs) {
             bail!("DEVICE_PRESENCE_WEBHOOK_TIMEOUT_SECONDS 需在 1-60 秒之间");
         }
-        let device_presence_notify_online = env_parse_bool("DEVICE_PRESENCE_NOTIFY_ONLINE", false)?;
+        let device_presence_notify_online = env_parse_bool("DEVICE_PRESENCE_NOTIFY_ONLINE", true)?;
         let device_presence_global_webhook_url = env_optional("DEVICE_PRESENCE_GLOBAL_WEBHOOK_URL");
         let device_presence_webhook_max_attempts =
             env_parse("DEVICE_PRESENCE_WEBHOOK_MAX_ATTEMPTS", 5_u32)?;
@@ -467,9 +470,9 @@ pub fn parse_wol_broadcast_targets(raw: Option<&str>) -> Result<Vec<SocketAddr>>
         if part.is_empty() {
             continue;
         }
-        let address: SocketAddr = part
-            .parse()
-            .with_context(|| format!("WOL_BROADCAST_TARGETS 中的目标非法：{part:?}（期望 IP:port）"))?;
+        let address: SocketAddr = part.parse().with_context(|| {
+            format!("WOL_BROADCAST_TARGETS 中的目标非法：{part:?}（期望 IP:port）")
+        })?;
         if !address.is_ipv4() {
             bail!("WOL_BROADCAST_TARGETS 只支持 IPv4（收到 {part:?}）");
         }
@@ -629,10 +632,9 @@ mod tests {
             parse_wol_broadcast_targets(None).unwrap(),
             vec!["255.255.255.255:9".parse().unwrap()]
         );
-        let targets = parse_wol_broadcast_targets(Some(
-            "192.168.8.255:9, 192.168.9.255:9,192.168.8.255:9",
-        ))
-        .unwrap();
+        let targets =
+            parse_wol_broadcast_targets(Some("192.168.8.255:9, 192.168.9.255:9,192.168.8.255:9"))
+                .unwrap();
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0], "192.168.8.255:9".parse().unwrap());
         assert_eq!(targets[1], "192.168.9.255:9".parse().unwrap());

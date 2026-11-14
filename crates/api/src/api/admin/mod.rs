@@ -255,6 +255,8 @@ pub fn router() -> Router<AppState> {
         .route("/machines", get(machines::list))
         // 必须在 `/machines/{serial}` 之前注册静态路径，否则会被动态段吞掉。
         .route("/machines/stream", get(machines::stream))
+        // 静态路径必须在 `/machines/{serial}` 之前注册。
+        .route("/machines/summary", get(machines::summary))
         .route("/machines/{serial}", get(machines::get))
         .route("/machines/{serial}/snapshots", get(machines::snapshots))
         .route(
@@ -268,6 +270,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/machines/{serial}/agent/poweroff",
             post(machines::create_agent_poweroff),
+        )
+        // 电源命令结果（下发后轮询；权限与下发一致 device:manage）。
+        .route(
+            "/machines/{serial}/agent/commands/{request_id}",
+            get(machines::get_agent_command),
         )
         // WOL：需要 device:wake（迁移 0030 播种；默认仅 admin 角色）。
         .route("/machines/{serial}/wake", post(machines::wake))

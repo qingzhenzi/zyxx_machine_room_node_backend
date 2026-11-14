@@ -2,12 +2,15 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 
 import { api } from '@/api'
+import type { ImageArtifact } from '@/api/schema'
 import type {
-  ImageArtifact,
+  RoomStartupAllowService,
   RoomStartupConfig,
+  RoomStartupNetworkMode,
   RoomStartupProfile,
   RoomStartupTarget,
-} from '@/api/schema'
+  RoomStartupVmNetwork,
+} from '@/api/startup'
 import AppButton from '@/components/ui/AppButton.vue'
 import PageSection from '@/components/ui/PageSection.vue'
 import StateBadge from '@/components/ui/StateBadge.vue'
@@ -38,6 +41,14 @@ interface VmFormRow {
   base_path: string
   gpu: string
   auto_start: boolean
+  /** 配网：不配网 / 隔离 / NAT；提交时 `none` 序列化为 `network: null`。 */
+  networkMode: RoomStartupNetworkMode
+  networkVlan: string
+  networkSubnet: string
+  /** allowlist 文本：每行 `cidr:port[-end][,port...][/tcp|/udp|/any]`。 */
+  networkAllow: string
+  networkAllowInternet: boolean
+  networkAllowSameRoom: boolean
 }
 
 const MAX_IMAGES = 8
@@ -45,6 +56,8 @@ const MAX_VMS = 32
 const VM_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/
 const VOLUME_RE = /^[A-Za-z0-9._-]{1,128}$/
 const GPU_RE = /^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$/
+const CIDR_RE = /^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/
+const PROTO_RE = /^(tcp|udp|any)$/i
 
 const toast = useToastStore()
 
@@ -104,13 +117,79 @@ function resetForm() {
     base_path: vm.base_path ?? '',
     gpu: (vm.gpu ?? []).join(','),
     auto_start: vm.auto_start,
+    networkMode: vm.network?.mode ?? 'none',
+    networkVlan: vm.network?.vlan_id ? String(vm.network.vlan_id) : '',
+    networkSubnet: vm.network?.subnet ?? '',
+    networkAllow: formatAllowlist(vm.network?.allow_services),
+    networkAllowInternet: vm.network?.allow_internet ?? false,
+    networkAllowSameRoom: vm.network?.allow_same_room ?? false,
   }))
   editing.value = false
 }
 
+/** allowlist 表单文本 → wire 结构（端口数字/范围字符串由服务端严格校验）。 */
+function parseAllowlist(raw: string): RoomStartupAllowService[] {
+  const services: RoomStartupAllowService[] = []
+  for (const line of raw
+    .split('\n')
+    .map((item) => item.trim())
+    .filter(Boolean)) {
+    let body = line
+    let proto: RoomStartupAllowService['proto']
+    const slash = line.lastIndexOf('/')
+    if (slash > 0 && PROTO_RE.test(line.slice(slash + 1).trim())) {
+      body = line.slice(0, slash)
+      proto = line
+        .slice(slash + 1)
+        .trim()
+        .toLowerCase() as RoomStartupAllowService['proto']
+    }
+    const colon = body.lastIndexOf(':')
+    if (colon <= 0) {
+      throw new Error(`allowlist 行格式错误：${line}（示例 192.168.8.231:8080/tcp）`)
+    }
+    const cidr = body.slice(0, colon).trim()
+    const ports = body
+      .slice(colon + 1)
+      .split(',')
+      .map((port) => port.trim())
+      .filter(Boolean)
+      .map((port) => (/^\d+$/.test(port) ? Number(port) : port))
+    if (!ports.length) {
+      throw new Error(`allowlist 行缺少端口：${line}`)
+    }
+    services.push({ cidr, proto, ports })
+  }
+  return services
+}
+
+/** wire 结构 → 表单文本（tcp 缺省省略后缀，减少噪音）。 */
+function formatAllowlist(services?: RoomStartupAllowService[] | null): string {
+  return (services ?? [])
+    .map((service) => {
+      const proto = service.proto && service.proto !== 'tcp' ? `/${service.proto}` : ''
+      return `${service.cidr}:${(service.ports ?? []).join(',')}${proto}`
+    })
+    .join('\n')
+}
+
+function networkLabel(network?: RoomStartupVmNetwork | null): string {
+  if (!network || network.mode === 'none') return '不配网'
+  const mode = network.mode === 'nat' ? 'NAT' : '隔离'
+  const vlan = network.vlan_id ? ` · VLAN ${network.vlan_id}` : ''
+  const subnet = network.subnet ? ` · ${network.subnet}` : ''
+  const allow = network.allow_services?.length ?? 0
+  return `${mode}${vlan}${subnet}${allow ? ` · allowlist ${allow} 条` : ''}`
+}
+
 async function loadImages() {
   try {
-    const page = await api.listImages({ kind: 'vm_disk', status: 'published', page: 1, page_size: 50 })
+    const page = await api.listImages({
+      kind: 'vm_disk',
+      status: 'published',
+      page: 1,
+      page_size: 50,
+    })
     vmDiskImages.value = page.items ?? []
   } catch {
     vmDiskImages.value = []
@@ -174,6 +253,12 @@ function addVm() {
     base_path: '',
     gpu: '',
     auto_start: true,
+    networkMode: 'none',
+    networkVlan: '',
+    networkSubnet: '',
+    networkAllow: '',
+    networkAllowInternet: false,
+    networkAllowSameRoom: false,
   })
 }
 
@@ -218,6 +303,33 @@ function validate(): string {
     const gpu = parseGpu(vm.gpu)
     if (gpu.length > 2) return `${label}：GPU 直通最多 2 个`
     if (gpu.some((item) => !GPU_RE.test(item))) return `${label}：GPU 地址格式应为 dddd:bb:dd.f`
+
+    if (vm.networkMode !== 'none') {
+      if (vm.networkMode !== 'isolated' && vm.networkMode !== 'nat') {
+        return `${label}：网络模式非法`
+      }
+      const vlan = vm.networkVlan.trim()
+      if (vlan) {
+        const value = Number(vlan)
+        if (!Number.isInteger(value) || value < 1 || value > 4094) {
+          return `${label}：VLAN 必须是 1-4094 的整数`
+        }
+      }
+      const subnet = vm.networkSubnet.trim()
+      if (subnet) {
+        if (!CIDR_RE.test(subnet)) return `${label}：子网格式应为 10.77.104.0/24`
+        const prefix = Number(subnet.split('/')[1])
+        if (prefix < 1 || prefix > 30) return `${label}：子网前缀必须 <= /30`
+      }
+      if (vm.networkMode !== 'nat' && vm.networkAllowInternet) {
+        return `${label}：只有 NAT 模式允许访问互联网`
+      }
+      try {
+        parseAllowlist(vm.networkAllow)
+      } catch (caught) {
+        return `${label}：${errorMessage(caught, 'allowlist 格式错误')}`
+      }
+    }
   }
   return ''
 }
@@ -229,6 +341,17 @@ function buildConfig(): RoomStartupConfig {
     images: form.imageIds.map((imageId) => ({ image_id: imageId })),
     vms: form.vms.map((vm) => {
       const gpu = parseGpu(vm.gpu)
+      const network: RoomStartupVmNetwork | null =
+        vm.networkMode === 'none'
+          ? null
+          : {
+              mode: vm.networkMode,
+              vlan_id: vm.networkVlan.trim() ? Number(vm.networkVlan.trim()) : null,
+              subnet: vm.networkSubnet.trim() || null,
+              allow_services: parseAllowlist(vm.networkAllow),
+              allow_internet: vm.networkMode === 'nat' && vm.networkAllowInternet,
+              allow_same_room: vm.networkAllowSameRoom,
+            }
       return {
         name: vm.name.trim(),
         vcpus: vm.vcpus,
@@ -238,6 +361,7 @@ function buildConfig(): RoomStartupConfig {
         base_path: vm.base_path.trim() || null,
         gpu,
         auto_start: vm.auto_start,
+        network,
       }
     }),
   }
@@ -269,17 +393,24 @@ async function save() {
   }
 }
 
-watch(() => props.roomId, () => void load())
+watch(
+  () => props.roomId,
+  () => void load(),
+)
 onMounted(() => void load())
 </script>
 
 <template>
   <PageSection
     title="启动配置"
-    description="设备上线后自动拉取镜像、创建并启动虚拟机（agent 收到 startup.update 立即执行，默认 60s 周期兜底）"
+    description="设备上线后自动拉取镜像、创建并启动虚拟机，可按 VM 配置隔离网络（agent 收到 startup.update 立即执行，默认 60s 周期兜底）"
   >
     <div class="px-5 py-4">
-      <div v-if="error" role="alert" class="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[11.5px] text-rose-700">
+      <div
+        v-if="error"
+        role="alert"
+        class="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[11.5px] text-rose-700"
+      >
         {{ error }}
       </div>
 
@@ -302,7 +433,9 @@ onMounted(() => void load())
               <template v-else>未绑定</template>
             </span>
           </div>
-          <AppButton v-if="canManage" icon="pencil" size="sm" @click="startEdit">编辑配置</AppButton>
+          <AppButton v-if="canManage" icon="pencil" size="sm" @click="startEdit"
+            >编辑配置</AppButton
+          >
         </div>
 
         <div class="mt-3 grid grid-cols-2 gap-4">
@@ -312,7 +445,9 @@ onMounted(() => void load())
               {{ (profile?.config.auto_pull ?? true) ? '开' : '关' }} /
               {{ (profile?.config.auto_start_vm ?? true) ? '开' : '关' }}
             </p>
-            <div class="mt-3 text-[10.5px] font-medium text-faint">镜像（{{ savedImages.length }}）</div>
+            <div class="mt-3 text-[10.5px] font-medium text-faint">
+              镜像（{{ savedImages.length }}）
+            </div>
             <ul v-if="savedImages.length" class="mt-1.5 divide-y divide-line/70">
               <li
                 v-for="image in savedImages"
@@ -342,11 +477,17 @@ onMounted(() => void load())
               >
                 <div class="flex items-center justify-between gap-2">
                   <span class="font-medium text-ink">{{ vm.name }}</span>
-                  <StateBadge :label="vm.auto_start ? '自动启动' : '仅创建'" :tone="vm.auto_start ? 'emerald' : 'slate'" />
+                  <StateBadge
+                    :label="vm.auto_start ? '自动启动' : '仅创建'"
+                    :tone="vm.auto_start ? 'emerald' : 'slate'"
+                  />
                 </div>
                 <p class="mt-0.5 text-[10.5px] text-faint">
-                  {{ vm.vcpus }} vCPU · {{ vm.memory_mib }} MiB · {{ vm.disk_gb }} GiB ·
-                  底包 {{ vm.base_volume || vm.base_path || '由镜像推导' }}
+                  {{ vm.vcpus }} vCPU · {{ vm.memory_mib }} MiB · {{ vm.disk_gb }} GiB · 底包
+                  {{ vm.base_volume || vm.base_path || '由镜像推导' }}
+                </p>
+                <p class="mt-0.5 text-[10.5px]" :class="vm.network ? 'text-accent' : 'text-faint'">
+                  网络：{{ networkLabel(vm.network) }}
                 </p>
               </div>
             </div>
@@ -359,7 +500,8 @@ onMounted(() => void load())
           class="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-dashed border-line bg-canvas/30 px-4 py-3"
         >
           <p class="max-w-[640px] text-[11.5px] leading-5 text-muted">
-            尚未配置：保存后本房间设备连上服务端即会自动准备环境（镜像先分配再预签名下发，VM 使用只读底包 + qcow2 差分盘）。
+            尚未配置：保存后本房间设备连上服务端即会自动准备环境（镜像先分配再预签名下发，VM
+            使用只读底包 + qcow2 差分盘）。
           </p>
           <AppButton v-if="canManage" icon="plus" @click="startEdit">配置镜像与 VM</AppButton>
         </div>
@@ -385,7 +527,8 @@ onMounted(() => void load())
           <div>
             <div class="flex items-center justify-between">
               <div class="text-[10.5px] font-medium text-faint">
-                镜像（已发布 vm_disk，最多 {{ MAX_IMAGES }} 个；保存时自动分配到本房间用于预签名下载）
+                镜像（已发布 vm_disk，最多
+                {{ MAX_IMAGES }} 个；保存时自动分配到本房间用于预签名下载）
               </div>
               <span class="text-[10.5px] text-faint">已选 {{ form.imageIds.length }}</span>
             </div>
@@ -404,7 +547,9 @@ onMounted(() => void load())
                 />
                 <span class="min-w-0">
                   <span class="block truncate text-ink">{{ option.label }}</span>
-                  <span class="block truncate text-[10px] text-faint">{{ option.description }}</span>
+                  <span class="block truncate text-[10px] text-faint">{{
+                    option.description
+                  }}</span>
                 </span>
               </label>
             </div>
@@ -415,17 +560,25 @@ onMounted(() => void load())
 
           <div>
             <div class="flex items-center justify-between">
-              <div class="text-[10.5px] font-medium text-faint">虚拟机（最多 {{ MAX_VMS }} 台）</div>
+              <div class="text-[10.5px] font-medium text-faint">
+                虚拟机（最多 {{ MAX_VMS }} 台）
+              </div>
               <AppButton size="sm" icon="plus" @click="addVm">添加 VM</AppButton>
             </div>
             <p v-if="!form.vms.length" class="mt-1.5 text-[11px] text-faint">
               尚未添加 VM。VM 使用只读底包 + qcow2 差分盘；底包不填时按唯一 vm_disk 镜像推导
               &lt;name&gt;-&lt;version&gt;。
             </p>
-            <div v-for="(vm, index) in form.vms" :key="index" class="mt-2 rounded-lg border border-line/70 bg-canvas/30 p-3">
+            <div
+              v-for="(vm, index) in form.vms"
+              :key="index"
+              class="mt-2 rounded-lg border border-line/70 bg-canvas/30 p-3"
+            >
               <div class="flex items-center justify-between">
                 <span class="text-[11px] font-medium text-ink-soft">VM {{ index + 1 }}</span>
-                <AppButton size="sm" variant="danger" icon="trash" @click="removeVm(index)">移除</AppButton>
+                <AppButton size="sm" variant="danger" icon="trash" @click="removeVm(index)"
+                  >移除</AppButton
+                >
               </div>
               <div class="mt-2 grid grid-cols-6 gap-2">
                 <label class="col-span-2 flex flex-col gap-1 text-[10.5px] text-muted">
@@ -498,6 +651,68 @@ onMounted(() => void load())
                   />
                 </label>
               </div>
+              <div class="mt-2 grid grid-cols-4 gap-2">
+                <label class="flex flex-col gap-1 text-[10.5px] text-muted">
+                  网络模式
+                  <select
+                    v-model="vm.networkMode"
+                    class="h-8 rounded-md border border-line bg-surface px-2.5 text-[12px] text-ink outline-none focus:border-accent"
+                  >
+                    <option value="none">不配网（默认）</option>
+                    <option value="isolated">隔离（默认拒绝）</option>
+                    <option value="nat">NAT（可访问互联网）</option>
+                  </select>
+                </label>
+                <label class="flex flex-col gap-1 text-[10.5px] text-muted">
+                  VLAN（可选，1-4094）
+                  <input
+                    v-model="vm.networkVlan"
+                    :disabled="vm.networkMode === 'none'"
+                    placeholder="104"
+                    class="h-8 rounded-md border border-line bg-surface px-2.5 text-[12px] text-ink outline-none focus:border-accent disabled:opacity-50"
+                  />
+                </label>
+                <label class="flex flex-col gap-1 text-[10.5px] text-muted">
+                  子网（可选）
+                  <input
+                    v-model="vm.networkSubnet"
+                    :disabled="vm.networkMode === 'none'"
+                    placeholder="10.77.104.0/24（留空自动）"
+                    class="h-8 rounded-md border border-line bg-surface px-2.5 text-[12px] text-ink outline-none focus:border-accent disabled:opacity-50"
+                  />
+                </label>
+                <div class="flex flex-wrap items-end gap-3 pb-1.5 text-[11px] text-ink-soft">
+                  <label class="flex items-center gap-2">
+                    <ToggleSwitch
+                      v-model="vm.networkAllowSameRoom"
+                      :disabled="vm.networkMode === 'none'"
+                    />
+                    同房间互访
+                  </label>
+                  <label class="flex items-center gap-2">
+                    <ToggleSwitch
+                      v-model="vm.networkAllowInternet"
+                      :disabled="vm.networkMode !== 'nat'"
+                    />
+                    访问互联网
+                  </label>
+                </div>
+              </div>
+              <div v-if="vm.networkMode !== 'none'" class="mt-2">
+                <label class="flex flex-col gap-1 text-[10.5px] text-muted">
+                  allowlist（每行 cidr:port[-end][,port...][/tcp|/udp|/any]；留空=默认拒绝全部）
+                  <textarea
+                    v-model="vm.networkAllow"
+                    rows="2"
+                    placeholder="192.168.8.231:8080/tcp&#10;192.168.8.0/24:8000-8100/udp"
+                    class="rounded-md border border-line bg-surface px-2.5 py-1.5 font-mono text-[11.5px] text-ink outline-none focus:border-accent"
+                  />
+                </label>
+                <p class="mt-1 text-[10px] text-faint">
+                  隔离网络默认拒绝一切出站，仅放行上面列出的目标与端口；同一房间所有 VM
+                  必须使用相同的网络配置（共享一张房间桥）。
+                </p>
+              </div>
             </div>
             <datalist id="startup-base-volumes">
               <option v-for="option in vmDiskOptions" :key="option.id" :value="option.volume">
@@ -508,7 +723,9 @@ onMounted(() => void load())
 
           <div class="flex items-center justify-end gap-2 border-t border-line/70 pt-3">
             <AppButton :disabled="saving" @click="cancelEdit">取消</AppButton>
-            <AppButton variant="primary" icon="check" :loading="saving" @click="save">保存启动配置</AppButton>
+            <AppButton variant="primary" icon="check" :loading="saving" @click="save"
+              >保存启动配置</AppButton
+            >
           </div>
         </div>
       </template>

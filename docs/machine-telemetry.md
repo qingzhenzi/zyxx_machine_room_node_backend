@@ -54,6 +54,41 @@ v1.1 文中"证书 CN 就是 device_slot"的表述已过时；HEAD 起设备身�
   链路与限制见 `docs/wol.md`。
 - `schema` 版本号仍为 `1`（纯新增字段，旧 agent 不上报时控制台按「无 MAC」处理）。
 
+### 0.4 v1.5（2026-11-14）：机器实时 WS 通道 + 长操作进度（不破坏 v1.x）
+
+- **mTLS WS `/machine/realtime`**：agent 维持一条长连接承载实时样本与长操作进度，
+  替代「每样本一次 HTTP POST」；服务端在有人订阅时下发 `want {interval_ms}`，
+  最后一个观察者离开即发 `idle`。连不上/断开时 agent 自动回退 v1.4 的 HTTP
+  `/metrics` + `telemetry.live` 路径（开关 `ROOM_AGENT_REALTIME_WS=0` 可强制回退）。
+  帧协议见 room_node `crates/device-pki/src/realtime.rs`。
+  注意：旧版 `ROOM_AGENT_LIVE_PUSH=1`（无条件常推）与 WS 按需模型冲突，设置后 agent
+  会禁用 WS 通道、继续用 HTTP 常推。
+- **长操作进度**：agent 在 `op_progress` 帧里上报阶段（`accepted` / `cleanup_done` /
+  `scheduled` / `rejected`，可带 percent/message）；device-pki 与实时样本共用广播，
+  qe-api 以 SSE `op` 事件（`LiveOpProgressEvent`）转发，控制台据此显示“执行中”，
+  不必只靠 1s 轮询命令结果。
+- **在线心跳顺带增强**：WS 建连与客户端 ping 都会刷新 `device_session` 活动，
+  只跑 machine 角色的设备也有一条真实长连接作为在线依据。
+
+### 0.3 v1.4（2026-11-14）：实时指标按需推流 + 在线判定自适应窗口（不破坏 v1.x）
+
+- **在线/新鲜窗口**：`MachineSummary` 的 `online` / 新增 `agent_online` 不再用固定 5 分钟，
+  而是 `max(3 × sections.agent.fast_interval_secs, 30s)`；同时返回 `report_age_secs`、
+  `stale_after_secs`，`report_stale` 沿用旧字段名但语义变成「超过该窗口」。
+  读不到 fast 间隔（旧 agent / 无该字段）按 10s 兜底。详见
+  `docs/machine-realtime-observability.md` §2。
+- **实时指标按需推流**：agent 默认不再常驻 POST `/metrics`。浏览器打开
+  `GET /api/v1/admin/machines/{serial}/metrics/stream?interval_ms=…` 时，qe-api 经
+  `device_downlink` 下发 `telemetry.live {enabled, interval_ms, expires_at_ms}`；
+  `qe-agent-node` 写入 `<data_dir>/telemetry.live.json`，遥测线程在 TTL 内按间隔采样并
+  推送，过期自动停止（浏览器断开后最多 30s）。旧行为保留开关：
+  `ROOM_AGENT_LIVE_PUSH=1` 表示无条件持续推送（排障/兼容）；`ROOM_AGENT_LIVE_INTERVAL_MILLIS`
+  仍是本地采样基准间隔（默认 500，范围 100–5000）。
+- **会话落库**：`POST /machine/report` 同时节流刷新 `device_session`（15s），
+  只跑 machine 角色、不拉下行的设备也有会话行与在线事件。
+- **事件默认值**：`DEVICE_PRESENCE_NOTIFY_ONLINE` 默认改为 `true`（恢复在线也产生
+  `device.online` 事件）；仍受唯一键去重与离线判定的 250ms 去抖约束。
+
 ## 1. 角色与链路
 
 ```text
@@ -259,7 +294,8 @@ PUT 请求体（device 示例）：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/v1/admin/machines` | 机器分页：设备 + 房间/区域 + 最新快照摘要；支持 `area_id`、`room_id`、`keyword`、`health`、`page`、`page_size` |
+| GET | `/api/v1/admin/machines` | 机器分页：设备 + 房间/区域 + 最新快照摘要；支持 `area_id`、`room_id`、`keyword`、`health`、`state`、`page`、`page_size` |
+| GET | `/api/v1/admin/machines/summary` | 状态汇总：total/online/stale/offline/missing/alerts（服务端聚合，KPI 不受 page_size 限制） |
 | GET | `/api/v1/admin/machines/{serial}` | 机器详情：设备信息 + 最新完整快照 + 最近 N 条历史（`history_limit` 1–50，默认 20） |
 | GET | `/api/v1/admin/machines/{serial}/snapshots` | 快照历史元数据（分页，`limit` 1–200） |
 
@@ -271,6 +307,11 @@ PUT 请求体（device 示例）：
   "device_slot": "room-101",
   "status": "active",
   "online": "online",
+  "session_online": "online",
+  "agent_online": true,
+  "report_age_secs": 8,
+  "stale_after_secs": 30,
+  "report_stale": false,
   "last_seen_at": "2026-10-31T14:52:00Z",
   "room_id": "…", "room_code": "e2e-room", "room_name": "E2E 房间",
   "area_id": "…", "area_code": "e2e-area", "area_name": "E2E 区域",
@@ -291,7 +332,33 @@ PUT 请求体（device 示例）：
 }
 ```
 
-`report` 为 `null` 表示从未上报（控制台显示「未上报」）。`online` 来自 `device_session`。
+`report` 为 `null` 表示从未上报（控制台显示「未上报」）。
+
+在线字段语义：
+
+| 字段 | 说明 |
+|---|---|
+| `online` | 综合在线：`device_session.state='online'` 或最新快照未过期。 |
+| `session_online` | device-pki 会话原始状态（排障用，可能与 `agent_online` 不一致）。 |
+| `agent_online` | Agent 视角严格在线：有快照且 `report_age_secs <= stale_after_secs`。 |
+| `report_age_secs` / `stale_after_secs` | 快照年龄与新鲜窗口（秒），用于解释判定。 |
+| `report_stale` | `report_age_secs > stale_after_secs`（旧字段名，语义随 v1.4 调整）。 |
+
+### 5.1 实时指标（毫秒级，默认按需）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/admin/machines/{serial}/metrics/stream?interval_ms=` | SSE：`metric`（LiveMetricSample）/ `heartbeat`；`interval_ms` 200–5000，默认 1000 |
+
+- 权限 `device:read`；经 device-pki 内存中转，**不写数据库**。
+- 帧事件：`metric`（`LiveMetricSample`）、`op`（`LiveOpProgressEvent`，长操作进度）、
+  `command`（`LiveCommandResultEvent`，命令终态，控制台可据此减少 1s 轮询）、`heartbeat`。
+- 订阅时按以下顺序通知 agent（新旧兼容）：**机器实时 WS 通道**（v1.5，`want {interval_ms}`，
+  最后观察者离开发 `idle`）优先；老 agent 回退 `telemetry.live` 下行 + HTTP `/metrics`
+  （TTL 30s，每 20s 续期）。两条路径都不会在无订阅者时产生流量。
+- 形状：`{schema:"live-metrics/1", serial, device_slot, collected_at, cpu_usage_percent,
+  memory_usage_percent, disk_usage_percent, load1, uptime_secs}`。
+- 历史趋势仍由 fast/full 快照提供；实时样本不落库。
 
 ## 6. room-agent 配置（客户端侧）
 
@@ -306,6 +373,10 @@ PUT 请求体（device 示例）：
 | `MACHINE_REPORT_INTERVAL_SECS` / `--interval` | — | 旧参数别名（映射到 fast） |
 | `MACHINE_API_BASE` | `http://127.0.0.1:8080/api/v1` | 仅 bearer 模式 |
 | `MACHINE_AGENT_TOKEN` | bearer 必填 | 仅 bearer 模式 |
+| `ROOM_AGENT_LIVE_PUSH` | 未设置 | `1` = 无条件持续推送实时指标；默认按需（收到 `telemetry.live` 才推） |
+| `ROOM_AGENT_LIVE_INTERVAL_MILLIS` | `500` | 本地采样基准间隔（100–5000）；按需推流时由 `interval_ms` 覆盖 |
+| `ROOM_AGENT_LIVE_DEMAND` | `1` | 是否接受按需推流；`0` = 关闭按需链路（既不常推也不响应浏览器观测） |
+| `ROOM_AGENT_REALTIME_WS` | `1` | 机器实时 WS 通道（`/machine/realtime`）；`0` = 强制回退 HTTP 实时指标 |
 
 `--print` 只打印 payload，不需要证书/token；`--once` 发一份 full 后退出
 （成功 0 / 上报失败 1 / 配置错误 2）。
@@ -338,3 +409,71 @@ PUT 请求体（device 示例）：
   `/agent/config` 响应新增字段用默认值填充，旧 node-agent 忽略未知字段。
 - 旧客户端未升级时不会应用 device 级频率覆盖（它根本不拉 `/agent/config`）。
 - 服务端可先上 0016/0017，再升级客户端；顺序相反也可（0017 之前 device 配置写入会 400）。
+
+## 10. 主机电源事件（v1.6，2026-11-14）
+
+agent 在主机 shutdown/reboot 收尾完成后上报一次「最后一次电源事件」，供管理台回答
+「这台机器最后一次是关机还是重启、是否优雅、什么时候」。它与遥测快照相互独立：
+即使机器已经断电，事件也已经落库。
+
+### 10.1 上报端点（device-pki mTLS）
+
+`POST /agent/power-event`，身份完全来自设备证书：
+
+- `serial` 取证书 serial；`device_slot` 由服务端按证书身份解析；
+- 请求体不能指定其它 serial；
+- 返回 `202` + 新事件 id；校验失败 `400`，无证书 serial `401`。
+
+请求体：
+
+```json
+{
+  "schema": 1,
+  "action": "shutdown",
+  "graceful": true,
+  "requested_by": "agent",
+  "agent_version": "0.1.0",
+  "at": "2026-11-14T06:00:00Z",
+  "note": "VM 2/2 优雅停止；网络已清理（1 个）",
+  "details": {
+    "trigger": "signal:SIGTERM",
+    "hostname": "node-101",
+    "vms": [{ "name": "vm-1", "graceful": true, "forced": false }],
+    "network": { "ok": true, "networks": ["qevm-101"] },
+    "errors": []
+  }
+}
+```
+
+约束：`action` 只接受 `shutdown`/`poweroff`/`reboot`/`restart`（大小写不敏感）；
+`details` 必须是 JSON object 且 ≤64 KiB；`note` ≤512 字符。
+
+### 10.2 数据表
+
+`migrations/0043_machine_power_events.sql`：
+
+| 列 | 语义 |
+|----|------|
+| `serial` | 设备证书 serial（FK `device_enrollment`，级联删除） |
+| `device_slot` | 服务端解析出的槽位 |
+| `action` | `shutdown` / `reboot` |
+| `graceful` | 无 destroy、无清理错误、网络清理成功 |
+| `requested_by` / `source` | 发起方 / 来源（当前 `agent`） |
+| `agent_version` | 上报 agent 版本 |
+| `note` | 一句话摘要 |
+| `details` | agent 完整收尾明细 JSONB |
+| `created_at` | 服务端时间（排序基准） |
+
+### 10.3 管理端读取
+
+- `GET /api/v1/admin/machines`：每行 `MachineSummary.last_power_event`；
+- `GET /api/v1/admin/machines/{serial}`：同上（详情复用摘要字段）；
+- 前端机器详情「最近电源事件」展示：时间、动作、是否优雅、发起方、Agent 版本、备注/错误。
+
+`last_power_event` 为 `null` 表示该机器尚未上报过（旧 agent 或从未关机）。
+
+### 10.4 agent 本地兜底
+
+agent 无论上报是否成功，关机前都会先写
+`$DEVICE_DATA_DIR/last-shutdown.json`（默认 `/var/lib/qe-agent/last-shutdown.json`）。
+上报失败保留 `reported=false`，下次 agent 启动时自动补报；补报失败只记日志，不阻塞启动。

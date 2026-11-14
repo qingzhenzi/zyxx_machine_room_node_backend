@@ -117,6 +117,72 @@ pub struct StartupVm {
     /// 缺省 true。
     #[serde(default = "default_true")]
     pub auto_start: bool,
+    /// 可选配网声明；缺省 `null` = 不配网（保持旧配置语义）。
+    #[serde(default)]
+    pub network: Option<StartupVmNetwork>,
+}
+
+/// `config.vms[].network`：房间 VM 的配网声明（契约 §2）。
+///
+/// 缺省（字段不存在 / `null`）表示**不配网**：agent 不创建隔离桥，VM 也不挂
+/// 网卡，与接入本字段之前的行为完全一致。只有显式写 `network` 且
+/// `mode != "none"` 时 agent 才会 `NetworkManager::ensure` 并给 VM 接桥。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupVmNetwork {
+    /// `isolated` | `nat` | `none`。
+    pub mode: StartupNetworkMode,
+    /// 802.1Q VLAN ID（1..=4094）；指定后桥名固定为 `qevm-<vlan>`。
+    #[serde(default)]
+    pub vlan_id: Option<u16>,
+    /// VM 专用子网 `a.b.c.d/len`；缺省由 agent 按 room_id 派生 `10.77.<hash>.0/24`。
+    #[serde(default)]
+    pub subnet: Option<String>,
+    /// 默认拒绝前提下的放行白名单（端口必须显式列出）。
+    #[serde(default)]
+    pub allow_services: Vec<StartupAllowService>,
+    /// 是否允许访问互联网（仅 `mode = "nat"` 合法）。
+    #[serde(default)]
+    pub allow_internet: bool,
+    /// 是否允许同房间 VM 互访（默认 false，防横向）。
+    #[serde(default)]
+    pub allow_same_room: bool,
+}
+
+/// 配网隔离模式（字段值小写）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartupNetworkMode {
+    /// libvirt 隔离桥：无出口。
+    Isolated,
+    /// libvirt NAT 桥：可按 `allow_internet` 访问互联网。
+    Nat,
+    /// 不创建网络（等价于不配网）。
+    None,
+}
+
+/// `network.allow_services[]`：允许 VM 访问的 `cidr:ports`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupAllowService {
+    /// 目标网段/IP（如 `192.168.8.231/32`、`192.168.8.0/24`）。
+    pub cidr: String,
+    /// `tcp` | `udp` | `any`；缺省 `tcp`。
+    #[serde(default)]
+    pub proto: Option<String>,
+    /// 目标端口，至少一个；元素可以是数字 `8080` 或范围字符串 `"8000-8100"`。
+    #[serde(default)]
+    pub ports: Vec<StartupPort>,
+}
+
+/// 一个端口或端口段（与 `qe-vm-net::PortRange` 的 JSON 形状一致）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StartupPort {
+    /// 单端口。
+    Port(u16),
+    /// 端口或范围：`"8080"` / `"8000-8100"`。
+    Text(String),
 }
 
 /// 数据库中的一行启动配置。
@@ -401,6 +467,92 @@ mod tests {
                           "auto_start": true, "gpus": [] }]
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn config_parses_vm_network_and_echoes_full_shape() {
+        // 契约 §2 的 network 形状：mode 必填，其余缺省；落库/回显保持完整字段。
+        let config: StartupConfig = serde_json::from_value(serde_json::json!({
+            "vms": [{
+                "name": "lab-104",
+                "network": {
+                    "mode": "isolated",
+                    "vlan_id": 104,
+                    "subnet": "10.77.104.0/24",
+                    "allow_services": [
+                        { "cidr": "192.168.8.231", "proto": "tcp", "ports": [8080, "8000-8100"] }
+                    ],
+                    "allow_internet": false,
+                    "allow_same_room": false
+                }
+            }]
+        }))
+        .expect("deserialize");
+        let network = config.vms[0].network.as_ref().expect("network");
+        assert_eq!(network.mode, StartupNetworkMode::Isolated);
+        assert_eq!(network.vlan_id, Some(104));
+        assert_eq!(network.subnet.as_deref(), Some("10.77.104.0/24"));
+        assert_eq!(network.allow_services.len(), 1);
+        assert_eq!(
+            network.allow_services[0].ports,
+            vec![
+                StartupPort::Port(8080),
+                StartupPort::Text("8000-8100".into())
+            ]
+        );
+        assert!(!network.allow_internet);
+        assert!(!network.allow_same_room);
+
+        let value = serde_json::to_value(&config).expect("serialize");
+        assert_eq!(
+            value["vms"][0]["network"]["mode"],
+            serde_json::json!("isolated")
+        );
+        assert_eq!(
+            value["vms"][0]["network"]["vlan_id"],
+            serde_json::json!(104)
+        );
+        assert_eq!(
+            value["vms"][0]["network"]["allow_services"][0]["ports"],
+            serde_json::json!([8080, "8000-8100"])
+        );
+    }
+
+    #[test]
+    fn legacy_vm_config_without_network_still_parses() {
+        // JSONB 迁移兼容：旧配置没有 network 字段，反序列化后为 None（不配网），
+        // 回显时也保持 null，不需要新迁移即可继续读取旧行。
+        let config: StartupConfig = serde_json::from_value(serde_json::json!({
+            "vms": [{ "name": "lab-1", "base_volume": "real-debian-13-0.1.1" }]
+        }))
+        .expect("old config");
+        assert!(config.vms[0].network.is_none());
+        let value = serde_json::to_value(&config).expect("serialize");
+        assert!(value["vms"][0]["network"].is_null());
+    }
+
+    #[test]
+    fn network_rejects_unknown_fields_and_bad_mode() {
+        // 拼错字段名 / 未知 mode 必须报错，避免“保存成功但配网没生效”。
+        assert!(
+            serde_json::from_value::<StartupConfig>(serde_json::json!({
+                "vms": [{ "name": "lab-1", "network": { "mode": "isolated", "vallan": 1 } }]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<StartupConfig>(serde_json::json!({
+                "vms": [{ "name": "lab-1", "network": { "mode": "bridge" } }]
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<StartupConfig>(serde_json::json!({
+                "vms": [{ "name": "lab-1", "network": { "vlan_id": 1 } }]
+            }))
+            .is_err(),
+            "network.mode 必填"
         );
     }
 

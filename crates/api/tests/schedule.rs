@@ -98,6 +98,11 @@ fn test_config() -> Config {
         federation_token: None,
         public_enroll_endpoint: "https://localhost:4440".to_owned(),
         storage: None,
+        wol_broadcast_targets: Vec::new(),
+        wol_source_addr: None,
+        data_dir: std::path::PathBuf::from("/tmp/qe-api-test"),
+        iso_seed_dir: std::path::PathBuf::from("/tmp/qe-api-test/iso-seeds"),
+        iso_upload_chunk_mib: 64,
     }
 }
 

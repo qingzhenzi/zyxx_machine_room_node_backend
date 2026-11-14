@@ -9,12 +9,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use tokio::sync::broadcast;
 use tokio::time::{Duration, interval};
 
@@ -82,10 +82,7 @@ pub async fn ingest(
     if body.len() > MAX_SAMPLE_BYTES {
         return Err(Error::BadRequest("实时指标样本过大".into()));
     }
-    let serial = peer
-        .serial_hex
-        .as_deref()
-        .ok_or(Error::Unauthorized)?;
+    let serial = peer.serial_hex.as_deref().ok_or(Error::Unauthorized)?;
     // 只接受合法 JSON，避免浏览器收到坏帧。
     serde_json::from_str::<serde_json::Value>(&body)
         .map_err(|_| Error::BadRequest("实时指标必须是 JSON".into()))?;
@@ -97,30 +94,69 @@ pub async fn ingest(
 pub struct InternalQuery {
     #[serde(default)]
     pub token: String,
+    /// 浏览器侧期望的推流间隔（毫秒）；device-pki 原样转成 `want` 帧给 agent。
+    #[serde(default)]
+    pub interval_ms: Option<u64>,
 }
 
-/// 内部明文 WS：`GET /internal/metrics/{serial}?token=...`，qe-api 订阅。
+/// 内部明文 WS：`GET /internal/metrics/{serial}?token=...&interval_ms=...`，qe-api 订阅。
 pub async fn internal_stream(
     State(st): State<AppState>,
     Path(serial): Path<String>,
-    Query(_query): Query<InternalQuery>,
+    Query(query): Query<InternalQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
     let serial = serial.trim();
-    if serial.is_empty() || serial.len() > 128 || !serial.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+    if serial.is_empty()
+        || serial.len() > 128
+        || !serial.chars().all(|ch| ch.is_ascii_alphanumeric())
+    {
         return Err(Error::BadRequest("serial 非法".into()));
     }
+    let interval_ms = query.interval_ms.unwrap_or(1000).clamp(
+        crate::realtime::MIN_INTERVAL_MS,
+        crate::realtime::MAX_INTERVAL_MS,
+    );
     let hub = Arc::clone(&st.metrics);
+    let realtime = Arc::clone(&st.realtime);
     let serial = serial.to_owned();
     Ok(ws
-        .on_upgrade(move |socket| stream_socket(socket, hub, serial))
+        .on_upgrade(move |socket| stream_socket(socket, hub, realtime, serial, interval_ms))
         .into_response())
 }
 
-async fn stream_socket(mut socket: WebSocket, hub: Arc<MetricsHub>, serial: String) {
+/// 观察者离开时递减需求计数；最后一个观察者离开会通知 agent `idle`。
+struct ViewerGuard {
+    realtime: Arc<crate::realtime::RealtimeHub>,
+    serial: String,
+}
+
+impl Drop for ViewerGuard {
+    fn drop(&mut self) {
+        self.realtime.viewer_closed(&self.serial);
+    }
+}
+
+async fn stream_socket(
+    mut socket: WebSocket,
+    hub: Arc<MetricsHub>,
+    realtime: Arc<crate::realtime::RealtimeHub>,
+    serial: String,
+    interval_ms: u64,
+) {
+    // 先登记需求：agent 若已连着实时通道会立即收到 want；否则重连时补发。
+    realtime.viewer_opened(&serial, interval_ms);
+    let _viewer = ViewerGuard {
+        realtime,
+        serial: serial.clone(),
+    };
     let (latest, mut receiver) = hub.subscribe(&serial);
     if let Some(latest) = latest {
-        if socket.send(Message::Text(latest.to_string().into())).await.is_err() {
+        if socket
+            .send(Message::Text(latest.to_string().into()))
+            .await
+            .is_err()
+        {
             return;
         }
     }

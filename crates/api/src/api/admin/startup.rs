@@ -11,11 +11,16 @@
 //! - `vms` 0..=32，`name` 去重，`base_volume` / `base_path` 互斥，`gpu` ≤2；
 //! - `vcpus` 1..=64（缺省 2）、`memory_mib` 256..=262144（缺省 2048）、
 //!   `disk_gb` 1..=2048（缺省 20）、`auto_start` 缺省 true；
+//! - `vms[].network` 可选：`mode` 必填，VLAN 1..=4094、子网必须是 RFC1918 私有
+//!   网段且至少 /30，allowlist 不允许 `0.0.0.0/0`、端口必须显式；同一房间的
+//!   所有 VM 共享一张房间桥，因此 `network` 配置必须完全一致；
+//! - 缺省 `network=null` = 不配网（旧配置语义不变）；
 //! - `auto_pull` / `auto_start_vm` 缺省 true。
 //!
 //! 缺省值由 `qe_db::startup` 的 serde 默认值负责，因此落库与回显的配置总是完整形状。
 
 use std::collections::HashSet;
+use std::net::Ipv4Addr;
 
 use axum::{
     Json,
@@ -29,7 +34,8 @@ use crate::{
     api::extractors::{ApiJson, AuthUser, ClientIp},
     auth::authorization,
     db::startup::{
-        MAX_STARTUP_IMAGES, MAX_STARTUP_VMS, RoomStartupProfile, StartupConfig, StartupVm,
+        MAX_STARTUP_IMAGES, MAX_STARTUP_VMS, RoomStartupProfile, StartupAllowService,
+        StartupConfig, StartupNetworkMode, StartupPort, StartupVm, StartupVmNetwork,
     },
     domain::{rbac::permissions, storage::ArtifactStatus},
     error::{AppError, AppResult},
@@ -183,8 +189,23 @@ fn validate_config(config: StartupConfig) -> AppResult<StartupConfig> {
     // vms 去重 + 逐字段校验（保留首次出现）。
     let mut seen_names = HashSet::new();
     let mut vms = Vec::with_capacity(config.vms.len());
+    let mut room_network: Option<StartupVmNetwork> = None;
     for (index, vm) in config.vms.into_iter().enumerate() {
         let vm = validate_vm(vm, index)?;
+        // 同房间所有 VM 共用一张桥（network_name 由 room_id/vlan 决定），
+        // 配置不一致会让每轮 reconcile 互相覆盖，因此写入前就拒绝。
+        if let Some(network) = vm.network.as_ref() {
+            match &room_network {
+                None => room_network = Some(network.clone()),
+                Some(expected) if expected != network => {
+                    return Err(AppError::bad_request(format!(
+                        "config.vms[{index}].network 与同房间其它 VM 不一致：\
+                         所有 VM 共享一张房间桥，mode/vlan_id/subnet/allowlist 必须完全相同"
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
         if seen_names.insert(vm.name.clone()) {
             vms.push(vm);
         }
@@ -247,6 +268,8 @@ fn validate_vm(vm: StartupVm, index: usize) -> AppResult<StartupVm> {
         })?);
     }
 
+    let network = validate_vm_network(vm.network, &prefix)?;
+
     Ok(StartupVm {
         name,
         vcpus,
@@ -256,7 +279,259 @@ fn validate_vm(vm: StartupVm, index: usize) -> AppResult<StartupVm> {
         base_path,
         gpu,
         auto_start: vm.auto_start,
+        network,
     })
+}
+
+/// 校验并规范化 `config.vms[].network`。
+///
+/// 规则与 `qe-vm-net::VmNetworkProfile::validate` 对齐（agent 侧仍会再校验一次）：
+/// - 缺省 / `mode="none"`：不配网；`none` 时不允许再带 vlan/subnet/allowlist；
+/// - `vlan_id` 1..=4094；
+/// - `subnet` 必须是 RFC1918、前缀 <=30，并归一为网络地址；
+/// - `allow_internet` 只允许 `mode="nat"`；
+/// - allowlist：`cidr` 不能是 `0.0.0.0/0`、不能与自身子网重叠、端口必须显式且合法；
+/// - `proto` 归一为小写 `tcp`/`udp`/`any`，缺省 `tcp`。
+fn validate_vm_network(
+    network: Option<StartupVmNetwork>,
+    prefix: &str,
+) -> AppResult<Option<StartupVmNetwork>> {
+    let Some(mut network) = network else {
+        return Ok(None);
+    };
+    let field = format!("{prefix}.network");
+
+    if let Some(vlan) = network.vlan_id
+        && !(1..=4094).contains(&vlan)
+    {
+        return Err(AppError::bad_request(format!(
+            "{field}.vlan_id 越界: {vlan}（允许 1..=4094）"
+        )));
+    }
+
+    if network.mode == StartupNetworkMode::None {
+        if network.allow_internet {
+            return Err(AppError::bad_request(format!(
+                "{field}.allow_internet 不能与 mode=none 组合（没有网络出口）"
+            )));
+        }
+        if network.vlan_id.is_some()
+            || network
+                .subnet
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            || !network.allow_services.is_empty()
+        {
+            return Err(AppError::bad_request(format!(
+                "{field} 的 mode=none 不创建网络，不能同时配置 vlan_id/subnet/allow_services"
+            )));
+        }
+        // 空字符串归一成 null，避免回显 `"subnet": ""` 这种歧义形状。
+        network.subnet = None;
+        return Ok(Some(network));
+    }
+
+    if network.allow_internet && network.mode != StartupNetworkMode::Nat {
+        return Err(AppError::bad_request(format!(
+            "{field}.allow_internet 需要 mode=nat（isolated 没有出口）"
+        )));
+    }
+
+    // 子网归一：显式给出时必须私有、至少 /30；缺省由 agent 按 room_id 派生。
+    let subnet = match network
+        .subnet
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => None,
+        Some(raw) => {
+            let (addr, len) = parse_cidr(raw).ok_or_else(|| {
+                AppError::bad_request(format!(
+                    "{field}.subnet 非法: {raw:?}（示例 10.77.104.0/24）"
+                ))
+            })?;
+            if len > 30 {
+                return Err(AppError::bad_request(format!(
+                    "{field}.subnet {raw:?} 太小（/ {len}），至少需要 /30 才能放网关与 DHCP"
+                )));
+            }
+            let net = mask_ipv4(addr, len);
+            if !is_private_ipv4(net) || !is_private_ipv4(broadcast_ipv4(net, len)) {
+                return Err(AppError::bad_request(format!(
+                    "{field}.subnet {raw:?} 不是 RFC1918 私有网段（10/8、172.16/12、192.168/16）"
+                )));
+            }
+            Some(format!("{net}/{len}"))
+        }
+    };
+
+    let mut allow_services = Vec::with_capacity(network.allow_services.len());
+    for (index, service) in network.allow_services.into_iter().enumerate() {
+        allow_services.push(validate_allow_service(
+            service,
+            subnet.as_deref(),
+            &format!("{field}.allow_services[{index}]"),
+        )?);
+    }
+
+    network.subnet = subnet;
+    network.allow_services = allow_services;
+    Ok(Some(network))
+}
+
+/// 校验一条 allowlist；返回归一化后的条目。
+fn validate_allow_service(
+    service: StartupAllowService,
+    own_subnet: Option<&str>,
+    field: &str,
+) -> AppResult<StartupAllowService> {
+    let raw_cidr = service.cidr.trim();
+    let (addr, len) = parse_cidr(raw_cidr).ok_or_else(|| {
+        AppError::bad_request(format!(
+            "{field}.cidr 非法: {raw_cidr:?}（示例 192.168.8.231/32 或 192.168.8.0/24）"
+        ))
+    })?;
+    if len == 0 {
+        return Err(AppError::bad_request(format!(
+            "{field}.cidr 不能用 0.0.0.0/0（等于放行所有目标）；请写具体 CIDR/IP"
+        )));
+    }
+    let target = mask_ipv4(addr, len);
+    if let Some(own) = own_subnet.and_then(parse_cidr) {
+        let own_net = mask_ipv4(own.0, own.1);
+        if overlaps(target, len, own_net, own.1) {
+            return Err(AppError::bad_request(format!(
+                "{field}.cidr {raw_cidr:?} 与 VM 自身子网 {own_net}/{} 重叠：这等于放行横向访问",
+                own.1
+            )));
+        }
+    }
+
+    let proto = match service
+        .proto
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => "tcp".to_owned(),
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "tcp" => "tcp".to_owned(),
+            "udp" => "udp".to_owned(),
+            "any" => "any".to_owned(),
+            other => {
+                return Err(AppError::bad_request(format!(
+                    "{field}.proto 不支持: {other:?}（允许 tcp|udp|any）"
+                )));
+            }
+        },
+    };
+
+    if service.ports.is_empty() {
+        return Err(AppError::bad_request(format!(
+            "{field}.ports 不能为空（必须显式列出端口，避免误放行全部端口）"
+        )));
+    }
+    let mut ports = Vec::with_capacity(service.ports.len());
+    for (index, port) in service.ports.into_iter().enumerate() {
+        ports.push(
+            normalize_port(port).map_err(|reason| {
+                AppError::bad_request(format!("{field}.ports[{index}] {reason}"))
+            })?,
+        );
+    }
+
+    Ok(StartupAllowService {
+        cidr: format!("{target}/{len}"),
+        proto: Some(proto),
+        ports,
+    })
+}
+
+/// 归一端口：数字保持数字，范围字符串解析后重新格式化（拒绝 0 与反向范围）。
+fn normalize_port(port: StartupPort) -> Result<StartupPort, String> {
+    match port {
+        StartupPort::Port(0) => Err("端口 0 不合法".to_owned()),
+        StartupPort::Port(port) => Ok(StartupPort::Port(port)),
+        StartupPort::Text(raw) => {
+            let raw = raw.trim();
+            let (start, end) = match raw.split_once('-') {
+                Some((start, end)) => (start.trim(), Some(end.trim())),
+                None => (raw, None),
+            };
+            let start: u16 = start
+                .parse()
+                .map_err(|_| format!("非法: {raw:?}（示例 8080 或 8000-8100）"))?;
+            let end: u16 = match end {
+                Some(end) => end
+                    .parse()
+                    .map_err(|_| format!("非法: {raw:?}（示例 8080 或 8000-8100）"))?,
+                None => start,
+            };
+            if start == 0 || end == 0 {
+                return Err(format!("端口 0 不合法: {raw:?}"));
+            }
+            if start > end {
+                return Err(format!("端口段起始大于结束: {raw:?}"));
+            }
+            if start == end {
+                Ok(StartupPort::Port(start))
+            } else {
+                Ok(StartupPort::Text(format!("{start}-{end}")))
+            }
+        }
+    }
+}
+
+/// 解析 `a.b.c.d[/len]`（缺省 /32）。
+fn parse_cidr(raw: &str) -> Option<(Ipv4Addr, u8)> {
+    let raw = raw.trim();
+    let (addr, len) = match raw.split_once('/') {
+        Some((addr, len)) => (addr.trim(), Some(len.trim())),
+        None => (raw, None),
+    };
+    let addr: Ipv4Addr = addr.parse().ok()?;
+    let len: u8 = match len {
+        Some(len) => len.parse().ok()?,
+        None => 32,
+    };
+    (len <= 32).then_some((addr, len))
+}
+
+fn mask_ipv4(addr: Ipv4Addr, len: u8) -> Ipv4Addr {
+    let mask = if len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(len))
+    };
+    Ipv4Addr::from(u32::from(addr) & mask)
+}
+
+fn broadcast_ipv4(net: Ipv4Addr, len: u8) -> Ipv4Addr {
+    let mask = if len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(len))
+    };
+    Ipv4Addr::from(u32::from(net) | !mask)
+}
+
+fn overlaps(left: Ipv4Addr, left_len: u8, right: Ipv4Addr, right_len: u8) -> bool {
+    // 取较短前缀（更宽的网段）比较：10.0.0.0/8 与 10.1.0.0/16 必须判为重叠。
+    let len = left_len.min(right_len);
+    let mask = if len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(len))
+    };
+    (u32::from(left) & mask) == (u32::from(right) & mask)
+}
+
+fn is_private_ipv4(addr: Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    octets[0] == 10
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
 }
 
 /// 校验 u32 计数在契约范围内（返回原值；serde 已排除 >u32::MAX 的输入）。
@@ -591,6 +866,176 @@ mod tests {
             })))
             .is_err()
         );
+    }
+
+    #[test]
+    fn validate_config_accepts_and_normalizes_vm_network() {
+        let config = validate_config(config_from_json(json!({
+            "vms": [{
+                "name": "lab-104",
+                "network": {
+                    "mode": "isolated",
+                    "vlan_id": 104,
+                    "subnet": "10.77.104.9/24",
+                    "allow_services": [{
+                        "cidr": "192.168.8.231",
+                        "ports": [8080, "8000-8100", "9000-9000"]
+                    }]
+                }
+            }]
+        })))
+        .expect("valid network");
+        let network = config.vms[0].network.as_ref().expect("network");
+        assert_eq!(network.mode, StartupNetworkMode::Isolated);
+        assert_eq!(network.vlan_id, Some(104));
+        // 子网按前缀归一，IP 不带前缀时归一为 /32。
+        assert_eq!(network.subnet.as_deref(), Some("10.77.104.0/24"));
+        assert_eq!(network.allow_services[0].cidr.as_str(), "192.168.8.231/32");
+        // proto 缺省 tcp；单端口范围归一成数字。
+        assert_eq!(network.allow_services[0].proto.as_deref(), Some("tcp"));
+        assert_eq!(
+            network.allow_services[0].ports,
+            vec![
+                StartupPort::Port(8080),
+                StartupPort::Text("8000-8100".into()),
+                StartupPort::Port(9000),
+            ]
+        );
+        assert!(!network.allow_internet);
+        assert!(!network.allow_same_room);
+
+        // GET/PUT 回显：落库/响应里的 network 是归一化后的完整形状。
+        let value = serde_json::to_value(&config).expect("serialize");
+        assert_eq!(value["vms"][0]["network"]["mode"], json!("isolated"));
+        assert_eq!(
+            value["vms"][0]["network"]["subnet"],
+            json!("10.77.104.0/24")
+        );
+        assert_eq!(
+            value["vms"][0]["network"]["allow_services"][0]["proto"],
+            json!("tcp")
+        );
+
+        // nat + allow_internet 合法。
+        assert!(
+            validate_config(config_from_json(json!({
+                "vms": [{
+                    "name": "lab-1",
+                    "network": { "mode": "nat", "allow_internet": true }
+                }]
+            })))
+            .is_ok()
+        );
+
+        // mode=none 等价不配网（不允许再带网络字段）。
+        assert!(
+            validate_config(config_from_json(json!({
+                "vms": [{ "name": "lab-1", "network": { "mode": "none" } }]
+            })))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_bad_vm_network() {
+        let cases = [
+            (
+                json!({ "mode": "isolated", "vlan_id": 0 }),
+                "network.vlan_id",
+            ),
+            (
+                json!({ "mode": "isolated", "vlan_id": 4095 }),
+                "network.vlan_id",
+            ),
+            (
+                json!({ "mode": "isolated", "subnet": "10.77.1.0/31" }),
+                "network.subnet",
+            ),
+            (
+                json!({ "mode": "isolated", "subnet": "8.8.8.0/24" }),
+                "network.subnet",
+            ),
+            (
+                json!({ "mode": "isolated", "subnet": "not-a-cidr" }),
+                "network.subnet",
+            ),
+            (
+                json!({ "mode": "isolated", "allow_internet": true }),
+                "allow_internet",
+            ),
+            (json!({ "mode": "none", "vlan_id": 1 }), "mode=none"),
+            (
+                json!({ "mode": "isolated", "allow_services": [{ "cidr": "192.168.8.1", "ports": [] }] }),
+                "network.allow_services[0].ports",
+            ),
+            (
+                json!({ "mode": "isolated", "allow_services": [{ "cidr": "0.0.0.0/0", "ports": [80] }] }),
+                "0.0.0.0/0",
+            ),
+            (
+                json!({ "mode": "isolated", "allow_services": [{ "cidr": "192.168.8.1", "proto": "sctp", "ports": [80] }] }),
+                "network.allow_services[0].proto",
+            ),
+            (
+                json!({ "mode": "isolated", "allow_services": [{ "cidr": "192.168.8.1", "ports": [0] }] }),
+                "network.allow_services[0].ports[0]",
+            ),
+            (
+                json!({ "mode": "isolated", "subnet": "10.77.1.0/24",
+                        "allow_services": [{ "cidr": "10.77.1.0/24", "ports": [80] }] }),
+                "重叠",
+            ),
+        ];
+        for (network, expected) in cases {
+            let error = validate_config(config_from_json(json!({
+                "vms": [{ "name": "lab-1", "network": network }]
+            })))
+            .expect_err("必须拒绝");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, error={error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_config_rejects_inconsistent_room_network() {
+        // 同房间共享一张桥：不同 VM 的网络配置必须一致。
+        let error = validate_config(config_from_json(json!({
+            "vms": [
+                { "name": "lab-1", "network": { "mode": "isolated", "vlan_id": 101 } },
+                { "name": "lab-2", "network": { "mode": "nat", "vlan_id": 102 } }
+            ]
+        })))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("config.vms[1].network"),
+            "{error}"
+        );
+
+        // 两台 VM 配置相同则允许。
+        assert!(
+            validate_config(config_from_json(json!({
+                "vms": [
+                    { "name": "lab-1", "network": { "mode": "isolated", "vlan_id": 101 } },
+                    { "name": "lab-2", "network": { "mode": "isolated", "vlan_id": 101 } }
+                ]
+            })))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_config_keeps_legacy_vm_without_network() {
+        let config = validate_config(config_from_json(json!({
+            "vms": [{ "name": "lab-1" }]
+        })))
+        .expect("legacy config");
+        assert!(config.vms[0].network.is_none());
+
+        // 回显/下发 JSON 里 network 为 null，agent 侧 serde default 可解析。
+        let value = serde_json::to_value(&config).expect("serialize");
+        assert!(value["vms"][0]["network"].is_null());
     }
 
     #[test]

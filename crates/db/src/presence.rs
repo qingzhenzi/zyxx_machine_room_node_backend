@@ -103,6 +103,18 @@ impl PresenceRepo {
         Ok(id)
     }
 
+    /// 每台设备最近一次在线状态（用于 qe-api 重启后种子化 presence 基线）。
+    pub async fn latest_states(&self) -> DbResult<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT ON (serial) serial, current_state
+               FROM device_presence_events
+              ORDER BY serial, id DESC",
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows)
+    }
+
     /// 幂等创建投递；返回 `true` 表示本次新插入。
     pub async fn add_delivery(&self, event_id: i64, url: &str) -> DbResult<bool> {
         let id = sqlx::query_scalar::<_, i64>(

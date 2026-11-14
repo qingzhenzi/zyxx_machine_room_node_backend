@@ -590,6 +590,7 @@ export interface ImageArtifact {
   updated_at: string
   version: string
   // 归属 / 可见性 / 分层就绪（image-build-lifecycle.md §1/§3；旧服务端可能不返回）
+  namespace_id?: string
   owner_user_id?: string | null
   owner_name?: string | null
   namespace_slug?: string | null
@@ -959,19 +960,23 @@ export interface MachineSnapshotPoint {
 }
 
 export interface MachineSummary {
+  agent_online: boolean
   area_code: string | null
   area_id: string | null
   area_name: string | null
   device_slot: string
+  last_power_event: MachinePowerEvent | null
   last_seen_at: string | null
   online: 'online' | 'offline' | null
   report: MachineReportSummary | null
+  report_age_secs: number | null
   report_stale: boolean
   room_code: string | null
   room_id: string | null
   room_name: string | null
   serial: string
   session_online: 'online' | 'offline' | null
+  stale_after_secs: number
   status: 'pending' | 'issued' | 'active' | 'rejected' | 'revoked'
 }
 
@@ -1877,4 +1882,70 @@ export interface WeeklySlot {
   schedule_id?: string
   start_time?: string
   teacher?: string
+}
+
+// ---- OpenAPI 新增类型（由 docs/openapi-types.py 生成后手工合并）----
+export type ImageVisibility = 'private' | 'room' | 'area' | 'public'
+
+export interface AgentPoweroffAccepted {
+  request_id: string
+  warn?: string | null
+}
+
+export interface ImageArtifactView extends ImageArtifact {
+  namespace_slug?: string
+  owner_name?: string | null
+  readiness?: 'building' | 'uploaded' | 'verified' | 'ready' | 'unavailable'
+}
+
+export interface LiveCommandResultEvent {
+  at?: string | null
+  data?: Record<string, unknown> | null
+  error?: string | null
+  ok: boolean
+  request_id: string
+  status: 'ok' | 'error'
+  type: 'command_result'
+}
+
+export interface LiveOpProgressEvent {
+  at?: string | null
+  kind: string
+  message?: string | null
+  percent?: number | null
+  request_id: string
+  stage: string
+  type: 'op_progress'
+}
+
+export interface MachineCommandReply {
+  created_at: string
+  data?: Record<string, unknown> | null
+  error?: string | null
+  request_id: string
+  status: 'pending' | 'ok' | 'error' | 'timeout'
+  updated_at: string
+}
+
+export interface MachinePowerEvent {
+  action: 'shutdown' | 'reboot'
+  agent_version: string | null
+  created_at: string
+  details: Record<string, unknown>
+  device_slot: string
+  graceful: boolean
+  id: number
+  note: string | null
+  requested_by: string | null
+  serial: string
+  source: string
+}
+
+export interface MachineStateCounts {
+  alerts: number
+  missing: number
+  offline: number
+  online: number
+  stale: number
+  total: number
 }

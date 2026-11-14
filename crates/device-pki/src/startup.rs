@@ -55,6 +55,10 @@ pub struct StartupImage {
 /// `GET /agent/startup` 响应（契约 §4.1）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StartupReply {
+    /// 设备所属房间；agent 用它派生配网 profile（`qe-vm-net` 的 room_id）。
+    /// 槽位未绑定房间 / 配置停用时为 `null`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<Uuid>,
     pub revision: i64,
     pub enabled: bool,
     pub auto_pull: bool,
@@ -67,6 +71,7 @@ impl StartupReply {
     /// 无配置 / `enabled=false` 时的标准响应：200 + revision=0 + 空列表。
     fn disabled() -> Self {
         Self {
+            room_id: None,
             revision: 0,
             enabled: false,
             auto_pull: true,
@@ -179,6 +184,7 @@ pub async fn get_startup(State(st): State<AppState>, peer: PeerCert) -> Result<J
     );
 
     Ok(Json(StartupReply {
+        room_id: Some(room_id),
         revision: effective.revision,
         enabled: true,
         auto_pull: effective.auto_pull,
@@ -410,6 +416,7 @@ mod tests {
         .expect("config");
 
         let reply = StartupReply {
+            room_id: Some(Uuid::new_v4()),
             revision: 3,
             enabled: true,
             auto_pull: config.auto_pull,
@@ -451,6 +458,7 @@ mod tests {
                     base_path: None,
                     gpu: Vec::new(),
                     auto_start: true,
+                    network: None,
                 }],
             },
             revision,

@@ -46,14 +46,14 @@ pub struct PresenceRow {
     pub last_seen_at: Option<DateTime<Utc>>,
     /// 触发本次扫描结果的 `device_session.updated_at`，作为事件幂等键的一部分。
     pub source_updated_at: DateTime<Utc>,
-    pub room_id: Uuid,
-    pub room_code: String,
-    pub room_name: String,
+    pub room_id: Option<Uuid>,
+    pub room_code: Option<String>,
+    pub room_name: Option<String>,
     /// 房间级 webhook（`rooms.webhook_url`）。
     pub webhook_url: Option<String>,
-    pub area_id: Uuid,
-    pub area_code: String,
-    pub area_name: String,
+    pub area_id: Option<Uuid>,
+    pub area_code: Option<String>,
+    pub area_name: Option<String>,
     /// 区域级 webhook（`areas.webhook_url`）。
     pub area_webhook_url: Option<String>,
 }
@@ -69,12 +69,12 @@ pub struct PresenceEvent {
     pub last_seen_at: Option<DateTime<Utc>>,
     pub previous_state: String,
     pub current_state: String,
-    pub room_id: Uuid,
-    pub room_code: String,
-    pub room_name: String,
-    pub area_id: Uuid,
-    pub area_code: String,
-    pub area_name: String,
+    pub room_id: Option<Uuid>,
+    pub room_code: Option<String>,
+    pub room_name: Option<String>,
+    pub area_id: Option<Uuid>,
+    pub area_code: Option<String>,
+    pub area_name: Option<String>,
     #[serde(skip)]
     pub webhook_url: Option<String>,
     #[serde(skip)]
@@ -159,6 +159,16 @@ pub fn resolve_webhook_url<'a>(
         .find(|url| !url.trim().is_empty())
 }
 
+impl PresenceTracker {
+    /// 从历史事件种子化基线：qe-api 重启后不必等「第一轮建立基线」，
+    /// 停机期间发生的翻转会在首个 tick 补发（至少不会永久漏掉）。
+    pub fn seed(&mut self, states: impl IntoIterator<Item = (String, String)>) {
+        for (serial, state) in states {
+            self.last_online.insert(serial, state == "online");
+        }
+    }
+}
+
 /// 第 `attempts` 次失败后的重试间隔：`min(300s, base * 2^(attempts-1))`。
 ///
 /// `attempts` 从 1 开始（首次失败后的下一次重试）。
@@ -197,6 +207,11 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
             }
         };
         let mut tracker = PresenceTracker::default();
+        // 重启后先回填基线：停机期间的状态翻转会在首个 tick 被检测到并补发。
+        match state.presence.latest_states().await {
+            Ok(states) => tracker.seed(states),
+            Err(error) => tracing::warn!(%error, "加载设备在线基线失败，首轮将重新建立基线"),
+        }
         let mut ticker = interval(Duration::from_secs(tick_secs));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -222,7 +237,7 @@ async fn persist_event(state: &AppState, event: PresenceEvent, global_webhook_ur
         event = %event.event,
         serial = %event.serial,
         device_slot = %event.device_slot,
-        room_id = %event.room_id,
+        room_id = ?event.room_id,
         "设备在线状态变化"
     );
 
@@ -230,8 +245,8 @@ async fn persist_event(state: &AppState, event: PresenceEvent, global_webhook_ur
     let new_event = NewPresenceEvent {
         serial: event.serial.clone(),
         device_slot: event.device_slot.clone(),
-        room_id: Some(event.room_id),
-        area_id: Some(event.area_id),
+        room_id: event.room_id,
+        area_id: event.area_id,
         previous_state: event.previous_state.clone(),
         current_state: event.current_state.clone(),
         source_updated_at: event.source_updated_at,
@@ -255,8 +270,8 @@ async fn persist_event(state: &AppState, event: PresenceEvent, global_webhook_ur
         id: event_id,
         serial: event.serial.clone(),
         device_slot: event.device_slot.clone(),
-        room_id: Some(event.room_id),
-        area_id: Some(event.area_id),
+        room_id: event.room_id,
+        area_id: event.area_id,
         previous_state: event.previous_state.clone(),
         current_state: event.current_state.clone(),
         occurred_at: event.occurred_at,
@@ -429,13 +444,13 @@ type RawPresenceRow = (
     String,
     String,
     DateTime<Utc>,
-    Uuid,
-    String,
-    String,
+    Option<Uuid>,
     Option<String>,
-    Uuid,
-    String,
-    String,
+    Option<String>,
+    Option<String>,
+    Option<Uuid>,
+    Option<String>,
+    Option<String>,
     Option<String>,
 );
 
@@ -447,9 +462,8 @@ async fn load_rows(pool: &PgPool) -> Result<Vec<PresenceRow>, sqlx::Error> {
            FROM device_session ds
            LEFT JOIN rooms rp ON rp.device_slot = ds.device_slot
            LEFT JOIN room_devices rd ON rd.device_slot = ds.device_slot
-           JOIN rooms r ON r.id = COALESCE(rp.id, rd.room_id)
-           JOIN areas a ON a.id = r.area_id
-          WHERE r.is_active = true",
+           LEFT JOIN rooms r ON r.id = COALESCE(rp.id, rd.room_id) AND r.is_active = true
+           LEFT JOIN areas a ON a.id = r.area_id",
     )
     .fetch_all(pool)
     .await?;
@@ -485,15 +499,44 @@ mod tests {
             online,
             last_seen_at: None,
             source_updated_at: Utc::now(),
-            room_id: Uuid::nil(),
-            room_code: "r1".into(),
-            room_name: "房间 1".into(),
+            room_id: Some(Uuid::nil()),
+            room_code: Some("r1".into()),
+            room_name: Some("房间 1".into()),
             webhook_url: Some("http://127.0.0.1:1/hook".into()),
-            area_id: Uuid::nil(),
-            area_code: "a1".into(),
-            area_name: "区域 1".into(),
+            area_id: Some(Uuid::nil()),
+            area_code: Some("a1".into()),
+            area_name: Some("区域 1".into()),
             area_webhook_url: None,
         }
+    }
+
+    #[test]
+    fn seeded_baseline_detects_downtime_transition_on_first_tick() {
+        let mut tracker = PresenceTracker::default();
+        tracker.seed(vec![("s1".to_owned(), "online".to_owned())]);
+        let events = tracker.observe(&[row("s1", false)], false);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, EVENT_OFFLINE);
+        assert_eq!(events[0].previous_state, "online");
+    }
+
+    #[test]
+    fn unbound_machine_event_has_no_room_and_does_not_panic() {
+        let mut tracker = PresenceTracker::default();
+        let mut unbound = row("s2", true);
+        unbound.room_id = None;
+        unbound.room_code = None;
+        unbound.room_name = None;
+        unbound.area_id = None;
+        unbound.area_code = None;
+        unbound.area_name = None;
+        unbound.webhook_url = None;
+        assert!(tracker.observe(&[unbound.clone()], false).is_empty());
+        unbound.online = false;
+        let events = tracker.observe(&[unbound], false);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].room_id, None);
+        assert_eq!(events[0].area_code, None);
     }
 
     #[test]
@@ -512,8 +555,8 @@ mod tests {
         assert_eq!(events[0].previous_state, "online");
         assert_eq!(events[0].current_state, "offline");
         assert_eq!(events[0].serial, "s1");
-        assert_eq!(events[0].room_code, "r1");
-        assert_eq!(events[0].area_code, "a1");
+        assert_eq!(events[0].room_code.as_deref(), Some("r1"));
+        assert_eq!(events[0].area_code.as_deref(), Some("a1"));
     }
 
     #[test]

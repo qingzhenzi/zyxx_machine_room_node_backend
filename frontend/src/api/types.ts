@@ -106,6 +106,8 @@ export interface MachineListParams extends PageParams {
   keyword?: string
   /** ok / warning / critical / missing（从未上报）/ unknown */
   health?: string
+  /** online / stale / offline / missing（观测状态筛选） */
+  state?: string
 }
 
 export interface MachineDetailParams {

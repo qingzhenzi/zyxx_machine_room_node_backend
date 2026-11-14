@@ -380,6 +380,7 @@ mod tests {
             vnc: Arc::new(crate::vnc::VncHub::new(crate::vnc::VNC_PAIR_TIMEOUT)),
             vnc_internal_token: None,
             metrics: Arc::new(crate::metrics::MetricsHub::new()),
+            realtime: Arc::new(crate::realtime::RealtimeHub::new()),
         }
     }
 

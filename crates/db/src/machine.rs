@@ -98,6 +98,41 @@ pub struct MachineReportSummary {
     pub uptime_secs: Option<i64>,
 }
 
+/// 一次机器电源事件（shutdown / reboot）。
+///
+/// 由 device-pki mTLS `POST /agent/power-event` 写入，agent 本地同时保留
+/// `last-shutdown.json`；管理台只展示最新一条，details 保留完整明细供排障。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromRow)]
+pub struct MachinePowerEvent {
+    pub id: i64,
+    pub serial: String,
+    pub device_slot: String,
+    /// `shutdown` / `reboot`
+    pub action: String,
+    /// 无 destroy、无清理错误、网络清理成功。
+    pub graceful: bool,
+    pub requested_by: Option<String>,
+    pub agent_version: Option<String>,
+    pub source: String,
+    pub note: Option<String>,
+    pub details: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 待写入的电源事件（服务端时间 created_at 由 DB 生成）。
+#[derive(Debug, Clone)]
+pub struct NewMachinePowerEvent {
+    pub serial: String,
+    pub device_slot: String,
+    pub action: String,
+    pub graceful: bool,
+    pub requested_by: Option<String>,
+    pub agent_version: Option<String>,
+    pub source: String,
+    pub note: Option<String>,
+    pub details: Value,
+}
+
 /// 机器总览的一行：设备注册信息 + 房间/区域 + 最新快照摘要。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineSummary {
@@ -115,8 +150,17 @@ pub struct MachineSummary {
     pub area_code: Option<String>,
     pub area_name: Option<String>,
     pub report: Option<MachineReportSummary>,
-    /// 最新快照超过 5 分钟未更新（agent 可能离线）。
+    /// 最新快照是否超过「新鲜窗口」（`max(3 × fast 间隔, 30s)`）。
     pub report_stale: bool,
+    /// 最新快照年龄（秒）；从未上报为 `null`。
+    pub report_age_secs: Option<i64>,
+    /// 当前生效的新鲜窗口（秒），由 agent 自报 fast 间隔推导。
+    pub stale_after_secs: i64,
+    /// Agent 视角严格在线：有快照且未过期（不并集 device-pki 会话）。
+    pub agent_online: bool,
+    /// 最近一次电源事件（关机/重启）；从未上报为 `null`。
+    #[serde(default)]
+    pub last_power_event: Option<MachinePowerEvent>,
 }
 
 /// 机器列表过滤条件。
@@ -127,6 +171,24 @@ pub struct MachineFilter {
     pub keyword: Option<String>,
     /// `ok` / `warning` / `critical` / `missing`（从未上报）。
     pub health: Option<String>,
+    /// `online` / `stale` / `offline` / `missing`（观测状态筛选）。
+    pub state: Option<String>,
+}
+
+/// 机器状态汇总（列表页 KPI；服务端聚合，不再按 page_size=100 自己数）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MachineStateCounts {
+    pub total: i64,
+    /// 有新鲜快照（agent 视角在线）。
+    pub online: i64,
+    /// 快照超过新鲜窗口。
+    pub stale: i64,
+    /// 会话离线且快照不新鲜。
+    pub offline: i64,
+    /// 从未上报快照。
+    pub missing: i64,
+    /// 最新快照健康为 warning/critical。
+    pub alerts: i64,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -157,6 +219,9 @@ struct MachineSummaryRow {
     disk_usage_percent: Option<f64>,
     uptime_secs: Option<i64>,
     report_stale: Option<bool>,
+    report_age_secs: Option<i64>,
+    stale_after_secs: Option<i64>,
+    agent_online: Option<bool>,
 }
 
 impl From<MachineSummaryRow> for MachineSummary {
@@ -194,6 +259,10 @@ impl From<MachineSummaryRow> for MachineSummary {
             area_name: row.area_name,
             report,
             report_stale: row.report_stale.unwrap_or(false),
+            report_age_secs: row.report_age_secs,
+            stale_after_secs: row.stale_after_secs.unwrap_or(30),
+            agent_online: row.agent_online.unwrap_or(false),
+            last_power_event: None,
         }
     }
 }
@@ -219,7 +288,7 @@ const MACHINE_FROM: &str = "
     LEFT JOIN room_devices rd ON rd.device_slot = de.device_slot
     LEFT JOIN rooms r ON r.id = COALESCE(rp.id, rd.room_id)
     LEFT JOIN areas a ON a.id = r.area_id
-    LEFT JOIN latest ms ON ms.serial = de.serial";
+    LEFT JOIN enriched ms ON ms.serial = de.serial";
 
 const MACHINE_FILTER: &str = "
     WHERE ($1::uuid IS NULL OR a.id = $1)
@@ -232,13 +301,23 @@ const MACHINE_FILTER: &str = "
            OR ms.hostname ILIKE '%' || $3::text || '%')
       AND ($4::text IS NULL
            OR ($4::text = 'missing' AND ms.id IS NULL)
-           OR ms.health_status = $4::text)";
+           OR ms.health_status = $4::text)
+      AND ($5::text IS NULL OR $5::text = ''
+           OR ($5::text = 'online'
+               AND (ds.state = 'online'
+                    OR (ms.id IS NOT NULL AND ms.report_age_secs <= ms.stale_after_secs)))
+           OR ($5::text = 'stale'
+               AND ms.id IS NOT NULL AND ms.report_age_secs > ms.stale_after_secs)
+           OR ($5::text = 'offline'
+               AND ds.state = 'offline'
+               AND NOT (ms.id IS NOT NULL AND ms.report_age_secs <= ms.stale_after_secs))
+           OR ($5::text = 'missing' AND ms.id IS NULL))";
 
 const MACHINE_SELECT: &str = "
     SELECT de.serial, de.device_slot, de.status,
            CASE WHEN ds.state = 'online' THEN 'online'
-                WHEN ms.collected_at IS NOT NULL
-                 AND ms.collected_at >= now() - interval '5 minutes' THEN 'online'
+                WHEN ms.id IS NOT NULL
+                 AND ms.report_age_secs <= ms.stale_after_secs THEN 'online'
                 ELSE ds.state END AS online,
            ds.state AS session_online,
            GREATEST(ds.updated_at, ms.received_at) AS last_seen_at,
@@ -247,13 +326,33 @@ const MACHINE_SELECT: &str = "
            ms.id AS report_id, ms.collected_at, ms.received_at, ms.agent_version,
            ms.hostname, ms.os_name, ms.kernel_version, ms.health_status, ms.health_score,
            ms.cpu_usage_percent, ms.memory_usage_percent, ms.disk_usage_percent, ms.uptime_secs,
-           (ms.collected_at IS NOT NULL
-            AND ms.collected_at < now() - interval '5 minutes') AS report_stale";
+           COALESCE(ms.report_age_secs <= ms.stale_after_secs, false) AS agent_online,
+           ms.report_age_secs AS report_age_secs,
+           ms.stale_after_secs AS stale_after_secs,
+           COALESCE(ms.report_age_secs > ms.stale_after_secs, false) AS report_stale";
 
+/// 最新快照 + 由 agent 自报的 fast 间隔推导「新鲜窗口」。
+///
+/// 快照过期阈值不再写死 5 分钟：room-agent 在 `sections.agent.fast_interval_secs`
+/// 自报 fast 档间隔，这里取 `max(3 × fast, 30s)`。这样 10s 档最快 ~30s 判过期，
+/// 而调大间隔的机器不会被误判；读不到（旧 agent / full 快照无该字段）时按 10s 兜底，
+/// 与 v1.1 契约默认值一致。`report_age_secs` / `stale_after_secs` 一起返回给前端，
+/// 让「在线」判定可解释、可展示。
 const LATEST_CTE: &str = "WITH latest AS (
     SELECT DISTINCT ON (serial) *
       FROM machine_snapshots
      ORDER BY serial, collected_at DESC
+  ), enriched AS (
+    SELECT latest.*,
+           GREATEST(
+             COALESCE(
+               CASE WHEN (payload->'sections'->'agent'->>'fast_interval_secs') ~ '^[0-9]+$'
+                    THEN (payload->'sections'->'agent'->>'fast_interval_secs')::bigint
+               END, 10) * 3,
+             30) AS stale_after_secs,
+           CASE WHEN collected_at IS NULL THEN NULL
+                ELSE GREATEST(EXTRACT(EPOCH FROM (now() - collected_at))::bigint, 0) END AS report_age_secs
+      FROM latest
   )";
 
 /// PostgreSQL 适配器：只负责 SQL。
@@ -350,6 +449,34 @@ impl MachineRepo {
         Ok(meta)
     }
 
+    /// 机器状态汇总（服务端聚合；KPI 不再依赖 page_size=100 的列表页自己数）。
+    pub async fn state_counts(&self) -> DbResult<MachineStateCounts> {
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64)>(&format!(
+            "{LATEST_CTE}
+             SELECT count(*)::bigint,
+                    count(*) FILTER (WHERE ms.id IS NOT NULL
+                                      AND ms.report_age_secs <= ms.stale_after_secs)::bigint,
+                    count(*) FILTER (WHERE ms.id IS NOT NULL
+                                      AND ms.report_age_secs > ms.stale_after_secs)::bigint,
+                    count(*) FILTER (WHERE ds.state = 'offline'
+                                      AND NOT (ms.id IS NOT NULL
+                                               AND ms.report_age_secs <= ms.stale_after_secs))::bigint,
+                    count(*) FILTER (WHERE ms.id IS NULL)::bigint,
+                    count(*) FILTER (WHERE ms.health_status IN ('warning','critical'))::bigint
+               {MACHINE_FROM}"
+        ))
+        .fetch_one(&self.db)
+        .await?;
+        Ok(MachineStateCounts {
+            total: row.0,
+            online: row.1,
+            stale: row.2,
+            offline: row.3,
+            missing: row.4,
+            alerts: row.5,
+        })
+    }
+
     /// 机器分页：设备 + 房间/区域 + 最新快照摘要。
     pub async fn list(
         &self,
@@ -367,6 +494,7 @@ impl MachineRepo {
         .bind(filter.room_id)
         .bind(&filter.keyword)
         .bind(&filter.health)
+        .bind(&filter.state)
         .bind(page_size)
         .bind(offset)
         .fetch_all(&self.db)
@@ -380,15 +508,13 @@ impl MachineRepo {
         .bind(filter.room_id)
         .bind(&filter.keyword)
         .bind(&filter.health)
+        .bind(&filter.state)
         .fetch_one(&self.db)
         .await?;
 
-        Ok(Page::new(
-            rows.into_iter().map(MachineSummary::from).collect(),
-            total,
-            page,
-            page_size,
-        ))
+        let mut items: Vec<MachineSummary> = rows.into_iter().map(MachineSummary::from).collect();
+        self.attach_power_events(&mut items).await?;
+        Ok(Page::new(items, total, page, page_size))
     }
 
     /// 单台机器的摘要；不存在返回 `None`。
@@ -400,7 +526,81 @@ impl MachineRepo {
         .bind(serial)
         .fetch_optional(&self.db)
         .await?;
-        Ok(row.map(MachineSummary::from))
+        let Some(mut summary) = row.map(MachineSummary::from) else {
+            return Ok(None);
+        };
+        summary.last_power_event = self.latest_power_event(serial).await?;
+        Ok(Some(summary))
+    }
+
+    /// 插入一次电源事件（服务端 created_at）。
+    pub async fn record_power_event(
+        &self,
+        event: &NewMachinePowerEvent,
+    ) -> DbResult<MachinePowerEvent> {
+        let row = sqlx::query_as::<_, MachinePowerEvent>(
+            "INSERT INTO machine_power_events
+                 (serial, device_slot, action, graceful, requested_by,
+                  agent_version, source, note, details)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             RETURNING id, serial, device_slot, action, graceful, requested_by,
+                       agent_version, source, note, details, created_at",
+        )
+        .bind(&event.serial)
+        .bind(&event.device_slot)
+        .bind(&event.action)
+        .bind(event.graceful)
+        .bind(&event.requested_by)
+        .bind(&event.agent_version)
+        .bind(&event.source)
+        .bind(&event.note)
+        .bind(&event.details)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(row)
+    }
+
+    /// 最近一次电源事件（按服务端 created_at / id 倒序）。
+    pub async fn latest_power_event(&self, serial: &str) -> DbResult<Option<MachinePowerEvent>> {
+        let row = sqlx::query_as::<_, MachinePowerEvent>(
+            "SELECT id, serial, device_slot, action, graceful, requested_by,
+                    agent_version, source, note, details, created_at
+               FROM machine_power_events
+              WHERE serial = $1
+              ORDER BY created_at DESC, id DESC
+              LIMIT 1",
+        )
+        .bind(serial)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(row)
+    }
+
+    /// 批量给列表页补最近电源事件（一次 SQL，避免 N+1）。
+    async fn attach_power_events(&self, items: &mut [MachineSummary]) -> DbResult<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let serials: Vec<String> = items.iter().map(|item| item.serial.clone()).collect();
+        let rows = sqlx::query_as::<_, MachinePowerEvent>(
+            "SELECT DISTINCT ON (serial)
+                    id, serial, device_slot, action, graceful, requested_by,
+                    agent_version, source, note, details, created_at
+               FROM machine_power_events
+              WHERE serial = ANY($1)
+              ORDER BY serial, created_at DESC, id DESC",
+        )
+        .bind(&serials)
+        .fetch_all(&self.db)
+        .await?;
+        let mut by_serial: std::collections::HashMap<String, MachinePowerEvent> = rows
+            .into_iter()
+            .map(|event| (event.serial.clone(), event))
+            .collect();
+        for item in items {
+            item.last_power_event = by_serial.remove(&item.serial);
+        }
+        Ok(())
     }
 
     /// 最新一次完整快照（含 payload）。
@@ -427,7 +627,9 @@ impl MachineRepo {
     }
 
     /// 按 id 增量查询快照元数据（SSE 实时流使用；`serial` 为空表示所有机器）。
-    /// 返回 id 倒序，调用方需要按 id 正序发送。
+    ///
+    /// 按 id **正序**返回：调用方用「已发送的最大 id」作为下一次游标，正序才能保证
+    /// 一次查不完时先发最旧的，下一轮继续；倒序 + LIMIT 会静默丢掉更旧的快照。
     pub async fn list_after_id(
         &self,
         after_id: i64,
@@ -439,7 +641,7 @@ impl MachineRepo {
                FROM machine_snapshots
               WHERE id > $1
                 AND ($3::text IS NULL OR serial = $3)
-              ORDER BY id DESC
+              ORDER BY id ASC
               LIMIT $2"
         ))
         .bind(after_id)

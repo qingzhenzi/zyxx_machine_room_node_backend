@@ -57,6 +57,8 @@ pub struct AppState {
     pub vnc_internal_token: Option<Arc<str>>,
     /// 毫秒级实时指标内存广播（不写 DB）。
     pub metrics: Arc<crate::metrics::MetricsHub>,
+    /// 机器实时 WS 通道注册表（按需推流/限速，见 `realtime.rs`）。
+    pub realtime: Arc<crate::realtime::RealtimeHub>,
 }
 
 // ---------------- /enroll/challenge ----------------
@@ -936,6 +938,9 @@ pub async fn machine_report(
             .upsert(&serial, &device_slot, SessionState::Online, 0);
     }
     st.sessions.mark_seen(&serial).await;
+    // 同时把会话落库：只跑 machine 角色（不拉下行）的设备没有别的活动来源，
+    // 不落库会让管理端 `session_online` 永远为 null、在线状态只能靠 5 分钟快照兜底。
+    persist_session_online(&st, &serial, Some(&device_slot)).await;
 
     let mut payload = validated.payload;
     payload["device_slot"] = serde_json::json!(device_slot);
@@ -1148,7 +1153,7 @@ pub struct DownlinkReply {
 /// 管理端把 `device_session.updated_at` 当作 `last_seen_at` 展示；HTTP 轮询模式的
 /// agent 不会走上行消息，因此必须把下行 pull/ack 也算作活动，否则会被离线判定器
 /// 误判为 offline（WS 模式由 channel.rs 记活动）。
-async fn mark_device_activity(st: &AppState, serial: &str) {
+pub(crate) async fn mark_device_activity(st: &AppState, serial: &str) {
     // device-pki 重启后内存会话为空（confirm 不会重放）：用 DB 里的 enrollment
     // 恢复内存会话，否则离线判定器永远遍历不到这个设备。
     let mut slot = st.sessions.device_slot(serial);
@@ -1378,12 +1383,16 @@ pub fn mtls_router(st: AppState) -> Router {
         .route("/machine/report", post(machine_report))
         // 毫秒级实时指标（内存广播，不写 DB）
         .route("/metrics", post(crate::metrics::ingest))
+        // 机器实时 WS 通道：一条长连接承载按需实时样本 + 长操作进度
+        .route("/machine/realtime", get(crate::realtime::upgrade))
         .route("/messages/downlink", get(downlink_pull))
         .route("/messages/downlink/ack", post(downlink_ack))
         // 节点配置：启动时按证书身份拉取 global → area → room 合并后的策略（§17.3）
         .route("/agent/config", get(crate::agent_config::get_config))
         // 房间启动配置：agent 自动拉镜像 / 建 VM / 启动（docs/startup-provisioning.md §4.1）
         .route("/agent/startup", get(crate::startup::get_startup))
+        // 主机 shutdown/reboot 收尾结果（serial 来自设备证书）
+        .route("/agent/power-event", post(crate::power_event::report))
         // 设备换对象存储预签名 URL（大文件不走消息通道，契约 §16.2）
         .route("/resources/presign", post(crate::resource::presign))
         // P2P 镜像分发：seed 登记 / peer 查询（ticket 即能力，仅内网 mTLS）
@@ -1449,6 +1458,7 @@ mod tests {
             vnc: Arc::new(crate::vnc::VncHub::new(crate::vnc::VNC_PAIR_TIMEOUT)),
             vnc_internal_token: None,
             metrics: Arc::new(crate::metrics::MetricsHub::new()),
+            realtime: Arc::new(crate::realtime::RealtimeHub::new()),
         };
         let mut h = HeaderMap::new();
         h.insert(

@@ -86,6 +86,7 @@ async fn setup_with_limit(admin_limit: u32) -> Option<(AppState, Router, Router)
         )),
         vnc_internal_token: None,
         metrics: Arc::new(qe_device_pki::metrics::MetricsHub::new()),
+        realtime: Arc::new(qe_device_pki::realtime::RealtimeHub::new()),
     };
     Some((
         state.clone(),

@@ -18,6 +18,8 @@ function makeImage(status: ImageArtifact['status']): ImageArtifact {
     platform: 'linux/amd64',
     status,
     total_size: 1024,
+    namespace_id: '22222222-2222-2222-2222-222222222222',
+    visibility: 'private',
     manifest_digest: null,
     created_by: null,
     created_at: '2026-11-07T10:00:00Z',

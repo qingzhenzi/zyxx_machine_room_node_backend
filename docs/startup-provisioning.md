@@ -66,11 +66,26 @@ CREATE TABLE IF NOT EXISTS room_startup_profiles (
       "base_volume": "real-debian-13-0.1.1",
       "base_path": null,
       "gpu": [],
-      "auto_start": true
+      "auto_start": true,
+      "network": {
+        "mode": "isolated",
+        "vlan_id": 104,
+        "subnet": "10.77.104.0/24",
+        "allow_services": [
+          { "cidr": "192.168.8.231/32", "proto": "tcp", "ports": [8080, 4441] }
+        ],
+        "allow_internet": false,
+        "allow_same_room": false
+      }
     }
   ]
 }
 ```
+
+`network` 是**可选**字段：缺省（字段不存在 / `null`）表示**不配网**，agent 不创建
+隔离桥、VM 也不挂网卡，与接入该字段之前的行为完全一致（旧 JSONB 配置无需迁移）。
+显式配置时 agent 会先 `NetworkManager::ensure` 房间网络，再给 VM 挂
+`<interface type='bridge'>`（e1000），见 §5.3。
 
 校验规则（API 返回 400，错误信息指出字段）：
 
@@ -87,12 +102,24 @@ CREATE TABLE IF NOT EXISTS room_startup_profiles (
 | `vms[].base_path` | 可选，必须是绝对路径；与 `base_volume` 互斥 |
 | `vms[].gpu` | ≤2 个，格式 `^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$` |
 | `vms[].auto_start` | bool，缺省 true |
+| `vms[].network` | 可选对象；缺省 `null` = 不配网（兼容旧配置） |
+| `vms[].network.mode` | 必填：`isolated` / `nat` / `none`（小写） |
+| `vms[].network.vlan_id` | 可选 1..=4094；指定后桥名固定 `qevm-<vlan>`，否则 `qevm-<room 短哈希>` |
+| `vms[].network.subnet` | 可选 `a.b.c.d/len`；必须是 RFC1918 私有网段、前缀 ≤30；缺省 agent 按 `room_id` 派生 `10.77.<hash>.0/24` |
+| `vms[].network.allow_services[]` | 每项 `{cidr,proto?,ports[]}`；`cidr` 不能 `0.0.0.0/0`、不能与自身子网重叠；`ports` 非空（数字或 `"start-end"`）；`proto` 取 `tcp`/`udp`/`any`，缺省 `tcp` |
+| `vms[].network.allow_internet` | 仅 `mode=nat` 可为 true（isolated 没有出口） |
+| `vms[].network.allow_same_room` | bool，缺省 false（同房间 VM 默认也互相隔离） |
+| 房间一致性 | 同一房间所有 VM 的 `network` 必须完全一致（共享一张房间桥），否则 400 |
 | `auto_pull` / `auto_start_vm` | bool，缺省 true |
 
 `base_volume` 缺省语义：若 `vms[].base_volume` 与 `base_path` 都为空，且 `images` 中恰好
 有一个 `kind=vm_disk` 的镜像，服务端不填；**agent 侧**按下式推导
 `<image.name>-<image.version>`（与 `importer/vm.rs` 的卷名规则一致）。多个 vm_disk
 镜像时必须显式给 `base_volume`/`base_path`，否则 agent 跳过该 VM 并告警。
+
+> 教室 VM 建议：`mode="isolated"` + 显式 `allow_services` 放行控制节点/监考服务
+> 需要的端口；只有确实需要公网时才用 `mode="nat"` 且 `allow_internet=true`。
+> `allow_same_room` 默认 false，避免一台考机被攻破后横向访问同房间其它考机。
 
 ## 3. 管理端 API（qe-api）
 
@@ -155,6 +182,7 @@ CREATE TABLE IF NOT EXISTS room_startup_profiles (
 
 ```json
 {
+  "room_id": "8f846cb5-7d5e-4181-8c9c-631b7a112397",
   "revision": 3,
   "enabled": true,
   "auto_pull": true,
@@ -178,6 +206,8 @@ CREATE TABLE IF NOT EXISTS room_startup_profiles (
 }
 ```
 
+* `room_id` 为设备所属房间（槽位未绑定房间时省略）；agent 用它派生配网 profile 的
+  `room_id`，旧服务端不下发时回退 `QE_VM_NET_ROOM` / `DEVICE_SLOT`；
 * `images[]` 只包含已发布且 manifest 完整的镜像；`transfer_id` 取该房间该镜像最新
   transfer，没有则 `null`（agent 用本地随机 UUID 上报，服务端查不到即忽略）；
 * 字段名与 `image.pull` payload 保持一致（`name/version/kind/format/platform/
@@ -198,6 +228,11 @@ reconcile 本身幂等，重复/漏收都由周期 reconcile 兜底）。
 | `QE_STARTUP_ENABLED` | `1` | `0/false/no/off` 关闭启动配置拉取（仅保留下行/人工命令） |
 | `QE_STARTUP_RECONCILE_SECS` | `60` | 周期 reconcile 间隔，0..=3600；`0` 表示只在启动/收到 `startup.update` 时执行 |
 | `QE_STARTUP_HTTP_TIMEOUT_SECS` | `10` | GET `/agent/startup` 超时 |
+| `QE_VM_NET_ROOM` | 空 | `/agent/startup` 无 `room_id` 时的配网房间标识（推荐显式设置；否则回退 `DEVICE_SLOT`） |
+| `QE_VM_NET_DISABLED` | 空 | `1` 时 startup 完全不配网（忽略 `vms[].network`） |
+| `QE_VM_NET_DRY_RUN` | 空 | `1` 时只生成 ensure 计划、不执行 `virsh`/`nft`（排障） |
+| `QE_VM_NET_STATE_DIR` | `/run/qe-vm-net` | profile 持久化目录（与 `qe-agent cli vm net` 共用） |
+| `QE_HOST_LAN_CIDRS` | `192.168.8.0/24` | 宿主机 LAN 网段，逗号分隔；VM 子网不得与之重叠 |
 
 ### 5.2 时机
 
@@ -220,14 +255,26 @@ reconcile 本身幂等，重复/漏收都由周期 reconcile 兜底）。
    * 缺失 → 用 §4.1 的字段构造 `image.pull` payload，复用 `ImagePullJob`
      （P2P 优先、HTTP 回退、逐片校验、import 全部不变）；失败 → warn 并在下次周期重试；
    * 与下行 `image.pull` 共用同一把 import 锁，串行导入；
-3. VM（`auto_start_vm` 与 `vms[].auto_start` 都需为 true 才自动启动）：
+3. 配网（`vms[].network` 存在且 `mode != "none"`）：
+   * 构造 `VmNetworkProfile`：`room_id` 取 `reply.room_id`，缺失时用 `QE_VM_NET_ROOM`，
+     再回退 `DEVICE_SLOT`；`subnet` 缺省按 room 哈希派生；allowlist 转成
+     `AllowedService`；
+   * 同一轮内按桥名去重后调用 `NetworkManager::ensure`（libvirt 网络 + nftables）；
+     **ensure 在 VM create/start 之前**，保证网卡指向的桥已存在；
+   * ensure 失败只 warn（并尽量推送 boot-display 提示），VM 仍会启动（无隔离网卡），
+     下轮 reconcile 重试；失败不会阻止镜像/VM 流程；
+4. VM（`auto_start_vm` 与 `vms[].auto_start` 都需为 true 才自动启动）：
    * 先 `vm_control list` 查域状态；
    * 不存在 → `create`（args：name/vcpus/memory_mib/disk_gb/base_volume|base_path/gpu，
-     `start = auto_start`）；底包卷缺失（镜像尚未拉完/拉取失败）→ warn 后跳过，下轮重试；
-   * 存在且 `running` → 不动；
-   * 存在且 `shut off` 且允许自动启动 → `start`；
+     `start = auto_start`；有 `network` 时再带 `nic=bridge:<桥名>` + `nic_model=e1000`）；
+     底包卷缺失（镜像尚未拉完/拉取失败）→ warn 后跳过，下轮重试；
+   * 存在且 `running` → 不重建；若配置了 `network` 且域里没有目标桥网卡，用
+     `virsh attach-interface --type bridge --source <桥> --model e1000 --config --live`
+     热插拔（已有同桥网卡则跳过；失败只 warn，不阻塞）；
+   * 存在且 `shut off` 且允许自动启动 → 先 `attach-interface ... --config`（写持久化
+     定义），再 `start`；
    * 其它状态（paused/crashed）只告警，不擅自操作；
-4. 每轮结束写 `<data_dir>/startup-state.json`：
+5. 每轮结束写 `<data_dir>/startup-state.json`：
 
 ```json
 {
@@ -238,8 +285,10 @@ reconcile 本身幂等，重复/漏收都由周期 reconcile 兜底）。
 }
 ```
 
-5. 日志：`startup 拉取成功 revision=…`、`镜像已存在，跳过 name=…`、
-   `开始拉取镜像 name=…`、`自动创建并启动 VM name=…`、`VM 已在运行，跳过 name=…` 等，
+6. 日志：`startup 拉取成功 revision=…`、`镜像已存在，跳过 name=…`、
+   `开始拉取镜像 name=…`、`startup 房间网络已 ensure room=… bridge=…`、
+   `自动创建并启动 VM name=…`、`存量 VM 已接入隔离桥（hotplug）`、
+   `VM 已在运行，跳过 name=…` 等，
    统一带 `startup` 关键字便于 `journalctl -u qe-agent | grep startup`。
 
 ### 5.4 命令行辅助
@@ -277,4 +326,7 @@ sudo bash scripts/deploy-remote-agent.sh \
    `startup-state.json` 记录 revision 与 VM 动作；
 4. 重复重启 agent / 重复 reconcile 不重复建盘、不重复拉镜像、不重启运行中的 VM；
 5. 删除 `lab-104` 后再重启 agent，能被重新创建并启动；
-6. 远程部署脚本可在 192.168.8.141:2222 上一次跑通（二进制 + env + enroll + 启动 + 自检）。
+6. 配置 `network.mode=isolated` 后：`virsh net-list` 出现 `qevm-<hash>`/`qevm-<vlan>`，
+   域 XML 有 `<interface type='bridge'><source bridge='qevm-…'/><model type='e1000'/>`，
+   guest 能 DHCP 到 `10.77.<hash>.x`；`nft list table inet qe_vm` 存在默认拒绝规则；
+7. 远程部署脚本可在 192.168.8.141:2222 上一次跑通（二进制 + env + enroll + 启动 + 自检）。

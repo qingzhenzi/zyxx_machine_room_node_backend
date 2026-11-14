@@ -20,7 +20,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use qe_db::{
-    machine::{MachineSnapshotMeta, MachineSnapshotRecord, MachineSummary},
+    machine::{MachineSnapshotMeta, MachineSnapshotRecord, MachineStateCounts, MachineSummary},
     storage::BUILD_REQUEST_TTL_MINUTES,
 };
 
@@ -52,6 +52,9 @@ pub struct MachineQuery {
     /// `ok` / `warning` / `critical` / `missing`（从未上报）。
     #[serde(default)]
     pub health: Option<String>,
+    /// `online` / `stale` / `offline` / `missing`（观测状态筛选）。
+    #[serde(default)]
+    pub state: Option<String>,
     #[serde(default)]
     pub page: Option<i64>,
     #[serde(default)]
@@ -91,6 +94,20 @@ pub struct MachineDetail {
     pub history: Vec<MachineSnapshotMeta>,
 }
 
+fn normalize_state_filter(raw: Option<&str>) -> AppResult<Option<String>> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let normalized = value.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "online" | "stale" | "offline" | "missing") {
+        Ok(Some(normalized))
+    } else {
+        Err(AppError::bad_request(
+            "state 只能是 online / stale / offline / missing",
+        ))
+    }
+}
+
 fn normalize_health_filter(raw: Option<&str>) -> AppResult<Option<String>> {
     let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
@@ -118,15 +135,28 @@ pub async fn list(
     let (page, page_size) = validation::page_params(query.page, query.page_size)?;
     let keyword = validation::normalize_keyword(query.keyword.as_deref())?;
     let health = normalize_health_filter(query.health.as_deref())?;
+    let state_filter = normalize_state_filter(query.state.as_deref())?;
 
     let filter = qe_db::machine::MachineFilter {
         area_id: query.area_id,
         room_id: query.room_id,
         keyword: (!keyword.is_empty()).then_some(keyword),
         health,
+        state: state_filter,
     };
 
     Ok(Json(state.machines.list(&filter, page, page_size).await?))
+}
+
+/// `GET /api/v1/admin/machines/summary` —— 机器状态汇总（列表页 KPI）。
+///
+/// 服务端聚合，避免前端只取 `page_size=100` 时统计不到全量机器。
+pub async fn summary(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+) -> AppResult<Json<MachineStateCounts>> {
+    authorization::require_permission(&state, id, permissions::DEVICE_READ).await?;
+    Ok(Json(state.machines.state_counts().await?))
 }
 
 pub async fn get(
@@ -204,22 +234,29 @@ pub struct WakeReply {
     pub warnings: Vec<String>,
 }
 
-/// `POST /api/v1/admin/machines/{serial}/wake` —— 局域网唤醒（Wake-on-LAN）。
+/// `POST /api/v1/admin/machines/{serial}/agent/poweroff` 的 202 响应。
 ///
-/// - 权限：`device:wake`（管理端默认只有 `admin` 角色，迁移 0030 播种）；
-/// - 目标 MAC 取该 serial **最新一条** `machine_snapshots.payload` 的
-///   `sections.agent.host.macs`；设备不存在 404、无快照/无 MAC 422；
-/// - 每个 MAC 发 3 次 102 字节 magic packet（6×0xFF + MAC×16）到 UDP 255.255.255.255:9；
-/// - 发送结果写审计 `device.wake`（resource_type=`machine`）。
+/// `warn` 为附加提示（例如机器当前离线，命令会在其重新连上后执行）；旧前端忽略即可。
+#[derive(Debug, Serialize)]
+pub struct AgentPoweroffAccepted {
+    pub request_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warn: Option<String>,
+}
+
 /// `POST /api/v1/admin/machines/{serial}/agent/poweroff` —— 触发 agent 所在主机系统关机。
 ///
 /// 安全：agent 侧必须显式设置 `QE_AGENT_ALLOW_POWEROFF=1` 才会执行；
 /// 未启用时命令返回失败结果，不会触碰电源。权限 `device:manage`。
+///
+/// 202 只表示「命令已入队」。执行进度用
+/// `GET /machines/{serial}/agent/commands/{request_id}` 轮询；agent 屏幕会显示
+/// boot-display 的 `power` 场景（见 room_agent `docs/power-shutdown.md`）。
 pub async fn create_agent_poweroff(
     State(state): State<AppState>,
     AuthUser { id }: AuthUser,
     Path(serial): Path<String>,
-) -> AppResult<(StatusCode, Json<VmCommandAccepted>)> {
+) -> AppResult<(StatusCode, Json<AgentPoweroffAccepted>)> {
     authorization::require_permission(&state, id, permissions::DEVICE_MANAGE).await?;
 
     let serial = serial.trim();
@@ -231,6 +268,17 @@ pub async fn create_agent_poweroff(
         .summary(serial)
         .await?
         .ok_or_else(|| AppError::not_found("机器不存在"))?;
+
+    // 离线设备的下行命令会在其重新连上后才被拉走：响应里明确提示，避免操作者
+    // 误以为机器马上会关机。判定同时看综合在线与快照新鲜度（高确定状态模型）。
+    let warn = if device.online.as_deref() != Some("online") || device.report_stale {
+        Some(
+            "机器当前不在线或遥测已过期：命令会入队，待机器恢复连接后执行（可能不是立即关机）"
+                .to_owned(),
+        )
+    } else {
+        None
+    };
 
     let request_id = Uuid::new_v4();
     let downlink = serde_json::json!({
@@ -253,11 +301,19 @@ pub async fn create_agent_poweroff(
                 "device.poweroff",
                 "machine",
                 Some(device.serial.clone()),
-                serde_json::json!({ "serial": device.serial, "request_id": request_id }),
+                serde_json::json!({
+                    "serial": device.serial,
+                    "request_id": request_id,
+                    "online": device.online,
+                    "report_stale": device.report_stale,
+                }),
                 None,
             )
             .await;
-            Ok((StatusCode::ACCEPTED, Json(VmCommandAccepted { request_id })))
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(AgentPoweroffAccepted { request_id, warn }),
+            ))
         }
         Err(error) => {
             cleanup_pending_command(&state, request_id).await;
@@ -322,6 +378,14 @@ pub async fn request_telemetry_report(
     ))
 }
 
+/// `POST /api/v1/admin/machines/{serial}/wake` —— 局域网唤醒（Wake-on-LAN）。
+///
+/// - 权限：`device:wake`（管理端默认只有 `admin` 角色，迁移 0030 播种）；
+/// - 目标 MAC 取该 serial **最新一条** `machine_snapshots.payload` 的
+///   `sections.agent.host.macs`；设备不存在 404、无快照/无 MAC 422；
+/// - 每个 MAC 发 3 次 102 字节 magic packet（6×0xFF + MAC×16）到 UDP 255.255.255.255:9；
+/// - 发送结果写审计 `device.wake`（resource_type=`machine`）。
+
 pub async fn wake(
     State(state): State<AppState>,
     AuthUser { id }: AuthUser,
@@ -359,12 +423,8 @@ pub async fn wake(
     let mac_labels: Vec<String> = macs.iter().map(ToString::to_string).collect();
     let targets = state.config.wol_broadcast_targets.clone();
     let target_labels: Vec<String> = targets.iter().map(ToString::to_string).collect();
-    let (sent_to, warnings) = send_wake_packets(
-        &macs,
-        &targets,
-        state.config.wol_source_addr,
-    )
-    .await;
+    let (sent_to, warnings) =
+        send_wake_packets(&macs, &targets, state.config.wol_source_addr).await;
     let ok = !sent_to.is_empty();
     if !warnings.is_empty() {
         tracing::warn!(
@@ -481,6 +541,8 @@ async fn send_wake_packets(
 const VM_COMMAND_DOWNLINK_KIND: &str = "vm.command";
 /// pending 超过该秒数视为超时（GET 时顺手把表更新为 timeout）。
 const VM_COMMAND_PENDING_TIMEOUT_SECS: i64 = 120;
+/// `agent.command`（主机电源）的 pending 超时（秒）：cleanup + 延迟断电留足余量。
+const AGENT_COMMAND_PENDING_TIMEOUT_SECS: i64 = 180;
 /// `image.make`（导出→分片上传→登记）的 pending 超时默认值（秒）= 6 小时。
 ///
 /// **语义是「总时长最终兜底」，不是无进展判定**：只要 agent 仍在导出/上传就不要
@@ -1615,7 +1677,7 @@ pub(crate) async fn enqueue_device_downlink(
             Ok(())
         }
         Ok(None) => Err(AppError::service_unavailable(
-            "设备当前没有存活证书，无法建立 VNC 隧道",
+            "设备当前没有可用的存活证书/连接，命令未下发",
         )),
         Err(error) => Err(error.into()),
     }
@@ -2089,6 +2151,68 @@ pub async fn get_vm_command(
     }))
 }
 
+/// `GET /api/v1/admin/machines/{serial}/agent/commands/{request_id}` —— 查询主机电源命令结果。
+///
+/// 权限 `device:manage`（与下发一致）。返回 `pending` / `ok` / `error` / `timeout`：
+/// agent 收到 `agent.command` 后先清理 VM/容器再延迟断电，`ok` 表示「已调度关机/重启」，
+/// 之后控制台会通过在线状态（设备事件/快照）看到机器离线。
+pub async fn get_agent_command(
+    State(state): State<AppState>,
+    AuthUser { id }: AuthUser,
+    Path((serial, request_id)): Path<(String, String)>,
+) -> AppResult<Json<VmCommandReply>> {
+    authorization::require_permission(&state, id, permissions::DEVICE_MANAGE).await?;
+
+    let serial = serial.trim();
+    if serial.is_empty() {
+        return Err(AppError::bad_request("serial 不能为空"));
+    }
+    let request_id = request_id
+        .trim()
+        .parse::<Uuid>()
+        .map_err(|_| AppError::bad_request("request_id 不是合法 UUID"))?;
+
+    let row = sqlx::query_as::<_, MachineCommandRow>(
+        "SELECT request_id, status, result, error, created_at, updated_at, payload
+           FROM machine_command_results
+          WHERE request_id = $1 AND serial = $2 AND kind = 'agent.command'",
+    )
+    .bind(request_id)
+    .bind(serial)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(|error| AppError::internal(format!("查询电源命令失败: {error}")))?
+    .ok_or_else(|| AppError::not_found("电源命令不存在"))?;
+
+    let mut status = row.status;
+    let mut updated_at = row.updated_at;
+    if status == "pending"
+        && row.created_at + chrono::Duration::seconds(AGENT_COMMAND_PENDING_TIMEOUT_SECS)
+            < Utc::now()
+    {
+        sqlx::query(
+            "UPDATE machine_command_results
+                SET status = 'timeout', updated_at = now()
+              WHERE request_id = $1 AND status = 'pending'",
+        )
+        .bind(request_id)
+        .execute(state.db.pool())
+        .await
+        .map_err(|error| AppError::internal(format!("更新电源命令超时失败: {error}")))?;
+        status = "timeout".to_owned();
+        updated_at = Utc::now();
+    }
+
+    Ok(Json(VmCommandReply {
+        request_id: row.request_id,
+        status,
+        data: row.result,
+        error: row.error,
+        created_at: row.created_at,
+        updated_at,
+    }))
+}
+
 /// SSE 实时流：新快照落库后 2 秒内推送；首次连接从当前最新 id 开始（不补历史），
 /// 断线重连带上最后收到的 `id` 作为 `after_id` 可补发最多 200 条。
 ///
@@ -2218,6 +2342,23 @@ fn machine_snapshot_frame(record: MachineSnapshotMeta) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_machine_state_filter() {
+        assert_eq!(normalize_state_filter(None).unwrap(), None);
+        assert_eq!(normalize_state_filter(Some(" ")).unwrap(), None);
+        assert_eq!(
+            normalize_state_filter(Some(" ONLINE ")).unwrap().as_deref(),
+            Some("online")
+        );
+        for value in ["stale", "offline", "missing"] {
+            assert_eq!(
+                normalize_state_filter(Some(value)).unwrap().as_deref(),
+                Some(value)
+            );
+        }
+        assert!(normalize_state_filter(Some("degraded")).is_err());
+    }
 
     fn request(op: &str, name: Option<&str>) -> VmCommandRequest {
         VmCommandRequest {

@@ -1,21 +1,30 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { api } from '@/api'
-import type { Area, MachineSummary, Room } from '@/api/schema'
+import type {
+  Area,
+  MachineReportSummary,
+  MachineSnapshotPoint,
+  MachineSummary,
+  PresenceEvent,
+  Room,
+} from '@/api/schema'
 import EmptyState from '@/components/ui/EmptyState.vue'
 import IconButton from '@/components/ui/IconButton.vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import PaginationBar from '@/components/ui/PaginationBar.vue'
 import SearchInput from '@/components/ui/SearchInput.vue'
 import StateBadge from '@/components/ui/StateBadge.vue'
+import type { BadgeTone } from '@/components/ui/StateBadge.vue'
 import { useDebounceFn } from '@/composables/useDebounceFn'
 import { useInterval } from '@/composables/useInterval'
 import MetricCard from '@/features/areas/MetricCard.vue'
 import type { MetricCardProps } from '@/features/areas/MetricCard.vue'
 import { MACHINE_HEALTH_FILTERS, machineHealthMeta } from '@/features/machines/machineMeta'
-import { useMachineStream } from '@/features/machines/useMachineStream'
+import { useMachineStream, type MachineStreamStatus } from '@/features/machines/useMachineStream'
+import { usePresenceStream } from '@/features/machines/usePresenceStream'
 import { useToastStore } from '@/stores/toast'
 import UsageBar from '@/features/machines/UsageBar.vue'
 import { errorMessage } from '@/utils/errors'
@@ -25,6 +34,49 @@ const router = useRouter()
 const route = useRoute()
 
 const PAGE_SIZE = 20
+const REFRESH_STORAGE_KEY = 'qe.machines.refresh'
+const SNAPSHOT_RECONCILE_DEBOUNCE_MS = 400
+const PRESENCE_TOAST_GRACE_MS = 3_000
+const PRESENCE_TOAST_DEDUPE_MS = 5_000
+const RECENT_CHANGE_TTL_MS = 60_000
+
+type RefreshMode = 'live' | '5s' | '15s' | '30s' | 'paused'
+
+const REFRESH_OPTIONS: { value: RefreshMode; label: string }[] = [
+  { value: 'live', label: '实时' },
+  { value: '5s', label: '5 秒' },
+  { value: '15s', label: '15 秒' },
+  { value: '30s', label: '30 秒' },
+  { value: 'paused', label: '暂停' },
+]
+
+/** `live` 仍保留 15s 全量对齐（注册/删除等非快照变更靠它兜底），其余为显式轮询。 */
+const REFRESH_INTERVALS: Record<RefreshMode, number | null> = {
+  live: 15_000,
+  '5s': 5_000,
+  '15s': 15_000,
+  '30s': 30_000,
+  paused: null,
+}
+
+function isRefreshMode(value: string): value is RefreshMode {
+  return REFRESH_OPTIONS.some((option) => option.value === value)
+}
+
+function readRefreshMode(): RefreshMode {
+  try {
+    const stored = localStorage.getItem(REFRESH_STORAGE_KEY)
+    if (stored && isRefreshMode(stored)) return stored
+  } catch {
+    // localStorage 不可用时退回默认值
+  }
+  return 'live'
+}
+
+interface RecentChange {
+  state: 'online' | 'offline'
+  at: number
+}
 
 const items = ref<MachineSummary[]>([])
 const total = ref(0)
@@ -39,12 +91,23 @@ const keyword = ref('')
 const areaId = ref('')
 const roomId = ref('')
 const health = ref('')
+const machineStateFilter = ref('')
 
-const stats = ref({ total: 0, online: 0, alerts: 0, missing: 0 })
+const stats = ref({ total: 0, online: 0, alerts: 0, missing: 0, stale: 0, offline: 0 })
 const toast = useToastStore()
 /** 已见过的 serial：轮询发现新设备时提示（首次加载不提示）。 */
 let knownSerials: Set<string> | null = null
+/** 未知 serial 只触发一次对齐刷新，避免新机器持续上报时反复全量拉取。 */
+const reconciledSnapshotSerials = new Set<string>()
 const statsLoading = ref(false)
+
+const refreshMode = ref<RefreshMode>(readRefreshMode())
+const refreshTimer = ref<ReturnType<typeof setInterval> | null>(null)
+
+const recentChanges = ref<Record<string, RecentChange>>({})
+const presenceToastAt = new Map<string, number>()
+const mountedAt = Date.now()
+let unmounted = false
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)))
 
@@ -52,8 +115,45 @@ const visibleRooms = computed(() =>
   areaId.value ? rooms.value.filter((room) => room.area_id === areaId.value) : rooms.value,
 )
 
-function agentOnline(machine: MachineSummary): boolean {
-  return machine.report !== null && !machine.report_stale
+function machineStateMeta(machine: MachineSummary): { label: string; tone: BadgeTone } {
+  if (!machine.report) return { label: '未上报', tone: 'slate' }
+  if (machine.online === 'online') {
+    return machine.agent_online
+      ? { label: '在线', tone: 'emerald' }
+      : { label: '在线·遥测过期', tone: 'amber' }
+  }
+  if (machine.online === 'offline') return { label: '离线', tone: 'rose' }
+  return { label: '未知', tone: 'slate' }
+}
+
+function recentChangeFor(serial: string): RecentChange | undefined {
+  return recentChanges.value[serial]
+}
+
+function recentChangeLabel(serial: string): string {
+  return recentChangeFor(serial)?.state === 'offline' ? '刚刚离线' : '刚刚上线'
+}
+
+function recentChangeClasses(serial: string): string {
+  return recentChangeFor(serial)?.state === 'offline'
+    ? 'bg-rose-50 text-rose-600'
+    : 'bg-emerald-50 text-emerald-600'
+}
+
+function rowToneClasses(serial: string): Record<string, boolean> {
+  const change = recentChangeFor(serial)
+  return {
+    'bg-rose-50/60': change?.state === 'offline',
+    'bg-emerald-50/60': change?.state === 'online',
+  }
+}
+
+/** 60s 后清掉「刚刚上线/离线」标记；由 1s ticker 驱动。 */
+function pruneRecentChanges(now: number) {
+  const entries = Object.entries(recentChanges.value)
+  const kept = entries.filter(([, change]) => now - change.at < RECENT_CHANGE_TTL_MS)
+  if (kept.length === entries.length) return
+  recentChanges.value = Object.fromEntries(kept)
 }
 
 const statCards = computed<MetricCardProps[]>(() => [
@@ -69,7 +169,7 @@ const statCards = computed<MetricCardProps[]>(() => [
   {
     label: 'Agent 在线',
     value: String(stats.value.online),
-    note: '最近 5 分钟内有 room-agent 上报',
+    note: `新鲜快照 · 过期 ${stats.value.stale} · 离线 ${stats.value.offline}（窗口自适应）`,
     badge: stats.value.total
       ? `${Math.round((stats.value.online / stats.value.total) * 100)}%`
       : undefined,
@@ -100,16 +200,15 @@ const statCards = computed<MetricCardProps[]>(() => [
 async function loadStats() {
   statsLoading.value = true
   try {
-    const data = await api.listMachines({ page_size: 100 })
-    const all = data.items
+    // 服务端聚合：不受 page_size=100 限制，与筛选无关（全量机房 KPI）。
+    const data = await api.machineSummary()
     stats.value = {
       total: data.total,
-      online: all.filter((item) => item.report !== null && !item.report_stale).length,
-      alerts: all.filter(
-        (item) =>
-          item.report?.health_status === 'warning' || item.report?.health_status === 'critical',
-      ).length,
-      missing: all.filter((item) => item.report === null).length,
+      online: data.online,
+      alerts: data.alerts,
+      missing: data.missing,
+      stale: data.stale,
+      offline: data.offline,
     }
   } catch {
     // 统计失败不阻断列表
@@ -138,6 +237,7 @@ async function load(reset = false) {
       area_id: areaId.value || undefined,
       room_id: roomId.value || undefined,
       health: health.value || undefined,
+      state: machineStateFilter.value || undefined,
       keyword: keyword.value.trim() || undefined,
     })
     items.value = data.items
@@ -167,12 +267,14 @@ watch([areaId, roomId], () => {
 })
 
 watch(health, () => void load(true))
+watch(machineStateFilter, () => void load(true))
 
 function resetFilters() {
   keyword.value = ''
   areaId.value = ''
   roomId.value = ''
   health.value = ''
+  machineStateFilter.value = ''
 }
 
 function openMachine(serial: string) {
@@ -191,14 +293,36 @@ function refresh() {
 const { run: refreshFromStream } = useDebounceFn(() => {
   void load()
   void loadStats()
-}, 400)
+}, SNAPSHOT_RECONCILE_DEBOUNCE_MS)
 
-// 前端兜底轮询：新设备注册后 presence 事件默认不通知 online、首个遥测快照也可能延迟，
-// 因此每 5s 刷新当前页；首次加载只建基线，后续出现新 serial 时 toast。
-useInterval(() => {
-  if (document.visibilityState === 'hidden') return
-  void Promise.all([load(), loadStats()])
-}, 5_000)
+// 兜底对齐：新设备注册后 presence 事件默认不通知 online、首个遥测快照也可能延迟。
+// 实时/轮询模式只是周期不同；暂停时完全不自动拉取。
+function stopRefreshTimer() {
+  if (refreshTimer.value !== null) {
+    clearInterval(refreshTimer.value)
+    refreshTimer.value = null
+  }
+}
+
+function startRefreshTimer() {
+  stopRefreshTimer()
+  const intervalMs = REFRESH_INTERVALS[refreshMode.value]
+  if (intervalMs === null) return
+  refreshTimer.value = setInterval(() => {
+    if (document.visibilityState === 'hidden') return
+    void load()
+    void loadStats()
+  }, intervalMs)
+}
+
+watch(refreshMode, (mode) => {
+  try {
+    localStorage.setItem(REFRESH_STORAGE_KEY, mode)
+  } catch {
+    // localStorage 不可用时只影响持久化
+  }
+  startRefreshTimer()
+})
 
 watch(
   () => items.value.map((item) => item.serial),
@@ -218,13 +342,109 @@ watch(
   },
 )
 
-const { status: streamStatus, lastEventAt } = useMachineStream({
-  onSnapshot: () => refreshFromStream(),
+function snapshotReport(snapshot: MachineSnapshotPoint): MachineReportSummary {
+  return {
+    agent_version: snapshot.agent_version,
+    collected_at: snapshot.collected_at,
+    received_at: snapshot.received_at,
+    hostname: snapshot.hostname,
+    os_name: snapshot.os_name ?? null,
+    kernel_version: snapshot.kernel_version ?? null,
+    health_status: snapshot.health_status,
+    health_score: snapshot.health_score ?? null,
+    cpu_usage_percent: snapshot.cpu_usage_percent ?? null,
+    memory_usage_percent: snapshot.memory_usage_percent ?? null,
+    disk_usage_percent: snapshot.disk_usage_percent ?? null,
+    uptime_secs: snapshot.uptime_secs ?? null,
+  }
+}
+
+/** 快照就地补丁：只换 report 与新鲜度字段，不动 online/session（在线翻转由 presence 事件负责）。 */
+function patchFromSnapshot(
+  machine: MachineSummary,
+  snapshot: MachineSnapshotPoint,
+): MachineSummary {
+  return {
+    ...machine,
+    report: snapshotReport(snapshot),
+    report_stale: false,
+    report_age_secs: 0,
+    agent_online: true,
+  }
+}
+
+// 同一帧内的多台机器快照合并成一次 items 重赋值，避免突发流量下反复触发渲染。
+const pendingSnapshots = new Map<string, MachineSnapshotPoint>()
+let snapshotFrame: number | null = null
+
+function flushSnapshots() {
+  snapshotFrame = null
+  if (!pendingSnapshots.size) return
+  const batch = new Map(pendingSnapshots)
+  pendingSnapshots.clear()
+  items.value = items.value.map((machine) => {
+    const snapshot = batch.get(machine.serial)
+    return snapshot ? patchFromSnapshot(machine, snapshot) : machine
+  })
+}
+
+function handleSnapshot(snapshot: MachineSnapshotPoint) {
+  if (items.value.some((machine) => machine.serial === snapshot.serial)) {
+    pendingSnapshots.set(snapshot.serial, snapshot)
+    if (snapshotFrame === null) snapshotFrame = requestAnimationFrame(flushSnapshots)
+  }
+
+  // 新注册设备不在当前页：做一次防抖全量对齐，由 items watcher 负责「新机器」toast。
+  if (!knownSerials || knownSerials.has(snapshot.serial)) return
+  if (reconciledSnapshotSerials.has(snapshot.serial)) return
+  reconciledSnapshotSerials.add(snapshot.serial)
+  refreshFromStream()
+}
+
+function onPresenceEvent(event: PresenceEvent) {
+  // 只处理当前页可见机器；其余事件忽略，绝不触发列表重载。
+  if (!items.value.some((machine) => machine.serial === event.serial)) return
+
+  const receivedAt = Date.now()
+  items.value = items.value.map((machine) =>
+    machine.serial === event.serial
+      ? {
+          ...machine,
+          online: event.current_state,
+          session_online: event.current_state,
+          last_seen_at: event.occurred_at,
+        }
+      : machine,
+  )
+  recentChanges.value = {
+    ...recentChanges.value,
+    [event.serial]: { state: event.current_state, at: receivedAt },
+  }
+
+  if (receivedAt - mountedAt < PRESENCE_TOAST_GRACE_MS) return
+  const lastToastAt = presenceToastAt.get(event.serial)
+  if (lastToastAt !== undefined && receivedAt - lastToastAt < PRESENCE_TOAST_DEDUPE_MS) return
+  presenceToastAt.set(event.serial, receivedAt)
+
+  const description = `${event.device_slot} · ${shortId(event.serial, 10)}`
+  if (event.current_state === 'online') toast.info('机器已上线', description)
+  else toast.error('机器已离线', description)
+}
+
+const { status: snapshotStatus, lastEventAt } = useMachineStream({ onSnapshot: handleSnapshot })
+const { status: presenceStatus } = usePresenceStream({ onEvent: onPresenceEvent })
+
+const streamStatus = computed<MachineStreamStatus>(() => {
+  if (snapshotStatus.value === 'live' || presenceStatus.value === 'live') return 'live'
+  if (snapshotStatus.value === 'connecting' || presenceStatus.value === 'connecting')
+    return 'connecting'
+  return 'offline'
 })
 
 const nowTick = ref(Date.now())
 useInterval(() => {
   nowTick.value = Date.now()
+  pruneRecentChanges(nowTick.value)
 }, 1_000)
 
 const streamAgeLabel = computed(() => {
@@ -245,6 +465,16 @@ onMounted(async () => {
   if (queryArea) areaId.value = queryArea
   if (queryRoom) roomId.value = queryRoom
   await Promise.all([load(), loadStats(), loadOptions()])
+  if (!unmounted) startRefreshTimer()
+})
+
+onBeforeUnmount(() => {
+  unmounted = true
+  stopRefreshTimer()
+  if (snapshotFrame !== null) {
+    cancelAnimationFrame(snapshotFrame)
+    snapshotFrame = null
+  }
 })
 </script>
 
@@ -299,15 +529,39 @@ onMounted(async () => {
           {{ option.label }}
         </option>
       </select>
+      <select
+        v-model="machineStateFilter"
+        class="select w-[150px]"
+        aria-label="按观测状态筛选"
+      >
+        <option value="">全部观测状态</option>
+        <option value="online">在线</option>
+        <option value="stale">遥测过期</option>
+        <option value="offline">离线</option>
+        <option value="missing">未上报</option>
+      </select>
       <button
-        v-if="keyword || areaId || roomId || health"
+        v-if="keyword || areaId || roomId || health || machineStateFilter"
         type="button"
         class="text-[11.5px] text-accent transition-colors hover:text-accent-strong"
         @click="resetFilters"
       >
         重置筛选
       </button>
-      <span class="ml-auto text-[11px] text-faint">共 {{ total }} 台机器</span>
+      <div class="ml-auto flex items-center gap-2">
+        <label for="machines-refresh-mode" class="text-[11px] text-faint">刷新</label>
+        <select
+          id="machines-refresh-mode"
+          v-model="refreshMode"
+          class="select w-[104px]"
+          aria-label="机器列表刷新频率"
+        >
+          <option v-for="option in REFRESH_OPTIONS" :key="option.value" :value="option.value">
+            {{ option.label }}
+          </option>
+        </select>
+        <span class="text-[11px] text-faint">共 {{ total }} 台机器</span>
+      </div>
     </div>
 
     <div
@@ -349,7 +603,8 @@ onMounted(async () => {
             <tr
               v-for="machine in items"
               :key="machine.serial"
-              class="cursor-pointer border-b border-line/70 transition-colors last:border-b-0 hover:bg-canvas/50"
+              class="cursor-pointer border-b border-line/70 transition-colors duration-700 last:border-b-0 hover:bg-canvas/50"
+              :class="rowToneClasses(machine.serial)"
               @click="openMachine(machine.serial)"
             >
               <td class="py-3 pl-5 pr-3">
@@ -377,12 +632,16 @@ onMounted(async () => {
               </td>
               <td class="px-3 py-3">
                 <div class="flex flex-col items-start gap-1">
-                  <StateBadge
-                    :label="
-                      agentOnline(machine) ? 'Agent 在线' : machine.report ? 'Agent 过期' : '未上报'
-                    "
-                    :tone="agentOnline(machine) ? 'emerald' : machine.report ? 'amber' : 'slate'"
-                  />
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <StateBadge v-bind="machineStateMeta(machine)" />
+                    <span
+                      v-if="recentChangeFor(machine.serial)"
+                      class="rounded px-1 py-0.5 text-[9.5px] font-medium"
+                      :class="recentChangeClasses(machine.serial)"
+                    >
+                      {{ recentChangeLabel(machine.serial) }}
+                    </span>
+                  </div>
                   <span class="text-[10px] text-faint">
                     device 会话 · {{ machine.session_online ?? '无' }}
                   </span>
@@ -431,6 +690,9 @@ onMounted(async () => {
                   </p>
                   <p v-if="machine.report_stale" class="mt-0.5 text-[10px] text-amber-600">
                     快照已过期
+                    <template v-if="machine.report_age_secs !== null">
+                      · {{ formatSeconds(machine.report_age_secs) }} 前
+                    </template>
                   </p>
                 </template>
                 <span v-else class="text-[10.5px] text-faint">—</span>
@@ -446,7 +708,7 @@ onMounted(async () => {
                 >
                   <template #action>
                     <button
-                      v-if="keyword || areaId || roomId || health"
+                      v-if="keyword || areaId || roomId || health || machineStateFilter"
                       type="button"
                       class="text-[11.5px] text-accent hover:underline"
                       @click="resetFilters"

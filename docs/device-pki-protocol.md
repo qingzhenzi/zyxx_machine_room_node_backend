@@ -468,3 +468,17 @@ CREATE INDEX device_message_inbox_unprocessed
 错误语义与其它上行消息一致（见 §6）：bad JSON / 未知 `phase` → handler 失败 →
 `5xx` 且**不推水位**，设备按至少一次重发；重复 `seq` 走收件箱去重返回
 `{"status":"duplicate"}`；DB 更新失败同样 5xx 重试。
+
+## 10. 主机电源事件（mTLS）
+
+### POST /agent/power-event
+
+agent 在主机 shutdown/reboot 收尾完成后上报最后一次电源事件。身份完全来自设备证书：
+
+- `serial` 取证书 serial；`device_slot` 由服务端按证书身份解析；
+- 请求体不能指定其它 serial；
+- 成功返回 `202`，非法 action/details 返回 `400`，无证书 serial 返回 `401`。
+
+请求/响应字段与数据库表见
+[`docs/machine-telemetry.md`](machine-telemetry.md) §10。该端点设计为「尽力上报」：
+agent 失败时本地保留 `last-shutdown.json` 并下次补报，因此服务端不做重试队列。

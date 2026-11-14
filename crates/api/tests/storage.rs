@@ -105,6 +105,11 @@ fn test_config(s3_endpoint: String) -> Config {
             presign_ttl_secs: 900,
             signing_key_base64: Some(SIGNING_KEY_B64.to_owned()),
         }),
+        wol_broadcast_targets: Vec::new(),
+        wol_source_addr: None,
+        data_dir: std::path::PathBuf::from("/tmp/qe-api-test"),
+        iso_seed_dir: std::path::PathBuf::from("/tmp/qe-api-test/iso-seeds"),
+        iso_upload_chunk_mib: 64,
     }
 }
 

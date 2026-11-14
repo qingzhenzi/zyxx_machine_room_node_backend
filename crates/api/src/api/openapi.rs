@@ -376,7 +376,7 @@ pub fn spec() -> Value {
                         "device_slot": { "type": "string" },
                         "serial": { "type": ["string", "null"], "description": "null = 已分配槽位但尚未注册。" },
                         "status": { "type": ["string", "null"], "enum": ["pending", "issued", "active", "rejected", "revoked", null] },
-                        "online": { "type": ["string", "null"], "enum": ["online", "offline", null], "description": "综合在线状态：device-pki 会话 online 或最近 5 分钟内有 room-agent 快照。" },
+                        "online": { "type": ["string", "null"], "enum": ["online", "offline", null], "description": "综合在线状态：device-pki 会话 online，或最新快照仍在新鲜窗口内（max(3×fast 间隔, 30s)）。" },
                         "last_seen_at": { "type": ["string", "null"], "format": "date-time" },
                         "pending_token": { "type": "boolean", "description": "存在未使用且未过期的注册 token。" }
                     }
@@ -1354,14 +1354,26 @@ pub fn spec() -> Value {
                         "uptime_secs": { "type": ["integer", "null"] }
                     }
                 },
+                "MachineStateCounts": {
+                    "type": "object",
+                    "required": ["total", "online", "stale", "offline", "missing", "alerts"],
+                    "properties": {
+                        "total": { "type": "integer", "format": "int64" },
+                        "online": { "type": "integer", "format": "int64", "description": "有新鲜快照（agent 在线）。" },
+                        "stale": { "type": "integer", "format": "int64", "description": "快照超过新鲜窗口。" },
+                        "offline": { "type": "integer", "format": "int64", "description": "会话离线且快照不新鲜。" },
+                        "missing": { "type": "integer", "format": "int64", "description": "从未上报快照。" },
+                        "alerts": { "type": "integer", "format": "int64", "description": "最新快照健康为 warning/critical。" }
+                    }
+                },
                 "MachineSummary": {
                     "type": "object",
-                    "required": ["serial", "device_slot", "status", "online", "session_online", "last_seen_at", "room_id", "room_code", "room_name", "area_id", "area_code", "area_name", "report", "report_stale"],
+                    "required": ["serial", "device_slot", "status", "online", "session_online", "last_seen_at", "room_id", "room_code", "room_name", "area_id", "area_code", "area_name", "report", "report_stale", "report_age_secs", "stale_after_secs", "agent_online", "last_power_event"],
                     "properties": {
                         "serial": { "type": "string" },
                         "device_slot": { "type": "string" },
                         "status": { "type": "string", "enum": ["pending", "issued", "active", "rejected", "revoked"] },
-                        "online": { "type": ["string", "null"], "enum": ["online", "offline", null], "description": "综合在线状态：device-pki 会话 online 或最近 5 分钟内有 room-agent 快照。" },
+                        "online": { "type": ["string", "null"], "enum": ["online", "offline", null], "description": "综合在线状态：device-pki 会话 online，或最新快照仍在新鲜窗口内（max(3×fast 间隔, 30s)）。" },
                         "session_online": { "type": ["string", "null"], "enum": ["online", "offline", null], "description": "device-pki 的 mTLS 会话原始状态，仅用于排障展示。" },
                         "last_seen_at": { "type": ["string", "null"], "format": "date-time", "description": "最近一次 device-pki 心跳或 room-agent 快照接收时间。" },
                         "room_id": { "type": ["string", "null"], "format": "uuid" },
@@ -1371,7 +1383,28 @@ pub fn spec() -> Value {
                         "area_code": { "type": ["string", "null"] },
                         "area_name": { "type": ["string", "null"] },
                         "report": { "oneOf": [{ "$ref": "#/components/schemas/MachineReportSummary" }, { "type": "null" }], "description": "null = 从未上报。" },
-                        "report_stale": { "type": "boolean", "description": "最新快照超过 5 分钟未更新。" }
+                        "report_stale": { "type": "boolean", "description": "最新快照超过新鲜窗口未更新（窗口按 agent 自报 fast 间隔推导，默认 ≥30s）。" },
+                        "report_age_secs": { "type": ["integer", "null"], "format": "int64", "description": "最新快照年龄（秒）；从未上报为 null。" },
+                        "stale_after_secs": { "type": "integer", "format": "int64", "description": "当前生效的新鲜窗口（秒）：max(3 × agent fast 间隔, 30)。" },
+                        "agent_online": { "type": "boolean", "description": "Agent 视角严格在线：有快照且未超过新鲜窗口（不并集 device-pki 会话）。" },
+                        "last_power_event": { "oneOf": [{ "$ref": "#/components/schemas/MachinePowerEvent" }, { "type": "null" }], "description": "最近一次关机/重启事件；null = 尚未上报。" }
+                    }
+                },
+                "MachinePowerEvent": {
+                    "type": "object",
+                    "required": ["id", "serial", "device_slot", "action", "graceful", "requested_by", "agent_version", "source", "note", "details", "created_at"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "serial": { "type": "string" },
+                        "device_slot": { "type": "string" },
+                        "action": { "type": "string", "enum": ["shutdown", "reboot"] },
+                        "graceful": { "type": "boolean", "description": "无 destroy、无清理错误、网络清理成功。" },
+                        "requested_by": { "type": ["string", "null"], "description": "发起方（agent / 控制面操作者）。" },
+                        "agent_version": { "type": ["string", "null"] },
+                        "source": { "type": "string", "description": "事件来源，当前为 agent。" },
+                        "note": { "type": ["string", "null"], "description": "一句话摘要（VM 优雅数、网络结果、destroy 列表）。" },
+                        "details": { "type": "object", "description": "agent 上报的完整收尾明细（VM/容器/网络/错误）。" },
+                        "created_at": { "type": "string", "format": "date-time" }
                     }
                 },
                 "MachinePage": {
@@ -1428,6 +1461,73 @@ pub fn spec() -> Value {
                             }
                         }
                     ]
+                },
+                "AgentPoweroffAccepted": {
+                    "type": "object",
+                    "required": ["request_id"],
+                    "properties": {
+                        "request_id": { "type": "string", "format": "uuid" },
+                        "warn": { "type": ["string", "null"], "description": "附加提示（例如机器当前离线，命令会在其恢复连接后执行）。" }
+                    }
+                },
+                "MachineCommandReply": {
+                    "type": "object",
+                    "required": ["request_id", "status", "created_at", "updated_at"],
+                    "properties": {
+                        "request_id": { "type": "string", "format": "uuid" },
+                        "status": { "type": "string", "enum": ["pending", "ok", "error", "timeout"] },
+                        "data": { "type": ["object", "null"], "description": "agent 回传的结构化结果（poweroff 含 cleanup/scheduled/delay_secs 等）。" },
+                        "error": { "type": ["string", "null"] },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "LiveCommandResultEvent": {
+                    "type": "object",
+                    "required": ["type", "request_id", "ok", "status"],
+                    "properties": {
+                        "type": { "type": "string", "enum": ["command_result"] },
+                        "request_id": { "type": "string" },
+                        "ok": { "type": "boolean" },
+                        "status": { "type": "string", "enum": ["ok", "error"] },
+                        "data": { "type": ["object", "null"] },
+                        "error": { "type": ["string", "null"] },
+                        "at": { "type": ["string", "null"], "format": "date-time" }
+                    }
+                },
+                "LiveOpProgressEvent": {
+                    "type": "object",
+                    "required": ["type", "request_id", "kind", "stage"],
+                    "properties": {
+                        "type": { "type": "string", "enum": ["op_progress"] },
+                        "request_id": { "type": "string", "description": "控制面命令的 request_id（UUID 字符串）。" },
+                        "kind": { "type": "string", "description": "操作类型，如 poweroff / image.make。" },
+                        "stage": { "type": "string", "description": "accepted / cleanup_done / scheduled / rejected 等。" },
+                        "percent": { "type": ["number", "null"], "description": "可选进度 0–100。" },
+                        "message": { "type": ["string", "null"] },
+                        "at": { "type": ["string", "null"], "format": "date-time" }
+                    }
+                },
+                "TelemetryReportReply": {
+                    "type": "object",
+                    "required": ["accepted", "request_id", "serial"],
+                    "properties": {
+                        "accepted": { "type": "boolean" },
+                        "request_id": { "type": "string", "format": "uuid" },
+                        "serial": { "type": "string" }
+                    }
+                },
+                "WakeReply": {
+                    "type": "object",
+                    "required": ["ok", "serial", "macs", "sent_to", "targets", "warnings"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "serial": { "type": "string" },
+                        "macs": { "type": "array", "items": { "type": "string" } },
+                        "sent_to": { "type": "array", "items": { "type": "string" } },
+                        "targets": { "type": "array", "items": { "type": "string" } },
+                        "warnings": { "type": "array", "items": { "type": "string" } }
+                    }
                 },
                 "TicketStatus": {
                     "type": "string",
@@ -3378,6 +3478,7 @@ pub fn spec() -> Value {
                         { "name": "room_id", "in": "query", "schema": { "type": "string", "format": "uuid" } },
                         { "name": "keyword", "in": "query", "schema": { "type": "string" }, "description": "serial / 槽位 / 房间 code/name / hostname 模糊匹配" },
                         { "name": "health", "in": "query", "schema": { "type": "string", "enum": ["ok", "warning", "critical", "missing", "unknown"] }, "description": "missing = 从未上报" },
+                        { "name": "state", "in": "query", "schema": { "type": "string", "enum": ["online", "stale", "offline", "missing"] }, "description": "观测状态筛选：online=会话在线或快照新鲜；stale=快照过期；offline=会话离线且快照不新鲜；missing=从未上报。" },
                         { "name": "page", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
                         { "name": "page_size", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } }
                     ],
@@ -3401,6 +3502,17 @@ pub fn spec() -> Value {
                     "responses": {
                         "200": { "description": "SSE 流", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
                         "400": error_response("after_id 不合法"),
+                        "403": error_response("缺少 device:read")
+                    }
+                }
+            },
+            "/admin/machines/summary": {
+                "get": {
+                    "tags": ["Machines"],
+                    "summary": "机器状态汇总（在线/过期/离线/未上报/告警，服务端聚合）",
+                    "security": secured(),
+                    "responses": {
+                        "200": { "description": "状态计数", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MachineStateCounts" } } } },
                         "403": error_response("缺少 device:read")
                     }
                 }
@@ -3434,6 +3546,92 @@ pub fn spec() -> Value {
                         "200": { "description": "快照历史", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/MachineSnapshotPoint" } } } } },
                         "403": error_response("缺少 device:read"),
                         "404": error_response("机器不存在")
+                    }
+                }
+            },
+            "/admin/machines/{serial}/agent/poweroff": {
+                "post": {
+                    "tags": ["Machines"],
+                    "summary": "触发 agent 主机系统关机（device:manage）",
+                    "description": "下发 `agent.command {op:poweroff}`；agent 侧必须设置 QE_AGENT_ALLOW_POWEROFF=1 才会执行。202 只表示命令已入队：客户端用 `/agent/commands/{request_id}` 轮询执行结果。机器离线时响应 `warn` 提示命令会在恢复连接后执行。agent 屏幕会显示 boot-display 的 `power` 场景。",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "serial", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "202": { "description": "命令已入队", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AgentPoweroffAccepted" } } } },
+                        "403": error_response("缺少 device:manage"),
+                        "404": error_response("机器不存在"),
+                        "503": error_response("设备当前没有可用连接，命令未下发")
+                    }
+                }
+            },
+            "/admin/machines/{serial}/agent/commands/{request_id}": {
+                "get": {
+                    "tags": ["Machines"],
+                    "summary": "查询主机电源命令结果（device:manage）",
+                    "description": "`status`：pending / ok / error / timeout。`ok` 表示 agent 已调度关机/重启（之后机器会离线）。pending 超过 180s 由 GET 顺手更新为 timeout。",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "serial", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "request_id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "命令结果", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MachineCommandReply" } } } },
+                        "400": error_response("request_id 不合法"),
+                        "403": error_response("缺少 device:manage"),
+                        "404": error_response("命令不存在")
+                    }
+                }
+            },
+            "/admin/machines/{serial}/telemetry/report": {
+                "post": {
+                    "tags": ["Machines"],
+                    "summary": "请求 agent 立即上报一次 fast 快照（device:manage）",
+                    "description": "下发 `telemetry.report`；agent 收到后立即采集并上报，前端通过 `/admin/machines/stream` 收到新快照。",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "serial", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "202": { "description": "已请求", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TelemetryReportReply" } } } },
+                        "403": error_response("缺少 device:manage"),
+                        "404": error_response("机器不存在")
+                    }
+                }
+            },
+            "/admin/machines/{serial}/metrics/stream": {
+                "get": {
+                    "tags": ["Machines"],
+                    "summary": "毫秒级实时指标 SSE（经 device-pki 内存中转，不写 DB）",
+                    "description": "订阅后 qe-api 通知 agent 按 `interval_ms` 推流（机器实时 WS 通道优先，老 agent 回退 device_downlink/HTTP；无订阅者时不产生流量）。帧事件：`metric`（LiveMetricSample）、`op`（LiveOpProgressEvent）、`command`（LiveCommandResultEvent）、`heartbeat`。",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "serial", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "interval_ms", "in": "query", "schema": { "type": "integer", "minimum": 200, "maximum": 5000, "default": 1000 }, "description": "期望采样/推送间隔（毫秒）；agent 按此频率推送，浏览器可再降频渲染。" }
+                    ],
+                    "responses": {
+                        "200": { "description": "SSE 流", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
+                        "400": error_response("interval_ms / serial 不合法"),
+                        "403": error_response("缺少 device:read"),
+                        "503": error_response("实时指标中转未配置")
+                    }
+                }
+            },
+            "/admin/machines/{serial}/wake": {
+                "post": {
+                    "tags": ["Machines"],
+                    "summary": "网络唤醒（Wake-on-LAN，device:wake）",
+                    "description": "目标 MAC 取自最新快照 `sections.agent.host.macs`；每个 MAC 发送 3 次 magic packet。",
+                    "security": secured(),
+                    "parameters": [
+                        { "name": "serial", "in": "path", "required": true, "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "发送结果", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WakeReply" } } } },
+                        "403": error_response("缺少 device:wake"),
+                        "404": error_response("机器不存在"),
+                        "422": error_response("没有可用的 MAC 地址")
                     }
                 }
             },
@@ -4368,6 +4566,11 @@ mod tests {
         assert!(paths.contains_key("/admin/machines/{serial}"));
         assert!(paths.contains_key("/admin/machines/stream"));
         assert!(paths.contains_key("/admin/machines/{serial}/snapshots"));
+        assert!(paths.contains_key("/admin/machines/summary"));
+        assert!(paths.contains_key("/admin/machines/{serial}/agent/poweroff"));
+        assert!(paths.contains_key("/admin/machines/{serial}/agent/commands/{request_id}"));
+        assert!(paths.contains_key("/admin/machines/{serial}/metrics/stream"));
+        assert!(paths.contains_key("/admin/machines/{serial}/telemetry/report"));
         assert!(paths.contains_key("/machine/report"));
         assert!(paths.contains_key("/admin/device-events"));
         assert!(paths.contains_key("/admin/device-events/stream"));

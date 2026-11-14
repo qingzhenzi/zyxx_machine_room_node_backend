@@ -28,7 +28,10 @@ pub const MAX_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 /// 机器遥测 fast 档上报间隔默认值（秒）。
 pub const DEFAULT_TELEMETRY_FAST_INTERVAL_SECS: u64 = 10;
 /// 机器遥测 fast 档上报间隔范围（秒）。
-pub const TELEMETRY_FAST_INTERVAL_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=60;
+///
+/// 下限 5s：fast 档每次都会落一条快照，低于 5s 会给数据库带来不必要的写放大。
+/// 需要亚秒级观测时走实时指标链路（`/metrics/stream`，按需推流、不写 DB）。
+pub const TELEMETRY_FAST_INTERVAL_SECS_RANGE: std::ops::RangeInclusive<u64> = 5..=60;
 /// 机器遥测 full 档上报间隔默认值（秒）。
 pub const DEFAULT_TELEMETRY_FULL_INTERVAL_SECS: u64 = 300;
 /// 机器遥测 full 档上报间隔范围（秒）。
@@ -365,7 +368,7 @@ mod tests {
                 poll_interval_secs: Some(1),
                 download_concurrency: Some(32),
                 cache_max_bytes: Some(0),
-                telemetry_fast_interval_secs: Some(1),
+                telemetry_fast_interval_secs: Some(5),
                 telemetry_full_interval_secs: Some(60),
                 ..Default::default()
             })

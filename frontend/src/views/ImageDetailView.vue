@@ -117,7 +117,9 @@ async function runVerify() {
   try {
     const reply = await api.verifyImage(imageId.value)
     verification.value = reply.verification
-    image.value = image.value ? { ...image.value, ...reply.artifact } : image.value
+    image.value = image.value
+      ? ({ ...image.value, ...reply.artifact } as typeof image.value)
+      : image.value
     if (reply.verification.ok) {
       toast.success('同步验证通过', '验证报告已写入，可查看每项检查结果')
     } else {
@@ -135,13 +137,17 @@ async function runVerify() {
 }
 
 async function onPublished(artifact: ImageArtifact) {
-  image.value = image.value ? { ...image.value, ...artifact } : image.value
+  image.value = image.value
+      ? ({ ...image.value, ...artifact } as typeof image.value)
+      : image.value
   await loadDetail(true)
 }
 
 /** 下架成功：用后端返回的最新 artifact 覆盖页面状态。 */
 async function onDeprecated(artifact: ImageArtifact) {
-  image.value = image.value ? { ...image.value, ...artifact } : image.value
+  image.value = image.value
+      ? ({ ...image.value, ...artifact } as typeof image.value)
+      : image.value
   await loadDetail(true)
 }
 

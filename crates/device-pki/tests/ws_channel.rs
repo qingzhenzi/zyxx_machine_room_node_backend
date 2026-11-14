@@ -118,6 +118,7 @@ async fn spawn_mtls_listener(
 /// 设备侧：TCP + mTLS（带设备证书）+ WebSocket 握手。
 async fn dial(
     addr: SocketAddr,
+    path: &str,
     ca_pem: &str,
     device_cert_pem: &str,
     device_key_pem: &str,
@@ -141,7 +142,7 @@ async fn dial(
     let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let tls_stream = connector.connect(server_name, tcp).await.expect("tls");
 
-    let request = format!("wss://localhost:{}/channel", addr.port())
+    let request = format!("wss://localhost:{}{path}", addr.port())
         .into_client_request()
         .unwrap();
     let (ws, _) = tokio_tungstenite::client_async(request, tls_stream)
@@ -236,6 +237,7 @@ async fn ws_channel_connects_and_activates_enrollment() {
         )),
         vnc_internal_token: None,
         metrics: Arc::new(qe_device_pki::metrics::MetricsHub::new()),
+        realtime: Arc::new(qe_device_pki::realtime::RealtimeHub::new()),
     };
     let enroll_app = routes::enroll_router(state.clone());
     let mtls_app = routes::mtls_router(state.clone());
@@ -381,6 +383,7 @@ async fn ws_channel_connects_and_activates_enrollment() {
     // ---- 设备连上来 ----
     let mut ws = dial(
         listener_addr,
+        "/channel",
         &ca_pem,
         &device_cert_pem,
         &device_key.serialize_pem(),
@@ -466,6 +469,57 @@ async fn ws_channel_connects_and_activates_enrollment() {
 
     // ---- 服务端关闭连接 ----
     ws.close(None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // ---- 机器实时 WS 通道：样本广播 + want/idle 按需控制 ----
+    let mut realtime = dial(
+        listener_addr,
+        "/machine/realtime",
+        &ca_pem,
+        &device_cert_pem,
+        &device_key.serialize_pem(),
+    )
+    .await;
+    let rt_ready = next_frame(&mut realtime).await;
+    assert_eq!(rt_ready["type"], "ready", "{rt_ready}");
+
+    // 先订阅 hub：没有观察者时不应自动推流；模拟 qe-api 的 viewer_opened 才发 want。
+    let (latest, mut samples) = state.metrics.subscribe(&serial);
+    assert!(latest.is_none());
+    realtime
+        .send(Message::Text(
+            serde_json::json!({"type":"hello","agent_version":"test","capabilities":["metrics"]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    realtime
+        .send(Message::Text(
+            serde_json::json!({"type":"sample","payload":{"cpu_usage_percent":12.5}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let sample = tokio::time::timeout(std::time::Duration::from_secs(2), samples.recv())
+        .await
+        .expect("等实时样本")
+        .expect("样本不应关流");
+    assert!(
+        sample.contains("12.5"),
+        "样本应进入 MetricsHub 广播: {sample}"
+    );
+
+    state.realtime.viewer_opened(&serial, 1000);
+    let want = next_frame(&mut realtime).await;
+    assert_eq!(want["type"], "want", "{want}");
+    assert_eq!(want["interval_ms"], 1000);
+    state.realtime.viewer_closed(&serial);
+    let idle = next_frame(&mut realtime).await;
+    assert_eq!(idle["type"], "idle", "{idle}");
+
+    realtime.close(None).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     handle.abort();
 

@@ -110,6 +110,19 @@ pub async fn report_result(
         status,
         "机器命令结果已回传"
     );
+    // 与实时样本共用同一条广播：qe-api 识别 `type=command_result` 后以 SSE `command`
+    // 事件转发，控制台不必再对每条命令 1s 轮询结果（轮询保留为兜底）。
+    let payload = serde_json::json!({
+        "type": "command_result",
+        "request_id": req.request_id,
+        "ok": req.ok,
+        "status": status,
+        "data": req.data,
+        "error": req.error,
+        "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    });
+    st.metrics
+        .publish(&serial, std::sync::Arc::from(payload.to_string()));
     Ok(Json(CommandResultReply {
         ok: true,
         status: status.to_owned(),

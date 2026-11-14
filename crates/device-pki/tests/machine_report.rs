@@ -45,6 +45,7 @@ fn app_state(db: PgPool) -> AppState {
         )),
         vnc_internal_token: None,
         metrics: Arc::new(qe_device_pki::metrics::MetricsHub::new()),
+        realtime: Arc::new(qe_device_pki::realtime::RealtimeHub::new()),
     }
 }
 

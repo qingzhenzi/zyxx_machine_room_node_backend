@@ -67,8 +67,11 @@ import type {
   MachineDetail,
   MachinePage,
   LiveMetricSample,
+  LiveOpProgressEvent,
+  LiveCommandResultEvent,
   MachineSnapshotPoint,
   MachineTokenRequest,
+  MachineStateCounts,
   CreateFederationNodeRequest,
   EventRule,
   FederationNodeView,
@@ -97,8 +100,6 @@ import type {
   RoomDevice,
   RoomMachine,
   RoomPage,
-  RoomStartupProfile,
-  RoomStartupSaveRequest,
   Schedule,
   ScheduleEventDetail,
   ScheduleEventPage,
@@ -138,6 +139,8 @@ import type {
   UpdateTicketScopesRequest,
   UpdateUserRequest,
   UpsertExceptionRequest,
+  AgentPoweroffAccepted,
+  MachineCommandReply,
   VmCommandAccepted,
   VmEnvironmentReply,
   VmEnvironmentRequest,
@@ -154,6 +157,7 @@ import type {
   TelemetryReportReply,
   WeeklySlot,
 } from './schema'
+import type { RoomStartupProfile, RoomStartupSaveRequest } from './startup'
 import {
   clearSession,
   getAccessToken,
@@ -600,6 +604,9 @@ export const api = {
   listMachines: (params: MachineListParams = {}) =>
     unwrap<MachinePage>(http.get('/admin/machines', { params })),
 
+  /** 机器状态汇总（在线/过期/离线/未上报/告警；服务端聚合）。 */
+  machineSummary: () => unwrap<MachineStateCounts>(http.get('/admin/machines/summary')),
+
   getMachine: (serial: string, params: MachineDetailParams = {}) =>
     unwrap<MachineDetail>(http.get(`/admin/machines/${encodeURIComponent(serial)}`, { params })),
 
@@ -612,8 +619,16 @@ export const api = {
 
   /** 触发 agent 主机关机（device:manage；agent 侧默认关闭，需显式启用）。 */
   poweroffMachine: (serial: string) =>
-    unwrap<VmCommandAccepted>(
+    unwrap<AgentPoweroffAccepted>(
       http.post(`/admin/machines/${encodeURIComponent(serial)}/agent/poweroff`),
+    ),
+
+  /** 主机电源命令结果（下发后轮询；pending / ok / error / timeout）。 */
+  agentCommandResult: (serial: string, requestId: string) =>
+    unwrap<MachineCommandReply>(
+      http.get(
+        `/admin/machines/${encodeURIComponent(serial)}/agent/commands/${encodeURIComponent(requestId)}`,
+      ),
     ),
 
   /** 请求 agent 立即上报一次 fast 快照（device:manage）。 */
@@ -1156,16 +1171,25 @@ function parseMachineSseChunk(chunk: string, options: MachineSnapshotStreamOptio
 /** 毫秒级实时指标 SSE 流（经 device-pki 中转，不写 DB）。 */
 export interface LiveMetricsStreamOptions {
   serial: string
+  /** 期望采样/推送间隔（毫秒，200–5000）；服务端据此通知 agent 按需推流。 */
+  intervalMs?: number
   signal: AbortSignal
   onOpen?: () => void
   onMetric: (sample: LiveMetricSample) => void
+  /** 长操作进度（关机清理、镜像制作等），与样本共用同一条 SSE。 */
+  onOpProgress?: (event: LiveOpProgressEvent) => void
+  /** 命令终态（vm.command / agent.command 等），用于即时更新状态、减少轮询。 */
+  onCommandResult?: (event: LiveCommandResultEvent) => void
   onHeartbeat?: () => void
 }
 
 export async function streamLiveMetrics(options: LiveMetricsStreamOptions): Promise<void> {
   const token = getAccessToken()
+  const params = new URLSearchParams()
+  if (options.intervalMs != null) params.set('interval_ms', String(options.intervalMs))
+  const query = params.size ? `?${params.toString()}` : ''
   const response = await fetch(
-    `${baseURL}/admin/machines/${encodeURIComponent(options.serial)}/metrics/stream`,
+    `${baseURL}/admin/machines/${encodeURIComponent(options.serial)}/metrics/stream${query}`,
     {
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -1199,6 +1223,22 @@ export async function streamLiveMetrics(options: LiveMetricsStreamOptions): Prom
       if (!dataLines.length) continue
       if (eventName === 'heartbeat') {
         options.onHeartbeat?.()
+        continue
+      }
+      if (eventName === 'op') {
+        try {
+          options.onOpProgress?.(JSON.parse(dataLines.join('\n')) as LiveOpProgressEvent)
+        } catch {
+          // ignore malformed frames
+        }
+        continue
+      }
+      if (eventName === 'command') {
+        try {
+          options.onCommandResult?.(JSON.parse(dataLines.join('\n')) as LiveCommandResultEvent)
+        } catch {
+          // ignore malformed frames
+        }
         continue
       }
       if (eventName !== 'metric') continue

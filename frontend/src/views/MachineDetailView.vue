@@ -3,7 +3,15 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 import { api, isNotFound, streamLiveMetrics } from '@/api'
-import type { ImageArtifact, LiveMetricSample, MachineDetail, VmCommandOp, VmCommandReply } from '@/api/schema'
+import type {
+  ImageArtifact,
+  LiveMetricSample,
+  LiveCommandResultEvent,
+  LiveOpProgressEvent,
+  MachineDetail,
+  VmCommandOp,
+  VmCommandReply,
+} from '@/api/schema'
 import AppButton from '@/components/ui/AppButton.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
@@ -48,6 +56,7 @@ import {
   type VmSnapshotRow,
 } from '@/features/machines/vmCommand'
 import { useMachineStream } from '@/features/machines/useMachineStream'
+import { usePresenceStream } from '@/features/machines/usePresenceStream'
 import VncConsoleModal from '@/features/machines/VncConsoleModal.vue'
 import { vncRuntimeHint } from '@/features/machines/vncSession'
 import { useAuthStore } from '@/stores/auth'
@@ -85,13 +94,87 @@ const detail = ref<MachineDetail | null>(null)
 const loading = ref(false)
 const error = ref('')
 const notFound = ref(false)
-const autoRefresh = ref(false)
-/** 实时模式：每 2s 请求 agent 立即上报一次 fast 快照（Pterodactyl 风格）。 */
-const liveMode = ref(false)
+const autoRefresh = ref(true)
+
+// ---- 实时指标（按需推流）----
+// 默认开启：Task Manager 式近实时观测；可选 200ms–5s 刷新率，选择会记忆。
+const LIVE_RATE_OPTIONS = [200, 500, 1000, 2000, 5000] as const
+const LIVE_MODE_KEY = 'qe.machine.live'
+const LIVE_RATE_KEY = 'qe.machine.liveRateMs'
+
+function readStoredBool(key: string, fallback: boolean): boolean {
+  try {
+    const raw = window.localStorage.getItem(key)
+    if (raw === '1') return true
+    if (raw === '0') return false
+  } catch {
+    // localStorage 不可用（隐私模式）时用默认值
+  }
+  return fallback
+}
+
+function readStoredRate(): number {
+  try {
+    const raw = Number(window.localStorage.getItem(LIVE_RATE_KEY))
+    if (LIVE_RATE_OPTIONS.includes(raw as (typeof LIVE_RATE_OPTIONS)[number])) return raw
+  } catch {
+    // ignore
+  }
+  return 1000
+}
+
+const liveMode = ref(readStoredBool(LIVE_MODE_KEY, true))
+const liveRateMs = ref(readStoredRate())
 const liveSamples = ref<LiveMetricSample[]>([])
+const liveLastSampleAt = ref<number | null>(null)
 const relayStatus = ref<'connecting' | 'live' | 'offline'>('offline')
 const poweroffOpen = ref(false)
 const poweroffBusy = ref(false)
+/** 关机命令生命周期：idle → sent（202 已入队）→ acked（agent 已接收）→ error。 */
+const powerState = ref<'idle' | 'sent' | 'acked' | 'error'>('idle')
+const powerRequestId = ref<string | null>(null)
+/** 来自实时通道（SSE `op` 事件）的关机阶段：比 1s 轮询更快、可显示具体在做什么。 */
+const powerProgress = ref<{ stage: string; percent: number | null; message: string } | null>(null)
+
+/**
+ * 实时通道推送的命令终态缓存：轮询循环先查这里，命中即返回。
+ * 不改变“轮询兜底”的语义（SSE 可能没开或断线），只是让正常路径不再等下一次 1s。
+ */
+const commandResults = ref<Record<string, VmCommandReply>>({})
+
+function rememberCommandResult(reply: VmCommandReply) {
+  const next = { ...commandResults.value, [reply.request_id]: reply }
+  const ids = Object.keys(next)
+  if (ids.length > 20) {
+    for (const id of ids.slice(0, ids.length - 20)) delete next[id]
+  }
+  commandResults.value = next
+}
+
+function cachedCommandResult(requestId: string): VmCommandReply | undefined {
+  return commandResults.value[requestId]
+}
+
+function onCommandResult(event: LiveCommandResultEvent) {
+  const at = event.at ?? new Date().toISOString()
+  const reply: VmCommandReply = {
+    request_id: event.request_id,
+    status: event.ok ? 'ok' : 'error',
+    data: event.data ?? null,
+    error: event.error ?? null,
+    created_at: at,
+    updated_at: at,
+  }
+  rememberCommandResult(reply)
+  if (powerRequestId.value === event.request_id) {
+    if (event.ok) {
+      powerState.value = 'acked'
+      powerProgress.value ??= { stage: 'scheduled', percent: 100, message: '已调度关机' }
+    } else {
+      powerState.value = 'error'
+    }
+  }
+}
 const wakeOpen = ref(false)
 const wakeLoading = ref(false)
 
@@ -120,8 +203,21 @@ const wakeDetail = computed(() =>
   ].join('\n'),
 )
 
-/** 机器是否「Agent 在线」：只看 room-agent 快照新鲜度，与 device-pki 的 mTLS 会话状态相互独立。 */
-const agentOnline = computed(() => report.value !== null && detail.value?.report_stale !== true)
+/** 机器是否「Agent 在线」：只看 room-agent 快照新鲜度（服务端按 fast 间隔自适应窗口），
+ * 与 device-pki 的 mTLS 会话状态相互独立。 */
+const agentOnline = computed(() => {
+  const current = detail.value
+  if (!current) return false
+  if (typeof current.agent_online === 'boolean') return current.agent_online
+  return current.report !== null && current.report_stale !== true
+})
+
+/** 快照新鲜窗口（秒）：服务端按 agent 自报 fast 间隔推导，默认 ≥30s。 */
+const staleAfterSecs = computed(() => detail.value?.stale_after_secs ?? 30)
+const reportAgeLabel = computed(() => {
+  const age = detail.value?.report_age_secs
+  return age == null ? '—' : formatSeconds(age)
+})
 
 const liveLatest = computed(() => liveSamples.value[liveSamples.value.length - 1] ?? null)
 
@@ -165,8 +261,14 @@ const statCards = computed<MetricCardProps[]>(() => {
       label: '磁盘使用率',
       value: percentLabel(live?.disk_usage_percent ?? currentReport?.disk_usage_percent),
       note: live?.disk_usage_percent != null ? '实时中转' : '根分区 / 最满挂载点',
-      badge: (live?.disk_usage_percent ?? currentReport?.disk_usage_percent ?? 0) >= 90 ? '快满' : undefined,
-      tone: (live?.disk_usage_percent ?? currentReport?.disk_usage_percent ?? 0) >= 90 ? 'rose' : 'violet',
+      badge:
+        (live?.disk_usage_percent ?? currentReport?.disk_usage_percent ?? 0) >= 90
+          ? '快满'
+          : undefined,
+      tone:
+        (live?.disk_usage_percent ?? currentReport?.disk_usage_percent ?? 0) >= 90
+          ? 'rose'
+          : 'violet',
       icon: 'database',
       loading: loading.value,
     },
@@ -190,6 +292,50 @@ const statCards = computed<MetricCardProps[]>(() => {
   ]
 })
 
+/** 最近一次关机/重启（agent 关机收尾后经 device-pki mTLS 上报）。 */
+const lastPowerEvent = computed(() => detail.value?.last_power_event ?? null)
+
+const lastPowerItems = computed(() => {
+  const event = lastPowerEvent.value
+  if (!event) {
+    return [{ label: '最近关机/重启', value: '暂无记录（等待 agent 上报）' }]
+  }
+  const details = (event.details ?? {}) as Record<string, unknown>
+  const errors = Array.isArray(details.errors) ? details.errors : []
+  const items: { label: string; value?: string | number | null; mono?: boolean }[] = [
+    {
+      label: '最近关机/重启',
+      value: `${formatFullDateTime(event.created_at)} · ${event.action === 'reboot' ? '重启' : '关机'}`,
+    },
+    {
+      label: '是否优雅',
+      value: event.graceful ? '优雅（无 destroy / 无清理错误）' : '非优雅（超时强制或有清理错误）',
+    },
+    { label: '动作', value: event.action === 'reboot' ? 'reboot' : 'shutdown', mono: true },
+    {
+      label: '发起方 / 来源',
+      value: `${event.requested_by ?? '未知'} / ${event.source}`,
+      mono: true,
+    },
+    {
+      label: 'Agent 版本',
+      value: event.agent_version ? `v${event.agent_version}` : '未上报',
+      mono: true,
+    },
+    { label: '备注', value: event.note ?? '—' },
+  ]
+  if (errors.length) {
+    items.push({
+      label: '清理错误',
+      value: errors
+        .slice(0, 3)
+        .map((item) => String(item))
+        .join('；'),
+    })
+  }
+  return items
+})
+
 const identityItems = computed(() => {
   const device = detail.value
   if (!device) return []
@@ -198,15 +344,16 @@ const identityItems = computed(() => {
     { label: '设备槽位', value: device.device_slot, mono: true },
     { label: '设备注册状态', value: device.status },
     {
-      label: '机器状态（Agent）',
+      label: 'Agent 状态（快照）',
       value: agentOnline.value
-        ? `在线 · ${report.value ? formatRelative(report.value.collected_at) : '刚刚'}上报`
+        ? `在线 · ${reportAgeLabel.value} 前上报`
         : report.value
-          ? '快照已过期'
+          ? `快照过期（${reportAgeLabel.value} 未更新，窗口 ${staleAfterSecs.value}s）`
           : '未上报',
     },
-    { label: '设备在线状态（综合）', value: device.online ?? '无会话' },
+    { label: '在线状态（综合）', value: device.online ?? '未知' },
     { label: 'device-pki 会话', value: device.session_online ?? '无会话' },
+    { label: '快照新鲜窗口', value: `${staleAfterSecs.value}s（3×fast 间隔，最小 30s）` },
     {
       label: '会话最后心跳',
       value: device.last_seen_at ? formatFullDateTime(device.last_seen_at) : '—',
@@ -233,6 +380,37 @@ const { status: streamStatus, lastEventAt } = useMachineStream({
   },
 })
 
+/** 在线/离线事件：不等快照、也不等轮询，直接改详情里的会话状态并提示。 */
+const lastPresenceAt = ref<Record<string, number>>({})
+const { status: presenceStatus } = usePresenceStream({
+  onEvent: (event) => {
+    if (event.serial !== serial.value) return
+    const now = Date.now()
+    const previous = lastPresenceAt.value[event.serial] ?? 0
+    if (now - previous < 5_000) return
+    lastPresenceAt.value = { ...lastPresenceAt.value, [event.serial]: now }
+
+    if (detail.value) {
+      detail.value = {
+        ...detail.value,
+        online: event.current_state,
+        session_online: event.current_state,
+        last_seen_at: event.occurred_at,
+      }
+    }
+    if (event.current_state === 'offline') {
+      toast.error(
+        '机器已离线',
+        `${detail.value?.device_slot ?? event.device_slot} · 快照停止或网络断开`,
+      )
+      window.setTimeout(() => void load(true), 1_500)
+    } else {
+      toast.info('机器已上线', `${detail.value?.device_slot ?? event.device_slot} · 已恢复连接`)
+      window.setTimeout(() => void load(true), 500)
+    }
+  },
+})
+
 const nowTick = ref(Date.now())
 useInterval(() => {
   nowTick.value = Date.now()
@@ -244,9 +422,36 @@ const streamAgeLabel = computed(() => {
   return `${seconds}s 前推送`
 })
 
+/** 「实时」必须真的有数据：只看 SSE 已连接会把「零样本」误标成实时。 */
+const liveDataFresh = computed(() => {
+  if (!liveLastSampleAt.value) return false
+  return nowTick.value - liveLastSampleAt.value < Math.max(3_000, liveRateMs.value * 3)
+})
+
+const liveLastSampleLabel = computed(() => {
+  if (!liveLastSampleAt.value) return ''
+  const seconds = Math.max(0, Math.round((nowTick.value - liveLastSampleAt.value) / 1000))
+  return `${seconds}s 前样本`
+})
+
+const liveStatusLabel = computed(() => {
+  if (!liveMode.value) return '实时指标已关闭'
+  if (relayStatus.value === 'offline') return '实时指标重连中'
+  if (relayStatus.value === 'connecting') return '实时指标连接中'
+  if (!liveDataFresh.value) return '实时已连接 · 等待数据'
+  const rate = liveRateMs.value >= 1000 ? `${liveRateMs.value / 1000}s` : `${liveRateMs.value}ms`
+  return `实时 · ${rate}`
+})
+
 const streamMeta = computed<{ label: string; tone: 'emerald' | 'amber' | 'rose' }>(() => {
-  if (streamStatus.value === 'live') return { label: '实时流已连接', tone: 'emerald' }
-  if (streamStatus.value === 'connecting') return { label: '实时流连接中', tone: 'amber' }
+  const state =
+    streamStatus.value === 'live' || presenceStatus.value === 'live'
+      ? 'live'
+      : streamStatus.value === 'connecting' || presenceStatus.value === 'connecting'
+        ? 'connecting'
+        : 'offline'
+  if (state === 'live') return { label: '实时流已连接', tone: 'emerald' }
+  if (state === 'connecting') return { label: '实时流连接中', tone: 'amber' }
   return { label: '实时流重连中', tone: 'rose' }
 })
 
@@ -366,6 +571,8 @@ async function pollVmCommand(
   maxAttempts: number = VM_POLL_MAX_ATTEMPTS,
 ): Promise<VmCommandReply> {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const cached = cachedCommandResult(requestId)
+    if (cached && cached.status !== 'pending') return cached
     const reply = await api.vmCommandResult(serial.value, requestId)
     if (reply.status !== 'pending') return reply
     await sleep(VM_POLL_INTERVAL_MS)
@@ -813,12 +1020,15 @@ async function connectLiveMetrics() {
   try {
     await streamLiveMetrics({
       serial: serial.value,
+      intervalMs: liveRateMs.value,
       signal: local.signal,
+      onOpProgress: onPowerProgress,
       onOpen: () => {
         relayStatus.value = 'live'
       },
       onMetric: (sample) => {
         relayStatus.value = 'live'
+        liveLastSampleAt.value = Date.now()
         const next = [...liveSamples.value, sample]
         liveSamples.value = next.slice(-240)
       },
@@ -841,8 +1051,32 @@ function stopLiveMetrics() {
 }
 
 watch(liveMode, (enabled) => {
-  if (enabled) void connectLiveMetrics()
-  else stopLiveMetrics()
+  try {
+    window.localStorage.setItem(LIVE_MODE_KEY, enabled ? '1' : '0')
+  } catch {
+    // ignore
+  }
+  if (enabled) {
+    void connectLiveMetrics()
+  } else {
+    stopLiveMetrics()
+    liveSamples.value = []
+    liveLastSampleAt.value = null
+  }
+})
+
+watch(liveRateMs, (rate) => {
+  try {
+    window.localStorage.setItem(LIVE_RATE_KEY, String(rate))
+  } catch {
+    // ignore
+  }
+  // 换刷新率等于换 agent 侧推流间隔：重连 SSE 让服务端重新下发需求。
+  if (liveMode.value) {
+    liveSamples.value = []
+    liveLastSampleAt.value = null
+    void connectLiveMetrics()
+  }
 })
 
 onUnmounted(() => {
@@ -850,19 +1084,116 @@ onUnmounted(() => {
   stopLiveMetrics()
 })
 
+/** 轮询主机电源命令结果：pending → ok/error/timeout（agent 收到后先清理再延迟断电）。 */
+async function pollAgentPower(requestId: string) {
+  const maxAttempts = 120
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const cached = cachedCommandResult(requestId)
+    if (cached && cached.status !== 'pending') {
+      if (cached.status === 'ok') {
+        powerState.value = 'acked'
+        toast.success('机器已接收关机命令', '正在关闭虚拟机/容器；机器屏幕会显示关机提示')
+        window.setTimeout(() => void load(true), 3_000)
+      } else {
+        powerState.value = 'error'
+        toast.error('关机命令执行失败', cached.error ?? `状态：${cached.status}`)
+      }
+      return
+    }
+    try {
+      const reply = await api.agentCommandResult(serial.value, requestId)
+      if (reply.status === 'pending') {
+        await sleep(1000)
+        continue
+      }
+      if (reply.status === 'ok') {
+        powerState.value = 'acked'
+        powerProgress.value ??= { stage: 'scheduled', percent: 100, message: '已调度关机' }
+        const data = (reply.data ?? {}) as Record<string, unknown>
+        const delay = typeof data.delay_secs === 'number' ? data.delay_secs : 3
+        toast.success(
+          '机器已接收关机命令',
+          `正在关闭虚拟机/容器，约 ${delay} 秒后断电；机器屏幕会显示关机提示`,
+        )
+        // 断电后快照停止、在线状态翻转，延迟一点再拉一次详情。
+        window.setTimeout(() => void load(true), Math.max(2_000, (delay + 2) * 1000))
+        return
+      }
+      powerState.value = 'error'
+      toast.error('关机命令执行失败', reply.error ?? `状态：${reply.status}`)
+      return
+    } catch {
+      // 瞬时网络/鉴权抖动：继续重试，避免把“未收到回执”误报成失败。
+      await sleep(1000)
+    }
+  }
+  powerState.value = 'error'
+  toast.error(
+    '等待 agent 回执超时',
+    '命令可能已排队（机器离线时会在恢复连接后执行），请观察机器是否离线。',
+  )
+}
+
 /** 请求 agent 立即上报一次 fast 快照（走 device_downlink，不依赖定时器）。 */
 async function poweroffMachine() {
   if (!serial.value) return
   poweroffBusy.value = true
+  powerState.value = 'sent'
+  powerProgress.value = null
+  powerRequestId.value = null
   try {
-    await api.poweroffMachine(serial.value)
+    const accepted = await api.poweroffMachine(serial.value)
+    powerRequestId.value = accepted.request_id
     poweroffOpen.value = false
-    toast.success('关机命令已下发', 'agent 默认禁用电源命令；需在 /etc/qe-agent.env 设置 QE_AGENT_ALLOW_POWEROFF=1')
+    if (accepted.warn) {
+      toast.info('关机命令已入队（机器当前离线）', accepted.warn)
+    } else {
+      toast.success('关机命令已下发', '正在等待 agent 回执……机器屏幕会显示关机提示')
+    }
+    poweroffBusy.value = false
+    await pollAgentPower(accepted.request_id)
   } catch (caught) {
+    powerState.value = 'error'
     toast.error('关机命令下发失败', errorMessage(caught, '请确认机器在线且有权执行'))
   } finally {
     poweroffBusy.value = false
   }
+}
+
+const POWER_STAGE_LABELS: Record<string, string> = {
+  accepted: '已接收命令',
+  cleanup_done: '已清理虚拟机/容器',
+  scheduled: '已调度关机',
+  rejected: '本机拒绝执行',
+}
+
+const powerStateLabel = computed(() => {
+  const stage = powerProgress.value?.stage
+  const stageLabel = stage ? (POWER_STAGE_LABELS[stage] ?? stage) : ''
+  switch (powerState.value) {
+    case 'sent':
+      return stageLabel ? `关机中 · ${stageLabel}` : '关机命令已下发，等待 agent 回执…'
+    case 'acked':
+      return stageLabel && stage !== 'scheduled'
+        ? `关机中 · ${stageLabel}`
+        : 'agent 已接收，正在关机'
+    case 'error':
+      return '关机命令未成功'
+    default:
+      return ''
+  }
+})
+
+function onPowerProgress(event: LiveOpProgressEvent) {
+  if (!powerRequestId.value || event.request_id !== powerRequestId.value) return
+  powerProgress.value = {
+    stage: event.stage,
+    percent: typeof event.percent === 'number' ? event.percent : null,
+    message: event.message ?? '',
+  }
+  if (event.stage === 'rejected') powerState.value = 'error'
+  else if (event.stage === 'scheduled') powerState.value = 'acked'
+  else if (powerState.value !== 'error') powerState.value = 'sent'
 }
 
 async function requestTelemetryReport() {
@@ -966,7 +1297,7 @@ onMounted(() => {
           <label
             v-if="canViewLive"
             class="flex items-center gap-2 text-[11.5px] text-muted"
-            title="通过 device-pki 中转持续接收毫秒级指标（不写数据库）"
+            title="按需从 agent 拉取毫秒级指标（不写数据库）；默认开启"
           >
             <input
               v-model="liveMode"
@@ -975,15 +1306,43 @@ onMounted(() => {
             />
             <span
               class="inline-flex items-center gap-1"
-              :class="relayStatus === 'live' ? 'text-emerald-600' : relayStatus === 'offline' ? 'text-rose-600' : 'text-amber-600'"
+              :class="
+                liveDataFresh
+                  ? 'text-emerald-600'
+                  : relayStatus === 'offline'
+                    ? 'text-rose-600'
+                    : 'text-amber-600'
+              "
             >
               <span
                 class="h-1.5 w-1.5 rounded-full"
-                :class="relayStatus === 'live' ? 'bg-emerald-500 animate-pulse' : relayStatus === 'offline' ? 'bg-rose-500' : 'bg-amber-500'"
+                :class="
+                  liveDataFresh
+                    ? 'bg-emerald-500 animate-pulse'
+                    : relayStatus === 'offline'
+                      ? 'bg-rose-500'
+                      : 'bg-amber-500'
+                "
               />
-              实时指标
+              {{ liveStatusLabel }}
+            </span>
+            <span v-if="liveLastSampleLabel" class="tabular-nums text-faint">
+              {{ liveLastSampleLabel }}
             </span>
           </label>
+          <select
+            v-if="canViewLive && liveMode"
+            v-model.number="liveRateMs"
+            class="select w-[104px]"
+            aria-label="实时指标刷新率"
+            title="agent 侧推流间隔（200ms–5s）"
+          >
+            <option :value="200">200 ms</option>
+            <option :value="500">500 ms</option>
+            <option :value="1000">1 秒</option>
+            <option :value="2000">2 秒</option>
+            <option :value="5000">5 秒</option>
+          </select>
           <AppButton
             v-if="canRequestTelemetry"
             icon="refresh"
@@ -1002,6 +1361,29 @@ onMounted(() => {
           >
             关机
           </AppButton>
+          <span
+            v-if="powerStateLabel"
+            class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10.5px] font-medium"
+            :class="
+              powerState === 'error'
+                ? 'bg-rose-50 text-rose-700'
+                : powerState === 'acked'
+                  ? 'bg-amber-50 text-amber-700'
+                  : 'bg-sky-50 text-sky-700'
+            "
+          >
+            <span
+              class="h-1.5 w-1.5 rounded-full"
+              :class="
+                powerState === 'error'
+                  ? 'bg-rose-500'
+                  : powerState === 'acked'
+                    ? 'bg-amber-500 animate-pulse'
+                    : 'bg-sky-500 animate-pulse'
+              "
+            />
+            {{ powerStateLabel }}
+          </span>
           <IconButton
             icon="refresh"
             label="刷新机器详情"
@@ -1022,11 +1404,12 @@ onMounted(() => {
       </div>
 
       <div
-        v-if="report && detail?.report_stale"
-        class="mt-4 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-[11.5px] text-amber-700"
+        v-if="report && !agentOnline"
+        class="mt-4 flex items-center gap-2 rounded-lg border border-rose-200 bg-rose-50 px-4 py-2.5 text-[11.5px] text-rose-700"
       >
-        <span class="h-1.5 w-1.5 rounded-full bg-amber-500" />
-        最新快照已超过 5 分钟未更新，Agent 可能离线或采集失败。
+        <span class="h-1.5 w-1.5 rounded-full bg-rose-500" />
+        最新快照已超过新鲜窗口（{{ reportAgeLabel }} 未更新，窗口 {{ staleAfterSecs }}s），Agent
+        可能离线或采集失败。
       </div>
 
       <div
@@ -1035,10 +1418,9 @@ onMounted(() => {
       >
         <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-sky-500" />
         <span>
-          Agent 正在正常上报（最近 {{ formatRelative(report?.collected_at) }}），但 device-pki 的
-          mTLS 会话状态是 <span class="font-mono">{{ detail.online ?? '无会话' }}</span
-          >。 两者相互独立：机器总览以 Agent 快照判断机器是否在线，device 会话只在设备走 device-pki
-          心跳时更新。
+          Agent 正在正常上报（{{ reportAgeLabel }} 前），但 device-pki 的 mTLS 会话状态是
+          <span class="font-mono">{{ detail.online ?? '未知' }}</span
+          >。 两者相互独立：机器观测以「快照新鲜度」为主，会话状态只在设备走 device-pki 心跳时更新。
         </span>
       </div>
 
@@ -1051,7 +1433,7 @@ onMounted(() => {
         class="mt-4"
         :points="chartPoints"
         :live-samples="liveSamples"
-        :live="liveMode && relayStatus === 'live'"
+        :live="liveMode && liveDataFresh"
       />
 
       <div class="mt-4 grid grid-cols-12 items-start gap-4">
@@ -1236,6 +1618,18 @@ onMounted(() => {
             </div>
           </PageSection>
 
+          <PageSection
+            title="最近电源事件"
+            description="agent 在主机 shutdown/reboot 前完成的收尾结果（mTLS 上报）"
+          >
+            <div class="px-5 py-4">
+              <InfoList :items="lastPowerItems" />
+              <p v-if="!lastPowerEvent" class="mt-2 text-[10.5px] text-faint">
+                升级 agent、完成一次正常关机/重启后，这里会显示时间、动作、是否优雅与备注。
+              </p>
+            </div>
+          </PageSection>
+
           <PageSection title="健康摘要" description="来自最新快照的判定">
             <div v-if="report" class="px-5 py-4">
               <div class="flex items-center gap-4">
@@ -1289,7 +1683,7 @@ onMounted(() => {
         :open="poweroffOpen"
         title="关闭这台机器？"
         description="通过 device_downlink 向 agent 下发 poweroff，由 agent 所在系统执行关机。"
-        detail="agent 默认禁用该命令；只有在 /etc/qe-agent.env 设置 QE_AGENT_ALLOW_POWEROFF=1 并重启 daemon 后才会真正关机。"
+        detail="agent 默认禁用该命令；只有在 /etc/qe-agent.env 设置 QE_AGENT_ALLOW_POWEROFF=1 并重启 daemon 后才会真正关机。机器在线时会先显示关机提示，再关闭虚拟机/容器并延迟断电；离线机器的命令会排队到恢复连接后执行。"
         confirm-label="确认关机"
         danger
         :loading="poweroffBusy"

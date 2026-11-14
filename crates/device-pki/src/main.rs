@@ -221,6 +221,7 @@ async fn main() -> Result<()> {
         )),
         vnc_internal_token: internal_token.as_deref().map(Arc::from),
         metrics: Arc::new(qe_device_pki::metrics::MetricsHub::new()),
+        realtime: Arc::new(qe_device_pki::realtime::RealtimeHub::new()),
     };
 
     let enroll_cfg = tls::server_config_enroll(&enroll_cert, &enroll_key)?;
