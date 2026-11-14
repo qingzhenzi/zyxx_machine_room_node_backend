@@ -23,10 +23,8 @@ import PageSection from '@/components/ui/PageSection.vue'
 import MetricCard from '@/features/areas/MetricCard.vue'
 import type { MetricCardProps } from '@/features/areas/MetricCard.vue'
 import PresenceFeed from '@/features/areas/PresenceFeed.vue'
-import ScheduleEventFeed from '@/features/areas/ScheduleEventFeed.vue'
 import RoomDevicePanel from '@/features/rooms/RoomDevicePanel.vue'
 import RoomFormModal from '@/features/rooms/RoomFormModal.vue'
-import RoomSchedulesPanel from '@/features/rooms/RoomSchedulesPanel.vue'
 import RoomStartupPanel from '@/features/rooms/RoomStartupPanel.vue'
 import { useAuthStore } from '@/stores/auth'
 import { errorMessage } from '@/utils/errors'
@@ -86,7 +84,6 @@ const roomId = computed(() => String(route.params.id ?? ''))
 const timezone = computed(() => room.value?.timezone || 'Asia/Shanghai')
 const canManage = computed(() => auth.can(PERMISSIONS.roomManage))
 const canManageDevice = computed(() => auth.can(PERMISSIONS.deviceManage))
-const canReadSchedules = computed(() => auth.can(PERMISSIONS.scheduleRead))
 const canControlVm = computed(() => auth.can(PERMISSIONS.vmControl))
 
 const boundDevice = computed<RoomDevice | null>(() => device.value ?? room.value?.device ?? null)
@@ -135,24 +132,6 @@ const stats = computed<MetricCardProps[]>(() => {
       tone: deviceTone,
       icon: 'monitor',
       loading: loading.value || deviceLoading.value,
-    },
-    {
-      label: '课表数',
-      value: activityErrors.schedules ? '—' : String(schedules.value.length),
-      note: '该房间的课表',
-      badge: activityErrors.schedules ? '加载失败' : undefined,
-      tone: 'sky',
-      icon: 'calendar',
-      loading: activityLoading.value,
-    },
-    {
-      label: '今日排课实例',
-      value: activityErrors.occurrences ? '—' : String(todayOccurrences.value.length),
-      note: '按房间时区今天起 1 天',
-      badge: activityErrors.occurrences ? '加载失败' : undefined,
-      tone: 'violet',
-      icon: 'clock',
-      loading: activityLoading.value,
     },
     {
       label: '今日设备事件',
@@ -476,33 +455,16 @@ onMounted(() => {
         </div>
       </div>
 
-      <RoomSchedulesPanel v-if="canReadSchedules" class="mt-4" :room-id="room.id" />
-      <PageSection v-else class="mt-4" title="课表与近期实例">
-        <p class="px-5 py-6 text-[11.5px] text-muted">
-          当前账号没有课表读取权限（schedule:read），无法查看该房间的课表与排课实例。
-        </p>
-      </PageSection>
-
       <RoomStartupPanel class="mt-4" :room-id="room.id" :can-manage="canControlVm" />
 
-      <div class="mt-4 grid grid-cols-12 items-start gap-4">
-        <div class="col-span-6">
-          <PresenceFeed
-            :events="presenceEvents"
-            :loading="activityLoading"
-            :error="activityErrors.presence"
-            @open="openDevice"
-            @retry="loadActivity"
-          />
-        </div>
-        <div class="col-span-6">
-          <ScheduleEventFeed
-            :events="scheduleEvents"
-            :loading="activityLoading"
-            :error="activityErrors.scheduleEvents"
-            @retry="loadActivity"
-          />
-        </div>
+      <div class="mt-4">
+        <PresenceFeed
+          :events="presenceEvents"
+          :loading="activityLoading"
+          :error="activityErrors.presence"
+          @open="openDevice"
+          @retry="loadActivity"
+        />
       </div>
     </template>
 

@@ -8,7 +8,6 @@ import PageHeader from '@/components/ui/PageHeader.vue'
 import { useInterval } from '@/composables/useInterval'
 import AuditPanel from '@/features/overview/AuditPanel.vue'
 import PresencePanel from '@/features/overview/PresencePanel.vue'
-import RecentEventsPanel from '@/features/overview/RecentEventsPanel.vue'
 import StatCard from '@/features/overview/StatCard.vue'
 import type { OverviewStat } from '@/features/overview/StatCard.vue'
 import SystemPanel from '@/features/overview/SystemPanel.vue'
@@ -48,18 +47,8 @@ const stats = computed<OverviewStat[]>(() => {
       label: '房间',
       value: kpi ? String(kpi.rooms) : '—',
       note: kpi ? `分布在 ${kpi.areas} 个区域` : '按区域组织的调度最小单位',
-      badge: kpi ? `${kpi.schedules} 张课表` : undefined,
       tone: 'accent',
       icon: 'door',
-      loading: loading.value,
-    },
-    {
-      label: '今日课表事件',
-      value: data.value ? String(data.value.todayEvents) : '—',
-      note: '今日 00:00 起触发的排课事件',
-      badge: data.value ? `${data.value.kpi.schedules} 张课表` : undefined,
-      tone: 'sky',
-      icon: 'calendar',
       loading: loading.value,
     },
     {
@@ -144,7 +133,7 @@ onMounted(() => void overview.load())
       <AppButton size="sm" variant="ghost" @click="overview.load()">重试</AppButton>
     </div>
 
-    <section class="mt-4 grid grid-cols-4 gap-4" aria-label="关键指标">
+    <section class="mt-4 grid grid-cols-3 gap-4" aria-label="关键指标">
       <StatCard v-for="stat in stats" :key="stat.label" :stat="stat" />
     </section>
 
@@ -155,7 +144,6 @@ onMounted(() => void overview.load())
           v-if="auth.can(PERMISSIONS.storageRead)"
           :transfers="data?.transfers ?? []"
         />
-        <RecentEventsPanel :events="data?.recentEvents ?? []" :loading="loading" />
       </div>
 
       <div class="col-span-4 flex flex-col gap-4">

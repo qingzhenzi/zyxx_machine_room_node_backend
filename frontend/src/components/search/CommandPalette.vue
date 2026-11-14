@@ -76,24 +76,6 @@ const quickActions = computed<PaletteEntry[]>(() => {
       action: () => navigate({ name: 'devices' }),
     },
     {
-      key: 'nav-schedules',
-      title: '课表',
-      subtitle: '周模板、单日覆盖与排课实例',
-      icon: 'calendar',
-      section: '跳转',
-      permission: PERMISSIONS.scheduleRead,
-      action: () => navigate({ name: 'schedules' }),
-    },
-    {
-      key: 'nav-events',
-      title: '触发事件',
-      subtitle: '事件记录、投递明细与重放',
-      icon: 'zap',
-      section: '跳转',
-      permission: PERMISSIONS.scheduleEventRead,
-      action: () => navigate({ name: 'events' }),
-    },
-    {
       key: 'nav-images',
       title: '镜像',
       subtitle: 'manifest、验证、发布与房间分配',
@@ -210,14 +192,6 @@ const entries = computed<PaletteEntry[]>(() => {
       section: '镜像',
       action: () => navigate({ name: 'image-detail', params: { id: image.id } }),
     })),
-    ...data.schedules.map<PaletteEntry>((schedule) => ({
-      key: `schedule-${schedule.id}`,
-      title: schedule.name,
-      subtitle: `${schedule.room_name} · ${schedule.start_date} ~ ${schedule.end_date}`,
-      icon: 'calendar',
-      section: '课表',
-      action: () => navigate({ name: 'schedule-detail', params: { id: schedule.id } }),
-    })),
     ...data.announcements.map<PaletteEntry>((announcement) => ({
       key: `announcement-${announcement.id}`,
       title: announcement.title,
@@ -325,7 +299,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               ref="inputRef"
               v-model="query"
               type="text"
-              placeholder="搜索房间、设备、镜像、课表或公告…"
+              placeholder="搜索房间、设备、镜像或公告…"
               class="h-12 w-full bg-transparent text-[13px] text-ink placeholder:text-faint focus:outline-none"
             />
             <kbd

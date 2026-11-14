@@ -82,32 +82,8 @@ const navGroups: { label: string; items: NavItem[] }[] = [
       },
     ],
   },
-  {
-    label: '课表与事件',
-    items: [
-      {
-        name: 'schedules',
-        label: '课表',
-        icon: 'calendar',
-        to: '/schedules',
-        permission: PERMISSIONS.scheduleRead,
-      },
-      {
-        name: 'schedule-plans',
-        label: '排课计划',
-        icon: 'layers',
-        to: '/schedules/plans',
-        permission: PERMISSIONS.scheduleRead,
-      },
-      {
-        name: 'events',
-        label: '触发事件',
-        icon: 'zap',
-        to: '/events',
-        permission: PERMISSIONS.scheduleEventRead,
-      },
-    ],
-  },
+  // 2026-11-14 决策：课表与事件暂不对外展示（代码/路由/后端保留）。
+  // 详见 docs/product-roadmap.md。
   {
     label: '资源',
     items: [
