@@ -488,7 +488,7 @@ impl MachineRepo {
         let rows = sqlx::query_as::<_, MachineSummaryRow>(&format!(
             "{LATEST_CTE} {MACHINE_SELECT} {MACHINE_FROM} {MACHINE_FILTER}
              ORDER BY de.device_slot, de.serial
-             LIMIT $5 OFFSET $6"
+             LIMIT $6 OFFSET $7"
         ))
         .bind(filter.area_id)
         .bind(filter.room_id)

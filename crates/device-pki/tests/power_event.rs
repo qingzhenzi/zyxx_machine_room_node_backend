@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt;
-use qe_db::machine::MachineRepo;
+use qe_db::machine::{MachineFilter, MachineRepo};
 use qe_device_pki::ca::Ca;
 use qe_device_pki::cert_status::CertStatusCache;
 use qe_device_pki::messaging::Dispatcher;
@@ -188,6 +188,37 @@ async fn records_power_event_and_returns_latest() {
             .await
             .unwrap();
     assert_eq!(count, 2);
+
+    // 详情/摘要路径：单台 summary 与列表批量附带的最近事件都必须是最新 reboot。
+    let summary = repo
+        .summary(&serial)
+        .await
+        .expect("summary")
+        .expect("machine");
+    assert_eq!(
+        summary
+            .last_power_event
+            .expect("summary power event")
+            .action,
+        "reboot"
+    );
+    let page = repo
+        .list(&MachineFilter::default(), 1, 200)
+        .await
+        .expect("list");
+    let listed = page
+        .items
+        .iter()
+        .find(|item| item.serial == serial)
+        .expect("listed machine");
+    assert_eq!(
+        listed
+            .last_power_event
+            .as_ref()
+            .expect("list power event")
+            .action,
+        "reboot"
+    );
 
     cleanup(&db, &serial).await;
 }

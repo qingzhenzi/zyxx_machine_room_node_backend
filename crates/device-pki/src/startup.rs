@@ -410,7 +410,14 @@ mod tests {
                 "base_volume": null,
                 "base_path": null,
                 "gpu": [],
-                "auto_start": true
+                "auto_start": true,
+                "network": {
+                    "mode": "isolated",
+                    "vlan_id": 104,
+                    "allow_services": [
+                        { "cidr": "192.168.8.231/32", "proto": "tcp", "ports": [8080] }
+                    ]
+                }
             }]
         }))
         .expect("config");
@@ -432,6 +439,16 @@ mod tests {
         assert_eq!(value["enabled"], serde_json::json!(true));
         assert_eq!(value["vms"][0]["name"], serde_json::json!("lab-104"));
         assert!(value["vms"][0]["base_volume"].is_null());
+        // network 原样下发给 agent（含 vlan/allowlist），房间 id 一并下发用于配网。
+        assert_eq!(
+            value["vms"][0]["network"]["mode"],
+            serde_json::json!("isolated")
+        );
+        assert_eq!(
+            value["vms"][0]["network"]["vlan_id"],
+            serde_json::json!(104)
+        );
+        assert!(value.get("room_id").is_some());
         assert_eq!(value["images"].as_array().unwrap().len(), 1);
         // 契约里的下划线字段名不能被写成 camelCase。
         assert!(value.get("autoStartVm").is_none());

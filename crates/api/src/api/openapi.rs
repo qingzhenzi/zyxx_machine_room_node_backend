@@ -4855,4 +4855,28 @@ mod tests {
             "GET /admin/images 缺少 scope 参数"
         );
     }
+
+    #[test]
+    fn machine_summary_documents_last_power_event() {
+        let spec = spec();
+        let schemas = spec["components"]["schemas"].as_object().expect("schemas");
+        let event = schemas["MachinePowerEvent"]
+            .as_object()
+            .expect("MachinePowerEvent schema");
+        let actions = event["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        assert!(actions.iter().any(|value| value == "shutdown"));
+        assert!(actions.iter().any(|value| value == "reboot"));
+
+        let summary = &schemas["MachineSummary"]["properties"]["last_power_event"];
+        assert_eq!(
+            summary["oneOf"][0]["$ref"],
+            "#/components/schemas/MachinePowerEvent"
+        );
+        let required = schemas["MachineSummary"]["required"]
+            .as_array()
+            .expect("required");
+        assert!(required.iter().any(|value| value == "last_power_event"));
+    }
 }
