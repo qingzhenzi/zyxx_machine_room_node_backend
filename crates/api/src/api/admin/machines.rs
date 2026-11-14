@@ -185,10 +185,8 @@ pub async fn snapshots(
     Ok(Json(state.machines.history(serial, limit).await?))
 }
 
-/// WOL：每个目标 MAC 发送的 magic packet 次数（UDP 无连接，重复提高到达率）。
+/// WOL：每个目标 MAC × 每个广播目标发送的 magic packet 次数（UDP 无连接，重复提高到达率）。
 const WOL_SEND_COUNT: usize = 3;
-/// Wake-on-LAN 标准端口 9 的 IPv4 广播地址（需与目标机同一二层网络）。
-const WOL_BROADCAST_ADDR: &str = "255.255.255.255:9";
 
 /// 网络唤醒响应：`ok` 表示至少有一个 magic packet 成功发出；广播失败只进 `warnings`，
 /// HTTP 仍是 200（契约见 `docs/wol.md`）。
@@ -200,6 +198,8 @@ pub struct WakeReply {
     pub macs: Vec<String>,
     /// 至少成功发出一次 magic packet 的 MAC。
     pub sent_to: Vec<String>,
+    /// 实际使用的广播目标（`WOL_BROADCAST_TARGETS`）。
+    pub targets: Vec<String>,
     /// 发送失败的 MAC/原因（不阻塞 HTTP 语义）。
     pub warnings: Vec<String>,
 }
@@ -357,7 +357,14 @@ pub async fn wake(
     }
 
     let mac_labels: Vec<String> = macs.iter().map(ToString::to_string).collect();
-    let (sent_to, warnings) = send_wake_packets(&macs).await;
+    let targets = state.config.wol_broadcast_targets.clone();
+    let target_labels: Vec<String> = targets.iter().map(ToString::to_string).collect();
+    let (sent_to, warnings) = send_wake_packets(
+        &macs,
+        &targets,
+        state.config.wol_source_addr,
+    )
+    .await;
     let ok = !sent_to.is_empty();
     if !warnings.is_empty() {
         tracing::warn!(
@@ -376,6 +383,7 @@ pub async fn wake(
         serde_json::json!({
             "serial": device.serial,
             "macs": mac_labels,
+            "targets": target_labels,
             "sent_to": sent_to,
             "warnings": warnings,
             "snapshot_id": latest.id,
@@ -389,6 +397,7 @@ pub async fn wake(
         serial: device.serial,
         macs: mac_labels,
         sent_to,
+        targets: target_labels,
         warnings,
     }))
 }
@@ -397,15 +406,23 @@ pub async fn wake(
 ///
 /// 广播发送是「尽力而为」：UDP 无连接、无 ACK，只要 socket 写入成功就算发出，
 /// 目标机是否真的醒来由目标机 BIOS/网卡决定（见 `docs/wol.md` 排障）。
-async fn send_wake_packets(macs: &[wol::MacAddress]) -> (Vec<String>, Vec<String>) {
+async fn send_wake_packets(
+    macs: &[wol::MacAddress],
+    targets: &[std::net::SocketAddr],
+    source: Option<std::net::IpAddr>,
+) -> (Vec<String>, Vec<String>) {
     let mut sent_to = Vec::new();
     let mut warnings = Vec::new();
 
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+    // 绑定源地址：多网卡/跨网段时用 WOL_SOURCE_ADDR 指定从哪张网卡发出。
+    let bind_addr = source
+        .map(|ip| std::net::SocketAddr::new(ip, 0))
+        .unwrap_or_else(|| "0.0.0.0:0".parse().expect("静态地址合法"));
+    let socket = match UdpSocket::bind(bind_addr).await {
         Ok(socket) => socket,
         Err(error) => {
             warnings.push(format!(
-                "创建 UDP socket 失败（本机可能无网络权限）: {error}"
+                "创建 UDP socket 失败（bind {bind_addr}，请检查 WOL_SOURCE_ADDR/网络权限）: {error}"
             ));
             return (sent_to, warnings);
         }
@@ -417,22 +434,34 @@ async fn send_wake_packets(macs: &[wol::MacAddress]) -> (Vec<String>, Vec<String
     for mac in macs {
         let packet = wol::magic_packet(*mac);
         let mut succeeded = 0usize;
-        let mut last_error: Option<String> = None;
-        for _ in 0..WOL_SEND_COUNT {
-            match socket.send_to(&packet, WOL_BROADCAST_ADDR).await {
-                Ok(sent) if sent == packet.len() => succeeded += 1,
-                Ok(sent) => {
-                    last_error = Some(format!("仅发送 {sent}/{} 字节", packet.len()));
+        let mut failures: Vec<String> = Vec::new();
+        for target in targets {
+            let mut target_ok = 0usize;
+            let mut last_error: Option<String> = None;
+            for _ in 0..WOL_SEND_COUNT {
+                match socket.send_to(&packet, target).await {
+                    Ok(sent) if sent == packet.len() => target_ok += 1,
+                    Ok(sent) => {
+                        last_error = Some(format!("仅发送 {sent}/{} 字节", packet.len()));
+                    }
+                    Err(error) => last_error = Some(error.to_string()),
                 }
-                Err(error) => last_error = Some(error.to_string()),
+            }
+            if target_ok > 0 {
+                succeeded += target_ok;
+            } else {
+                failures.push(format!(
+                    "{target}: {}",
+                    last_error.unwrap_or_else(|| "未知错误".to_owned())
+                ));
             }
         }
         if succeeded > 0 {
             sent_to.push(mac.to_string());
         } else {
             warnings.push(format!(
-                "{mac} 发送失败: {}",
-                last_error.unwrap_or_else(|| "未知错误".to_owned())
+                "{mac} 发送失败（所有目标失败）: {}",
+                failures.join("; ")
             ));
         }
     }

@@ -62,6 +62,12 @@ pub struct Config {
     pub schedule_webhook_max_attempts: u32,
     pub schedule_delivery_batch: i64,
     // ---- 设备 ----
+    /// WOL 广播目标（逗号分隔的 `IP:port`，默认 `255.255.255.255:9`）。
+    /// 跨网段/多网卡时填各网段的定向广播地址（如 `192.168.8.255:9,192.168.9.255:9`）。
+    pub wol_broadcast_targets: Vec<SocketAddr>,
+    /// WOL 发送源地址（可选）：绑定到指定网卡 IP（如 `192.168.8.231`），
+    /// 用于多网卡/容器网络下明确从哪个网卡发出广播。
+    pub wol_source_addr: Option<std::net::IpAddr>,
     /// 设备注册服务对外地址，用于拼装注册链接（如 `https://node:4440`）。
     pub public_enroll_endpoint: String,
     // ---- noVNC 阶段 2（device-pki 内部 VNC 中继）----
@@ -343,6 +349,10 @@ impl Config {
                 .to_owned(),
             device_pki_internal_token: env_optional("DEVICE_PKI_INTERNAL_TOKEN"),
             federation_token: env_optional("FEDERATION_TOKEN"),
+            wol_broadcast_targets: parse_wol_broadcast_targets(
+                env_optional("WOL_BROADCAST_TARGETS").as_deref(),
+            )?,
+            wol_source_addr: parse_wol_source_addr(env_optional("WOL_SOURCE_ADDR").as_deref())?,
             public_enroll_endpoint: env_optional("PUBLIC_ENROLL_ENDPOINT")
                 .unwrap_or_else(|| "https://localhost:4440".to_owned())
                 .trim_end_matches('/')
@@ -437,6 +447,58 @@ fn parse_environment() -> Result<Environment> {
             "production" | "prod" => Ok(Environment::Production),
             _ => bail!("APP_ENV 只能是 development 或 production"),
         },
+    }
+}
+
+/// 默认 WOL 目标（同一二层网络的受限广播）。
+const DEFAULT_WOL_BROADCAST_TARGET: &str = "255.255.255.255:9";
+/// WOL 目标数量上限，避免误配大量地址放大发包量。
+const MAX_WOL_BROADCAST_TARGETS: usize = 16;
+
+/// 解析 `WOL_BROADCAST_TARGETS`：逗号分隔的 `IPv4:port`；缺省 `255.255.255.255:9`。
+///
+/// 支持多网段定向广播（如 `192.168.8.255:9,192.168.9.255:9`）与指定端口；
+/// 只接受 IPv4（WOL magic packet 是 IPv4 广播），并去重。
+pub fn parse_wol_broadcast_targets(raw: Option<&str>) -> Result<Vec<SocketAddr>> {
+    let raw = raw.unwrap_or(DEFAULT_WOL_BROADCAST_TARGET);
+    let mut targets = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let address: SocketAddr = part
+            .parse()
+            .with_context(|| format!("WOL_BROADCAST_TARGETS 中的目标非法：{part:?}（期望 IP:port）"))?;
+        if !address.is_ipv4() {
+            bail!("WOL_BROADCAST_TARGETS 只支持 IPv4（收到 {part:?}）");
+        }
+        if !targets.contains(&address) {
+            targets.push(address);
+        }
+    }
+    if targets.is_empty() {
+        bail!("WOL_BROADCAST_TARGETS 至少需要一个目标（如 255.255.255.255:9）");
+    }
+    if targets.len() > MAX_WOL_BROADCAST_TARGETS {
+        bail!("WOL_BROADCAST_TARGETS 最多 {MAX_WOL_BROADCAST_TARGETS} 个目标");
+    }
+    Ok(targets)
+}
+
+/// 解析 `WOL_SOURCE_ADDR`：可选 IPv4 源地址（绑定指定网卡）；未设置=0.0.0.0。
+pub fn parse_wol_source_addr(raw: Option<&str>) -> Result<Option<std::net::IpAddr>> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => {
+            let address: std::net::IpAddr = value
+                .parse()
+                .with_context(|| format!("WOL_SOURCE_ADDR 非法：{value:?}（期望 IPv4 地址）"))?;
+            if !address.is_ipv4() {
+                bail!("WOL_SOURCE_ADDR 只支持 IPv4（收到 {value:?}）");
+            }
+            Ok(Some(address))
+        }
     }
 }
 
@@ -559,6 +621,35 @@ mod tests {
             &origins(&["https://app.example.com"]),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn wol_broadcast_targets_parse_default_and_multi_subnet() {
+        assert_eq!(
+            parse_wol_broadcast_targets(None).unwrap(),
+            vec!["255.255.255.255:9".parse().unwrap()]
+        );
+        let targets = parse_wol_broadcast_targets(Some(
+            "192.168.8.255:9, 192.168.9.255:9,192.168.8.255:9",
+        ))
+        .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0], "192.168.8.255:9".parse().unwrap());
+        assert_eq!(targets[1], "192.168.9.255:9".parse().unwrap());
+        assert!(parse_wol_broadcast_targets(Some("192.168.8.255")).is_err());
+        assert!(parse_wol_broadcast_targets(Some("::1:9")).is_err());
+        assert!(parse_wol_broadcast_targets(Some(" , ")).is_err());
+    }
+
+    #[test]
+    fn wol_source_addr_parse() {
+        assert_eq!(parse_wol_source_addr(None).unwrap(), None);
+        assert_eq!(
+            parse_wol_source_addr(Some(" 192.168.8.231 ")).unwrap(),
+            Some("192.168.8.231".parse().unwrap())
+        );
+        assert!(parse_wol_source_addr(Some("::1")).is_err());
+        assert!(parse_wol_source_addr(Some("not-an-ip")).is_err());
     }
 
     #[test]
