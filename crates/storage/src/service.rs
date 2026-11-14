@@ -18,6 +18,11 @@ const MIN_PRESIGN_TTL_SECS: u64 = 60;
 const MAX_PRESIGN_TTL_SECS: u64 = 86_400;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// S3 流式上传的读取 buffer：1 MiB。
+///
+/// `ReaderStream` 默认 8 KiB，GB 级 ISO 上传时 syscall/分块开销明显；1 MiB 能把
+/// complete → S3 阶段吞吐提升一个档次（不影响内存占用，最多多 1 MiB）。
+const S3_UPLOAD_STREAM_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// S3 兼容存储配置（与 `docs/storage-design.md` §14.1 一致）。
 #[derive(Debug, Clone)]
@@ -361,7 +366,8 @@ impl StorageService {
             .await
             .with_context(|| format!("读取待上传文件大小失败：{}", path.display()))?
             .len();
-        let stream = tokio_util::io::ReaderStream::new(file);
+        let stream =
+            tokio_util::io::ReaderStream::with_capacity(file, S3_UPLOAD_STREAM_BUFFER_BYTES);
         let body = reqwest::Body::wrap_stream(stream);
         let presigned = self.presign_put(object_key, Some(content_type))?;
         let response = self
@@ -479,7 +485,7 @@ fn transport_error(context: &str, object_key: &str, error: reqwest::Error) -> an
 
 #[cfg(test)]
 mod tests {
-    use super::{StorageOptions, StorageService, base64};
+    use super::{S3_UPLOAD_STREAM_BUFFER_BYTES, StorageOptions, StorageService, base64};
     use chrono::{TimeZone, Utc};
 
     fn options() -> StorageOptions {
@@ -680,6 +686,12 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn put_file_stream_buffer_is_one_mib() {
+        // 大 ISO 上传：ReaderStream 缓冲从默认 8KiB 提升到 1MiB。
+        assert_eq!(S3_UPLOAD_STREAM_BUFFER_BYTES, 1024 * 1024);
     }
 
     #[test]

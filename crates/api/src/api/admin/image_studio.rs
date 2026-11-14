@@ -703,7 +703,20 @@ async fn start_iso_distribution(
 /// `preparing`（iso 资产）：确保 iso.pull 已下发 → 轮询结果 → ok 后进入创建 VM。
 ///
 /// 分发是幂等的：目标机已有同名且 sha 匹配的 ISO 时 agent 返回 `skipped=true`（仍为 ok），
-/// 会话直接进入创建 VM。超过 30 分钟未完成 → failed（契约 B.3）。
+/// 会话直接进入创建 VM。
+///
+/// 超时语义：默认 2 小时**总时长兜底**（`ISO_PULL_PENDING_TIMEOUT_SECS` 可覆盖，
+/// 300..=21600s）。4.7GB ISO 在慢链路上可能超过 30 分钟，不能按「一次固定等待」
+/// 打断；只要 agent 还在下载（命令 pending）就继续等，真正无响应/失败由命令结果或
+/// agent 空闲超时上报。
+fn iso_pull_pending_timeout_secs() -> i64 {
+    std::env::var("ISO_PULL_PENDING_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|secs| (300..=21_600).contains(secs))
+        .unwrap_or(7_200)
+}
+
 async fn advance_preparing_iso_asset(
     state: &AppState,
     session: BuildSession,
@@ -713,11 +726,15 @@ async fn advance_preparing_iso_asset(
     };
     match command_outcome(state, request_id).await? {
         CommandOutcome::Pending => {
-            if Utc::now() - session.updated_at > chrono::Duration::minutes(30) {
+            let timeout_secs = iso_pull_pending_timeout_secs();
+            if Utc::now() - session.updated_at > chrono::Duration::seconds(timeout_secs) {
                 return transition_failed(
                     state,
                     &session,
-                    "ISO 分发超时（>30 分钟），请检查目标机网络或稍后重试",
+                    format!(
+                        "ISO 分发超过总时长上限（{} 秒）仍未完成，请检查目标机网络或稍后重试",
+                        timeout_secs
+                    ),
                 )
                 .await;
             }

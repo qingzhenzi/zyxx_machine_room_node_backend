@@ -1,9 +1,14 @@
 //! 镜像构建会话后台回收（契约 `docs/image-studio.md` §3.2）。
 //!
 //! 教师关掉页面/机器掉线后，构建会话可能停在非终态。本 worker 每 60s 扫描一次：
-//! `state NOT IN (done, failed, cancelled, expired)` 且 `updated_at < now()-2h`
-//! → 置 `expired`，并尽力回收构建 VM（destroy + delete remove_disks=true）、
-//! 清理尚未消费的 draft 镜像，写 `image_events(actor_kind=system)`。
+//! `state NOT IN (done, failed, cancelled, expired)` 且
+//! `updated_at < now()-IMAGE_BUILD_EXPIRE_SECS`（默认 2h）→ 置 `expired`，并尽力
+//! 回收构建 VM（destroy + delete remove_disks=true）、清理尚未消费的 draft 镜像，
+//! 写 `image_events(actor_kind=system)`。
+//!
+//! 说明：这是「会话总时长兜底」，不是进展判定；installing/making 等长任务只要
+//! 会话状态在推进（updated_at 被刷新）就不会被回收。可用 `IMAGE_BUILD_EXPIRE_SECS`
+//! 调大（600..=86400 秒）。
 //!
 //! 多副本安全：`expire_stale_sessions` 用 `FOR UPDATE SKIP LOCKED` + CAS，同一行
 //! 只会被一个副本回收；VM 回收命令是幂等语义（destroy/delete 不存在的 VM 由 agent
@@ -13,7 +18,7 @@ use std::time::Duration;
 
 use tokio::time::{MissedTickBehavior, interval};
 
-use qe_domain::image_studio::{BuildSession, SESSION_STALE_HOURS};
+use qe_domain::image_studio::BuildSession;
 
 use crate::{
     domain::storage::{ArtifactStatus, ImageEventActorKind, NewImageEvent},
@@ -23,6 +28,20 @@ use crate::{
 /// 扫描周期：60s。
 const REAPER_TICK: Duration = Duration::from_secs(60);
 
+/// 非终态会话回收总时长默认值：2 小时（契约 §3.2）。
+const DEFAULT_IMAGE_BUILD_EXPIRE_SECS: i64 = 2 * 60 * 60;
+
+/// 解析 `IMAGE_BUILD_EXPIRE_SECS`（600..=86400，非法/越界回退默认 2h）。
+fn parse_image_build_expire_secs(raw: Option<&str>) -> i64 {
+    raw.and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|secs| (600..=86_400).contains(secs))
+        .unwrap_or(DEFAULT_IMAGE_BUILD_EXPIRE_SECS)
+}
+
+fn image_build_expire_secs() -> i64 {
+    parse_image_build_expire_secs(std::env::var("IMAGE_BUILD_EXPIRE_SECS").ok().as_deref())
+}
+
 /// 启动后台构建会话回收（生命周期跟随进程）。
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -30,9 +49,12 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            // 仓库按分钟扫描；向上取整，避免 <60s 的配置被截断成 0。
+            let expire_secs = image_build_expire_secs();
+            let expire_minutes = ((expire_secs + 59) / 60).max(1);
             match state
                 .image_studio
-                .expire_stale_sessions(SESSION_STALE_HOURS * 60)
+                .expire_stale_sessions(expire_minutes)
                 .await
             {
                 Ok(sessions) if sessions.is_empty() => {}
@@ -118,10 +140,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stale_window_matches_two_hours() {
-        // 契约 §3.2：>2h 非终态会话回收；worker 用小时数换算分钟。
-        assert_eq!(SESSION_STALE_HOURS, 2);
-        assert_eq!(SESSION_STALE_HOURS * 60, 120);
+    fn expire_window_defaults_to_two_hours_and_is_env_overridable() {
+        // 默认 2h 总时长兜底；配置值 600..=86400 秒。
+        assert_eq!(parse_image_build_expire_secs(None), 7_200);
+        assert_eq!(parse_image_build_expire_secs(Some("7200")), 7_200);
+        assert_eq!(parse_image_build_expire_secs(Some(" 10800 ")), 10_800);
+        assert_eq!(parse_image_build_expire_secs(Some("86400")), 86_400);
+        // 非法/越界回退默认值。
+        assert_eq!(parse_image_build_expire_secs(Some("599")), 7_200);
+        assert_eq!(parse_image_build_expire_secs(Some("86401")), 7_200);
+        assert_eq!(parse_image_build_expire_secs(Some("bogus")), 7_200);
         assert_eq!(REAPER_TICK, Duration::from_secs(60));
+        // 分钟换算向上取整。
+        let minutes = |secs: i64| ((secs + 59) / 60).max(1);
+        assert_eq!(minutes(7_200), 120);
+        assert_eq!(minutes(650), 11);
+        assert_eq!(minutes(600), 10);
     }
 }

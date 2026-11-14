@@ -598,7 +598,8 @@ ALTER TABLE install_isos
 - **压缩导出**：`IMAGE_MAKE_COMPRESS=1`（默认开）时 `qemu-img convert -c`，Windows 10.5GB 预计压到 ~6-7GB；
   （qcow2 压缩镜像可直接作为 libvirt 卷/backing，导入逻辑无需改）
 - **零分片跳过**：全零 chunk 标记为 skipped（manifest 已支持 skipped_chunks），减少无效上传；
-- **服务端 pending 超时**：`IMAGE_MAKE_PENDING_TIMEOUT_SECS` 默认 1800s（原 600s），`image.make` 命令/结果逻辑不变；
+- **服务端 pending 超时**：`IMAGE_MAKE_PENDING_TIMEOUT_SECS` 默认 21600s（6h，v4.1 起；
+  仅总时长兜底，持续进展不超时，无进展由 agent 空闲超时处理），`image.make` 命令/结果逻辑不变；
 - **进度**：agent 每 N 个分片记录日志（chunk/total/字节/耗时/吞吐）；服务端仍按 request_id 轮询；
 - **验收**：用已装好的 Windows 10 LTSC（10.5GB）导出，记录导出/上传耗时；服务端 verify/publish 通过；
   并验证 Windows 底包用 `disk_bus=sata` 创建构建 VM 能进桌面。
@@ -641,3 +642,44 @@ ALTER TABLE install_isos
   （免全局 2 MiB body / 30s 超时；body 上限 16 GiB、超时 2h）。
 - **本期不做**：分片并发上限/限速、跨进程分片锁（写不同 index 天然并发安全，同 index 幂等覆盖）、
   断点元数据压缩/清理 worker（中断记录由用户 DELETE /upload 释放）。
+
+---
+
+# 附录 D：进展式超时 / DB 繁忙重试 / complete 提速（v4.1，2026-11-14）
+
+用户要求：**只要持续在上传/导出就不超时，只有无响应才失败**。服务端时间戳只做
+「总时长最终兜底」，真正的停滞判定在 agent（空闲超时/命令结果 error）。
+
+## D.1 超时语义
+
+| 场景 | 参数 | 默认 | 语义 |
+|---|---|---|---|
+| 普通 `vm.command` pending | 固定 | 120s | 只针对无响应命令（不适用于大任务） |
+| `image.make` pending | `IMAGE_MAKE_PENDING_TIMEOUT_SECS` | **21600s（6h）** | 导出+上传总时长兜底；持续进展不打断 |
+| 构建会话 `iso.pull` pending | `ISO_PULL_PENDING_TIMEOUT_SECS` | **7200s（2h）** | 4.7GB ISO 慢链路下载兜底 |
+| 构建会话超时回收 | `IMAGE_BUILD_EXPIRE_SECS` | **7200s（2h）** | 非终态会话总时长兜底（状态推进刷新 updated_at） |
+
+- 所有上限都可用环境变量覆盖（含范围校验，非法值回退默认）；
+- 会话 GET 每次推进状态会刷新 `updated_at`，因此 `installing/making` 等长任务只要
+  仍在推进就不会被 worker 回收；
+- 迁移无需变更，纯服务端配置/日志调整。
+
+## D.2 DB 繁忙短退避
+
+- `DB_MAX_CONNECTIONS` 默认 **20**（原 10）；`ACQUIRE_TIMEOUT` 3s 不变。
+- 分片上传相关 DB 调用（`install_isos.get/list_chunks/upsert_chunk/received_summary/
+  update_ready/delete_chunks`、角色查询）遇 `DbError::Unavailable`（连接池超时、
+  连接中断、锁超时/死锁/连接数打满等）做 **50/150/400ms 最多 3 次**退避重试，
+  仍失败才映射 503；参数/冲突/不存在等业务错误立即失败，不重试。
+- 分类 helper：`qe_db::error::DbError::is_busy()`；退避常量：
+  `qe_db::error::DB_BUSY_RETRY_DELAYS_MS`（单测覆盖）。
+
+## D.3 complete 提速
+
+- `StorageService::put_file` 的 `ReaderStream` 读取 buffer 从默认 8 KiB 提升到
+  **1 MiB**（`S3_UPLOAD_STREAM_BUFFER_BYTES`），提升大 ISO 的 S3 PUT 吞吐；
+- complete 仍为「一遍读取分片 → 同时写合并文件 + 计算整体 SHA-256」，不额外扫盘；
+- 阶段日志（`tracing::info`）：`ISO complete：分片拼接 + 整体 SHA-256 完成`
+  （assemble_ms/bytes/chunks）与 `ISO complete：S3 上传完成`
+  （upload_ms/throughput_mb_s/total_ms），便于定位慢在拼接还是 S3；
+- 未做 multipart 上传（RustFS/MinIO 兼容性/正确性优先，后续如需再评估）。

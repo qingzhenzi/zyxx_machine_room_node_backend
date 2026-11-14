@@ -40,7 +40,23 @@ impl DbError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
+
+    /// 是否属于「数据库繁忙 / 连接暂不可用」这类**可短退避重试**的错误。
+    ///
+    /// 只有 [`DbError::Unavailable`] 命中（连接池等待超时、连接中断、数据库重启、
+    /// 锁超时/死锁/连接数打满等，见 `From<sqlx::Error>` 的分类）；参数/约束/冲突
+    /// 等业务错误重试没有意义，调用方应立即失败。
+    pub const fn is_busy(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+    }
 }
+
+/// 分片上传等高频短事务的 DB 繁忙重试退避（毫秒）：最多重试 3 次。
+///
+/// 与 [`DbError::is_busy`] 配合：仅在 `Unavailable` 时退避重试，其余错误立即返回。
+/// 用途：并发分片上传会瞬间占满连接池，偶发 `PoolTimedOut -> 503`；短退避通常
+/// 50-150ms 就能拿到连接，避免把瞬时抖动暴露给教师端。
+pub const DB_BUSY_RETRY_DELAYS_MS: [u64; 3] = [50, 150, 400];
 
 impl From<sqlx::Error> for DbError {
     fn from(error: sqlx::Error) -> Self {
@@ -83,7 +99,7 @@ impl From<sqlx::Error> for DbError {
 
 #[cfg(test)]
 mod tests {
-    use super::DbError;
+    use super::{DB_BUSY_RETRY_DELAYS_MS, DbError};
 
     #[test]
     fn pool_timeout_is_classified_as_unavailable() {
@@ -91,5 +107,26 @@ mod tests {
             DbError::from(sqlx::Error::PoolTimedOut),
             DbError::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn busy_classification_only_covers_unavailable() {
+        assert!(DbError::unavailable("数据库繁忙").is_busy());
+        assert!(DbError::from(sqlx::Error::PoolTimedOut).is_busy());
+        assert!(!DbError::bad_request("bad arg").is_busy());
+        assert!(!DbError::not_found("missing").is_busy());
+        assert!(!DbError::conflict("dup").is_busy());
+        assert!(!DbError::internal("boom").is_busy());
+    }
+
+    #[test]
+    fn busy_retry_delays_are_short_and_increasing() {
+        assert_eq!(DB_BUSY_RETRY_DELAYS_MS, [50, 150, 400]);
+        assert!(
+            DB_BUSY_RETRY_DELAYS_MS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        assert!(DB_BUSY_RETRY_DELAYS_MS.iter().all(|ms| *ms <= 500));
     }
 }

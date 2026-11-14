@@ -18,7 +18,7 @@
 //! 注意：`PUT content` 不挂全局 2 MiB body 限制 / 30s 超时，由 `api/mod.rs` 的独立
 //! 长上传路由承载（16 GiB、2 小时）。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json,
@@ -247,8 +247,38 @@ impl From<InstallIso> for IsoReply {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// 分片上传/complete 路径的 DB 繁忙重试：仅 `DbError::Unavailable` 做 50/150/400ms
+/// 三次短退避；参数/冲突/不存在等错误立即返回。并发分片会瞬时占满连接池，短退避
+/// 通常能拿到连接，避免把瞬时抖动变成 503。
+async fn db_retry_busy<'a, T, F>(mut operation: F) -> AppResult<T>
+where
+    F: FnMut() -> futures_util::future::BoxFuture<'a, qe_db::DbResult<T>>,
+{
+    let mut attempt = 0usize;
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if error.is_busy() && attempt < qe_db::error::DB_BUSY_RETRY_DELAYS_MS.len() =>
+            {
+                let delay = qe_db::error::DB_BUSY_RETRY_DELAYS_MS[attempt];
+                tracing::warn!(
+                    retry = attempt + 1,
+                    delay_ms = delay,
+                    %error,
+                    "分片上传数据库繁忙，短退避后重试"
+                );
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 async fn actor_is_admin(state: &AppState, user_id: Uuid) -> AppResult<bool> {
-    Ok(role_is_admin(&state.users.roles_of(user_id).await?))
+    let roles = db_retry_busy(|| Box::pin(state.users.roles_of(user_id))).await?;
+    Ok(role_is_admin(&roles))
 }
 
 fn parse_status_filter(raw: Option<&str>) -> AppResult<Option<IsoStatus>> {
@@ -538,9 +568,7 @@ pub async fn create(
 
 /// 读取 ISO 并校验 owner/admin；preset 不允许上传/中止（契约 C.1）。
 async fn load_uploadable_iso(state: &AppState, actor: Uuid, iso_id: Uuid) -> AppResult<InstallIso> {
-    let iso = state
-        .isos
-        .get(iso_id)
+    let iso = db_retry_busy(|| Box::pin(state.isos.get(iso_id)))
         .await?
         .ok_or_else(|| AppError::not_found("ISO 不存在"))?;
     let is_admin = actor_is_admin(state, actor).await?;
@@ -562,7 +590,7 @@ pub async fn get_upload(
     authorization::require_permission(&state, id, permissions::IMAGE_MANAGE).await?;
     let iso = load_uploadable_iso(&state, id, iso_id).await?;
     let plan = resolve_plan(&state, &iso);
-    let chunks = state.isos.list_chunks(iso_id).await?;
+    let chunks = db_retry_busy(|| Box::pin(state.isos.list_chunks(iso_id))).await?;
     Ok(Json(build_upload_status(&iso, &plan, &chunks)))
 }
 
@@ -680,16 +708,10 @@ pub async fn upload_chunk(
     tokio::fs::rename(&temp, &target)
         .await
         .map_err(|error| AppError::internal(format!("落盘分片文件失败: {error}")))?;
-    state
-        .isos
-        .upsert_chunk(
-            iso_id,
-            index,
-            i64::try_from(received).unwrap_or(i64::MAX),
-            &sha256,
-        )
-        .await?;
-    let (received_count, received_bytes) = state.isos.received_summary(iso_id).await?;
+    let chunk_size = i64::try_from(received).unwrap_or(i64::MAX);
+    db_retry_busy(|| Box::pin(state.isos.upsert_chunk(iso_id, index, chunk_size, &sha256))).await?;
+    let (received_count, received_bytes) =
+        db_retry_busy(|| Box::pin(state.isos.received_summary(iso_id))).await?;
     Ok(Json(ChunkUploadReply {
         received_count,
         received_bytes,
@@ -728,7 +750,8 @@ pub async fn complete(
         None => None,
     };
     let plan = resolve_plan(&state, &iso);
-    let chunks = state.isos.list_chunks(iso_id).await?;
+    let complete_started = Instant::now();
+    let chunks = db_retry_busy(|| Box::pin(state.isos.list_chunks(iso_id))).await?;
     let received: Vec<i32> = chunks.iter().map(|chunk| chunk.chunk_index).collect();
     let missing = missing_chunk_indices(plan.total_chunks, &received);
     if !missing.is_empty() {
@@ -743,7 +766,8 @@ pub async fn complete(
         .into());
     }
 
-    // 按序流式拼接 + 整体 SHA-256（不一次性读入内存）。
+    // 按序流式拼接 + 整体 SHA-256（一遍读取，不一次性读入内存、也不额外扫盘）。
+    let assemble_started = Instant::now();
     let final_temp = complete_temp_path(&state, iso_id);
     cleanup_temp(&final_temp).await;
     let dir = chunk_dir(&state, iso_id);
@@ -803,6 +827,14 @@ pub async fn complete(
     drop(output);
 
     let sha256 = hex::encode(hasher.finalize());
+    let assemble_elapsed = assemble_started.elapsed();
+    tracing::info!(
+        %iso_id,
+        chunks = plan.total_chunks,
+        bytes = total,
+        assemble_ms = assemble_elapsed.as_millis() as u64,
+        "ISO complete：分片拼接 + 整体 SHA-256 完成"
+    );
     let expected_sha = body_sha.or_else(|| iso.sha256.clone());
     if let Some(expected) = expected_sha.as_deref()
         && !expected.eq_ignore_ascii_case(&sha256)
@@ -814,39 +846,54 @@ pub async fn complete(
         );
     }
 
+    let upload_started = Instant::now();
     let storage = super::storage::service(&state)?.clone();
     let storage_key = iso_storage_key(iso_id, &iso.filename);
-    if let Err(error) = storage
+    let put_result = storage
         .put_file(
             &storage_key,
             &final_temp,
             "application/octet-stream",
             ISO_UPLOAD_S3_TIMEOUT,
         )
-        .await
-    {
+        .await;
+    let upload_elapsed = upload_started.elapsed();
+    if let Err(error) = put_result {
         cleanup_temp(&final_temp).await;
         let _ = state.isos.update_failed(iso_id).await;
         return Err(AppError::bad_gateway(format!("上传 ISO 到对象存储失败: {error}")).into());
     }
+    let throughput_mbps = if upload_elapsed.as_secs_f64() > 0.0 {
+        total as f64 / 1024.0 / 1024.0 / upload_elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    tracing::info!(
+        %iso_id,
+        bytes = total,
+        upload_ms = upload_elapsed.as_millis() as u64,
+        throughput_mb_s = throughput_mbps.round(),
+        total_ms = complete_started.elapsed().as_millis() as u64,
+        "ISO complete：S3 上传完成"
+    );
     cleanup_temp(&final_temp).await;
 
-    let updated = state
-        .isos
-        .update_ready(
+    let updated = db_retry_busy(|| {
+        Box::pin(state.isos.update_ready(
             iso_id,
             i64::try_from(total).unwrap_or(i64::MAX),
             &sha256,
             &storage_key,
-        )
-        .await?
-        .ok_or_else(|| {
-            CompleteIsoError::App(AppError::conflict(
-                "ISO 状态已变化（可能被并发完成/删除），请刷新",
-            ))
-        })?;
+        ))
+    })
+    .await?
+    .ok_or_else(|| {
+        CompleteIsoError::App(AppError::conflict(
+            "ISO 状态已变化（可能被并发完成/删除），请刷新",
+        ))
+    })?;
     // ready 后清理分片（记录里保留 upload_chunk/total 便于展示）。
-    state.isos.delete_chunks(iso_id).await?;
+    db_retry_busy(|| Box::pin(state.isos.delete_chunks(iso_id))).await?;
     cleanup_dir(&dir).await;
     record_iso_audit(&state, id, &updated, "iso.upload_ready", ip.as_deref()).await;
     Ok(Json(IsoReply::from(updated)))
@@ -870,10 +917,10 @@ pub async fn abort_upload(
             iso.status
         )));
     }
-    state.isos.delete_chunks(iso_id).await?;
+    db_retry_busy(|| Box::pin(state.isos.delete_chunks(iso_id))).await?;
     cleanup_dir(&chunk_dir(&state, iso_id)).await;
     cleanup_temp(&complete_temp_path(&state, iso_id)).await;
-    state.isos.delete(iso_id).await?;
+    db_retry_busy(|| Box::pin(state.isos.delete(iso_id))).await?;
     record_iso_audit(&state, id, &iso, "iso.upload_abort", ip.as_deref()).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1449,6 +1496,46 @@ mod tests {
         ] {
             assert!(value.get(key).is_some(), "missing {key}");
         }
+    }
+
+    #[tokio::test]
+    async fn db_retry_busy_retries_unavailable_then_succeeds() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let result: AppResult<u8> = db_retry_busy(move || {
+            let counter = counter.clone();
+            Box::pin(async move {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                if attempt < 2 {
+                    Err(qe_db::error::DbError::unavailable("数据库繁忙"))
+                } else {
+                    Ok(7u8)
+                }
+            })
+        })
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn db_retry_busy_does_not_retry_business_errors() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let result: AppResult<u8> = db_retry_busy(move || {
+            let counter = counter.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(qe_db::error::DbError::conflict("业务冲突"))
+            })
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

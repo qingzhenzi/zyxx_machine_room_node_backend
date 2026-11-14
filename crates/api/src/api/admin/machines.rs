@@ -452,19 +452,27 @@ async fn send_wake_packets(macs: &[wol::MacAddress]) -> (Vec<String>, Vec<String
 const VM_COMMAND_DOWNLINK_KIND: &str = "vm.command";
 /// pending 超过该秒数视为超时（GET 时顺手把表更新为 timeout）。
 const VM_COMMAND_PENDING_TIMEOUT_SECS: i64 = 120;
-/// `image.make`（导出→分片上传→登记）的 pending 超时默认值（秒）。
+/// `image.make`（导出→分片上传→登记）的 pending 超时默认值（秒）= 6 小时。
 ///
-/// 大镜像（Windows 10.5GB）即使并发/压缩后也可能超过 10 分钟；可用
-/// `IMAGE_MAKE_PENDING_TIMEOUT_SECS` 覆盖（60..=21600），默认 1800s。
-const VM_COMMAND_IMAGE_MAKE_TIMEOUT_SECS: i64 = 1800;
+/// **语义是「总时长最终兜底」，不是无进展判定**：只要 agent 仍在导出/上传就不要
+/// 靠服务端时间戳打断；真正「无响应/停滞」由 agent 侧空闲超时负责。大镜像
+/// （Windows 10.5GB 压缩后 ~6-7GB）在慢链路/慢盘上可能超过 1 小时，因此默认
+/// 21600s；可用 `IMAGE_MAKE_PENDING_TIMEOUT_SECS` 覆盖（60..=21600）。
+const VM_COMMAND_IMAGE_MAKE_TIMEOUT_SECS: i64 = 21_600;
 
-/// 读取 `IMAGE_MAKE_PENDING_TIMEOUT_SECS`（越界/非法回退默认值）。
-fn image_make_pending_timeout_secs() -> i64 {
-    std::env::var("IMAGE_MAKE_PENDING_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<i64>().ok())
+/// 解析 `IMAGE_MAKE_PENDING_TIMEOUT_SECS`（60..=21600，非法/越界回退默认 6h）。
+fn parse_image_make_pending_timeout(raw: Option<&str>) -> i64 {
+    raw.and_then(|value| value.trim().parse::<i64>().ok())
         .filter(|secs| (60..=21_600).contains(secs))
         .unwrap_or(VM_COMMAND_IMAGE_MAKE_TIMEOUT_SECS)
+}
+
+fn image_make_pending_timeout_secs() -> i64 {
+    parse_image_make_pending_timeout(
+        std::env::var("IMAGE_MAKE_PENDING_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// 允许的 VM 操作白名单（阶段 1 + 阶段 1.5 底包/差分盘/快照）。
@@ -1995,7 +2003,8 @@ pub async fn get_vm_command(
         .and_then(|payload| payload.get("op"))
         .and_then(|op| op.as_str())
         .map(str::to_owned);
-    // image.make 要做「导出 qcow2 + 分片上传」，耗时远高于普通命令（设计 §8.5 超时 600s）。
+    // image.make 要做「导出 qcow2 + 分片上传」，默认 6h 只做总时长兜底（持续进展不超时；
+    // 无进展由 agent 空闲超时处理）；普通命令仍 120s（只针对无响应命令）。
     let pending_timeout_secs = match op.as_deref() {
         Some("image.make") => image_make_pending_timeout_secs(),
         _ => VM_COMMAND_PENDING_TIMEOUT_SECS,
@@ -2598,6 +2607,21 @@ mod tests {
                 "should reject {args}"
             );
         }
+    }
+
+    #[test]
+    fn image_make_pending_timeout_defaults_to_six_hours() {
+        // 用户要求：持续有进展不超时，只做总时长兜底（默认 6h）。
+        assert_eq!(parse_image_make_pending_timeout(None), 21_600);
+        assert_eq!(parse_image_make_pending_timeout(Some("21600")), 21_600);
+        assert_eq!(parse_image_make_pending_timeout(Some(" 7200 ")), 7_200);
+        assert_eq!(parse_image_make_pending_timeout(Some("60")), 60);
+        // 越界/非法回退默认。
+        assert_eq!(parse_image_make_pending_timeout(Some("59")), 21_600);
+        assert_eq!(parse_image_make_pending_timeout(Some("21601")), 21_600);
+        assert_eq!(parse_image_make_pending_timeout(Some("bogus")), 21_600);
+        // 普通命令仍是 120s（只针对无响应命令）。
+        assert_eq!(VM_COMMAND_PENDING_TIMEOUT_SECS, 120);
     }
 
     #[test]
