@@ -366,3 +366,16 @@ ISO 列表只返回文件名/大小，不返回宿主路径。
   `POST /admin/machines/{serial}/vm/commands` 调 `iso.list` 查看目标机 ISO。
 - **本期不做**：ISO 上传 API（要求 ISO 已由运维/管理台放到目标机 `LIBVIRT_ISO_DIR`，默认
   `/var/lib/libvirt/images/iso`）；Windows 驱动注入（SATA 优先，virtio-win 后续）。
+
+## A.8 实现备注（2026-11-14 联调补充）
+
+- **构建 VM 显示设备**：显示开启时除 `<input type='tablet' bus='usb'/>` 还必须挂
+  `<input type='keyboard' bus='usb'/>`；否则 Windows 安装程序/登录界面无法键盘输入。
+- **noVNC 缩放**：`@novnc/novnc@1.7.0` 的 RFB 构造函数不消费 `scaleViewport`/`viewOnly`
+  选项，必须在实例上显式 `rfb.scaleViewport = true`（内部触发 `display.autoscale`）。
+  不要用 CSS 直接缩放 canvas：指针坐标映射会错位，表现为按钮点不到。
+- **VNC 容器**：教师端构建工作台固定高度 `h-[520px]`，组件按容器等比缩放；
+  另提供 Ctrl+Alt+Del 按钮（Windows 登录界面需要）。
+- **ISO 上传**：本期只支持目标机 ISO 目录已有文件；`iso.list` 只读、不暴露宿主路径。
+- **Windows 镜像导出**：大磁盘（~10GB）按当前 S3 分片速度约 25–35 分钟，且 image.make pending
+  超时 600s 会先超时；Windows 制作建议后续启用分片并发/压缩或放宽该 op 的超时。
