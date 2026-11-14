@@ -1,4 +1,4 @@
-//! 镜像制作工作台仓储（迁移 0039，契约 `docs/image-studio.md` §2 / §3）。
+//! 镜像制作工作台仓储（迁移 0039 / 0040，契约 `docs/image-studio.md` §2 / §3 / 附录 A）。
 //!
 //! 三块职责：
 //! 1. `image_build_sessions`：会话创建/读取/active 列表/幂等状态推进/超时回收；
@@ -16,7 +16,8 @@ use uuid::Uuid;
 
 use qe_domain::{
     image_studio::{
-        BuildSession, BuildState, NewBuildSession, RoomImageDefault as DomainRoomImageDefault,
+        BuildSession, BuildState, DiskBus, NewBuildSession, NicMode,
+        RoomImageDefault as DomainRoomImageDefault, SourceMode,
     },
     storage::{ArtifactStatus, Transfer},
 };
@@ -27,17 +28,20 @@ use crate::error::{DbError, DbResult};
 const TERMINAL_STATES: [&str; 4] = ["done", "failed", "cancelled", "expired"];
 
 const SESSION_COLUMNS: &str = "id, user_id, room_id, machine_serial, build_vm_name,
+     source_mode, iso_name, disk_bus, nic, media_ejected,
      base_image_id, delta_image_id, base_transfer_id, name, version, platform,
      vcpus, memory_mib, disk_gb, description, state, error,
      create_request_id, shutdown_request_id, destroy_request_id, make_request_id, image_id,
-     created_at, updated_at, finished_at";
+     iso_check_request_id, eject_request_id, created_at, updated_at, finished_at";
 
 /// `expire_stale_sessions` 的 `UPDATE ... FROM stale` 需要带表别名的列。
 const SESSION_COLUMNS_QUALIFIED: &str = "s.id, s.user_id, s.room_id, s.machine_serial,
-     s.build_vm_name, s.base_image_id, s.delta_image_id, s.base_transfer_id, s.name,
+     s.build_vm_name, s.source_mode, s.iso_name, s.disk_bus, s.nic, s.media_ejected,
+     s.base_image_id, s.delta_image_id, s.base_transfer_id, s.name,
      s.version, s.platform, s.vcpus, s.memory_mib, s.disk_gb, s.description, s.state,
      s.error, s.create_request_id, s.shutdown_request_id, s.destroy_request_id,
-     s.make_request_id, s.image_id, s.created_at, s.updated_at, s.finished_at";
+     s.make_request_id, s.image_id, s.iso_check_request_id, s.eject_request_id,
+     s.created_at, s.updated_at, s.finished_at";
 
 const TRANSFER_COLUMNS: &str = "id, direction, room_id, image_id, manifest_digest,
      status, progress, error, created_at, updated_at";
@@ -46,6 +50,18 @@ const ROOM_DEFAULT_COLUMNS: &str = "room_id, base_image_id, delta_image_id, upda
 
 fn state_from_str(raw: &str) -> BuildState {
     raw.parse().unwrap_or(BuildState::Failed)
+}
+
+fn source_mode_from_str(raw: &str) -> SourceMode {
+    raw.parse().unwrap_or(SourceMode::Base)
+}
+
+fn disk_bus_from_str(raw: &str) -> DiskBus {
+    raw.parse().unwrap_or(DiskBus::Virtio)
+}
+
+fn nic_mode_from_str(raw: &str) -> NicMode {
+    raw.parse().unwrap_or(NicMode::None)
 }
 
 fn transfer_status_from_str(raw: &str) -> qe_domain::storage::TransferStatus {
@@ -71,7 +87,12 @@ struct BuildSessionRow {
     room_id: Uuid,
     machine_serial: String,
     build_vm_name: String,
-    base_image_id: Uuid,
+    source_mode: String,
+    iso_name: Option<String>,
+    disk_bus: String,
+    nic: String,
+    media_ejected: bool,
+    base_image_id: Option<Uuid>,
     delta_image_id: Option<Uuid>,
     base_transfer_id: Option<Uuid>,
     name: String,
@@ -88,6 +109,8 @@ struct BuildSessionRow {
     destroy_request_id: Option<Uuid>,
     make_request_id: Option<Uuid>,
     image_id: Option<Uuid>,
+    iso_check_request_id: Option<Uuid>,
+    eject_request_id: Option<Uuid>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     finished_at: Option<DateTime<Utc>>,
@@ -101,6 +124,11 @@ impl From<BuildSessionRow> for BuildSession {
             room_id: row.room_id,
             machine_serial: row.machine_serial,
             build_vm_name: row.build_vm_name,
+            source_mode: source_mode_from_str(&row.source_mode),
+            iso_name: row.iso_name,
+            disk_bus: disk_bus_from_str(&row.disk_bus),
+            nic: nic_mode_from_str(&row.nic),
+            media_ejected: row.media_ejected,
             base_image_id: row.base_image_id,
             delta_image_id: row.delta_image_id,
             base_transfer_id: row.base_transfer_id,
@@ -118,6 +146,8 @@ impl From<BuildSessionRow> for BuildSession {
             destroy_request_id: row.destroy_request_id,
             make_request_id: row.make_request_id,
             image_id: row.image_id,
+            iso_check_request_id: row.iso_check_request_id,
+            eject_request_id: row.eject_request_id,
             created_at: row.created_at,
             updated_at: row.updated_at,
             finished_at: row.finished_at,
@@ -189,6 +219,12 @@ pub struct SessionUpdate {
     pub destroy_request_id: Option<Uuid>,
     pub make_request_id: Option<Uuid>,
     pub image_id: Option<Uuid>,
+    /// iso 模式：preparing 阶段 `vm.command iso.list` 的 request_id。
+    pub iso_check_request_id: Option<Uuid>,
+    /// iso 模式：ejecting 阶段 `vm.command eject` 的 request_id。
+    pub eject_request_id: Option<Uuid>,
+    /// iso 模式：eject ok 后置 true（`Some(false)` 可显式复位，主要用于测试）。
+    pub media_ejected: Option<bool>,
 }
 
 impl SessionUpdate {
@@ -203,6 +239,9 @@ impl SessionUpdate {
             destroy_request_id: None,
             make_request_id: None,
             image_id: None,
+            iso_check_request_id: None,
+            eject_request_id: None,
+            media_ejected: None,
         }
     }
 
@@ -237,6 +276,21 @@ impl SessionUpdate {
         self.image_id = Some(image_id);
         self
     }
+
+    pub fn with_iso_check_request(mut self, request_id: Uuid) -> Self {
+        self.iso_check_request_id = Some(request_id);
+        self
+    }
+
+    pub fn with_eject_request(mut self, request_id: Uuid) -> Self {
+        self.eject_request_id = Some(request_id);
+        self
+    }
+
+    pub fn with_media_ejected(mut self, media_ejected: bool) -> Self {
+        self.media_ejected = Some(media_ejected);
+        self
+    }
 }
 
 /// `ensure_image_assigned` 的结果：本次（或已存在的）download transfer。
@@ -262,10 +316,14 @@ impl ImageStudioRepo {
     pub async fn create_session(&self, input: &NewBuildSession) -> DbResult<BuildSession> {
         let sql = format!(
             "INSERT INTO image_build_sessions
-                (id, user_id, room_id, machine_serial, build_vm_name, base_image_id,
-                 delta_image_id, base_transfer_id, name, version, platform,
+                (id, user_id, room_id, machine_serial, build_vm_name,
+                 source_mode, iso_name, disk_bus, nic,
+                 base_image_id, delta_image_id, base_transfer_id, iso_check_request_id,
+                 name, version, platform,
                  vcpus, memory_mib, disk_gb, description, state)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'preparing')
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::uuid, $11::uuid,
+                     $12::uuid, $13::uuid,
+                     $14, $15, $16, $17, $18, $19, $20, 'preparing')
              RETURNING {SESSION_COLUMNS}"
         );
         let row = sqlx::query_as::<_, BuildSessionRow>(&sql)
@@ -274,9 +332,14 @@ impl ImageStudioRepo {
             .bind(input.room_id)
             .bind(&input.machine_serial)
             .bind(&input.build_vm_name)
+            .bind(input.source_mode.as_str())
+            .bind(input.iso_name.as_deref())
+            .bind(input.disk_bus.as_str())
+            .bind(input.nic.as_str())
             .bind(input.base_image_id)
             .bind(input.delta_image_id)
             .bind(input.base_transfer_id)
+            .bind(input.iso_check_request_id)
             .bind(&input.name)
             .bind(&input.version)
             .bind(&input.platform)
@@ -369,12 +432,15 @@ impl ImageStudioRepo {
                     destroy_request_id = COALESCE($6, destroy_request_id),
                     make_request_id = COALESCE($7, make_request_id),
                     image_id = COALESCE($8, image_id),
+                    iso_check_request_id = COALESCE($9, iso_check_request_id),
+                    eject_request_id = COALESCE($10, eject_request_id),
+                    media_ejected = COALESCE($11, media_ejected),
                     updated_at = now(),
                     finished_at = CASE
-                        WHEN $2 = ANY($9::text[]) THEN COALESCE(finished_at, now())
+                        WHEN $2 = ANY($12::text[]) THEN COALESCE(finished_at, now())
                         ELSE finished_at
                     END
-              WHERE id = $1 AND state = ANY($10::text[])
+              WHERE id = $1 AND state = ANY($13::text[])
               RETURNING {SESSION_COLUMNS}"
         );
         let row = sqlx::query_as::<_, BuildSessionRow>(&sql)
@@ -386,6 +452,9 @@ impl ImageStudioRepo {
             .bind(update.destroy_request_id)
             .bind(update.make_request_id)
             .bind(update.image_id)
+            .bind(update.iso_check_request_id)
+            .bind(update.eject_request_id)
+            .bind(update.media_ejected)
             .bind(terminal_states.as_slice())
             .bind(from_states.as_slice())
             .fetch_optional(&self.db)
@@ -621,6 +690,36 @@ mod tests {
             .with_image_id(Uuid::new_v4());
         assert!(making.make_request_id.is_some());
         assert!(making.image_id.is_some());
+
+        // v2（迁移 0040）：ISO 相关字段。
+        let ejecting = SessionUpdate::new(&[BuildState::Installing], BuildState::Ejecting)
+            .with_eject_request(Uuid::new_v4());
+        assert!(ejecting.eject_request_id.is_some());
+        assert_eq!(ejecting.media_ejected, None);
+
+        let ready =
+            SessionUpdate::new(&[BuildState::Ejecting], BuildState::Ready).with_media_ejected(true);
+        assert_eq!(ready.media_ejected, Some(true));
+
+        let iso_check = SessionUpdate::new(&[BuildState::Preparing], BuildState::Creating)
+            .with_iso_check_request(Uuid::new_v4());
+        assert!(iso_check.iso_check_request_id.is_some());
+    }
+
+    #[test]
+    fn iso_text_fallbacks_and_state_list() {
+        assert_eq!(source_mode_from_str("bogus"), SourceMode::Base);
+        assert_eq!(source_mode_from_str("iso"), SourceMode::Iso);
+        assert_eq!(disk_bus_from_str("bogus"), DiskBus::Virtio);
+        assert_eq!(disk_bus_from_str("sata"), DiskBus::Sata);
+        assert_eq!(nic_mode_from_str("bogus"), NicMode::None);
+        assert_eq!(nic_mode_from_str("default"), NicMode::Default);
+        // installing/ejecting 属于非终态：超时回收必须覆盖。
+        for state in [BuildState::Installing, BuildState::Ejecting] {
+            assert!(!TERMINAL_STATES.contains(&state.as_str()));
+            assert!(!state.is_terminal());
+            assert!(state.can_cancel());
+        }
     }
 
     #[test]

@@ -473,6 +473,9 @@ const VM_COMMAND_OPS: &[&str] = &[
     "export",
     "image.make",
     "vnc.info",
+    // ISO 安装（契约附录 A.3.1）。
+    "iso.list",
+    "eject",
 ];
 
 /// 容器命令下行 kind（与 agent `container_control` 对齐）。
@@ -513,6 +516,12 @@ const VM_CREATE_ARGS: &[&str] = &[
     "base_path",
     "gpu",
     "start",
+    // ISO 安装（契约 image-studio.md 附录 A.3.1）：有 iso_name 时挂 CD-ROM 并按
+    // cdrom 优先启动；Windows 建议 disk_bus=sata、nic=none（离线安装）。
+    "iso_name",
+    "disk_bus",
+    "nic",
+    "nic_model",
 ];
 
 /// `POST /admin/machines/{serial}/vm/commands` 请求体。
@@ -800,6 +809,32 @@ fn build_create_args(
     if let Some(start) = expect_bool(args, "start")? {
         out.insert("start".to_owned(), serde_json::json!(start));
     }
+
+    // ISO 安装扩展参数：iso_name 只允许文件名（拒绝 / \ ..），disk_bus/nic/nic_model
+    // 只接受契约 A.3.1 的枚举值；全部透传给 agent。
+    if let Some(iso_name) = expect_string(args, "iso_name")?.filter(|value| !value.is_empty()) {
+        let iso_name = qe_domain::image_studio::validate_iso_name(&iso_name).map_err(bad_arg)?;
+        out.insert("iso_name".to_owned(), serde_json::json!(iso_name));
+    }
+    if let Some(disk_bus) = expect_string(args, "disk_bus")?.filter(|value| !value.is_empty()) {
+        let disk_bus = disk_bus
+            .parse::<qe_domain::image_studio::DiskBus>()
+            .map_err(|_| bad_arg("disk_bus 只能是 virtio / sata"))?;
+        out.insert("disk_bus".to_owned(), serde_json::json!(disk_bus.as_str()));
+    }
+    if let Some(nic) = expect_string(args, "nic")?.filter(|value| !value.is_empty()) {
+        let nic = nic
+            .parse::<qe_domain::image_studio::NicMode>()
+            .map_err(|_| bad_arg("nic 只能是 none / user / default"))?;
+        out.insert("nic".to_owned(), serde_json::json!(nic.as_str()));
+    }
+    if let Some(nic_model) = expect_string(args, "nic_model")?.filter(|value| !value.is_empty()) {
+        let nic_model = nic_model.trim().to_ascii_lowercase();
+        if !matches!(nic_model.as_str(), "e1000" | "virtio") {
+            return Err(bad_arg("nic_model 只能是 e1000 / virtio"));
+        }
+        out.insert("nic_model".to_owned(), serde_json::json!(nic_model));
+    }
     Ok(out)
 }
 
@@ -886,9 +921,9 @@ fn validate_vm_command(request: VmCommandRequest) -> AppResult<ValidatedVmComman
         }
     }
 
-    if op == "list" {
+    if op == "list" || op == "iso.list" {
         if !args.is_empty() {
-            return Err(bad_arg("list 命令不接受参数"));
+            return Err(bad_arg(format!("{op} 命令不接受参数")));
         }
         return Ok(ValidatedVmCommand {
             op,
@@ -993,9 +1028,9 @@ fn validate_container_command(request: VmCommandRequest) -> AppResult<ValidatedV
             }
         }
     }
-    if op == "list" {
+    if op == "list" || op == "iso.list" {
         if !args.is_empty() {
-            return Err(bad_arg("list 命令不接受参数"));
+            return Err(bad_arg(format!("{op} 命令不接受参数")));
         }
         return Ok(ValidatedVmCommand {
             op,
@@ -2125,6 +2160,8 @@ mod tests {
             "export",
             "image.make",
             "vnc.info",
+            "iso.list",
+            "eject",
         ] {
             assert!(VM_COMMAND_OPS.contains(&op), "缺少 op：{op}");
         }
@@ -2398,6 +2435,73 @@ mod tests {
             serde_json::json!("ubuntu-22.04")
         );
         assert_eq!(create_payload["args"]["vcpus"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn iso_commands_validate_and_pass_through() {
+        // iso.list：不接受参数。
+        let list = validate_vm_command(request("iso.list", None)).unwrap();
+        assert_eq!(list.op, "iso.list");
+        assert!(list.args.is_empty());
+        assert!(
+            validate_vm_command(request_args("iso.list", serde_json::json!({ "name": "x" })))
+                .is_err()
+        );
+
+        // eject：只接受 name。
+        let eject = validate_vm_command(request_args(
+            "eject",
+            serde_json::json!({ "name": "qe-build-a1b2c3d4" }),
+        ))
+        .unwrap();
+        assert_eq!(eject.op, "eject");
+        assert_eq!(eject.args["name"], serde_json::json!("qe-build-a1b2c3d4"));
+        assert!(validate_vm_command(request_args("eject", serde_json::json!({}))).is_err());
+        assert!(
+            validate_vm_command(request_args(
+                "eject",
+                serde_json::json!({ "name": "x", "force": true })
+            ))
+            .is_err()
+        );
+
+        // create + ISO 参数：文件名 trim、枚举校验并透传。
+        let create = validate_vm_command(request_args(
+            "create",
+            serde_json::json!({
+                "name": "qe-build-a1b2c3d4",
+                "iso_name": " Win10_LTSC_2021.iso ",
+                "disk_bus": "SATA",
+                "nic": "none",
+                "nic_model": "E1000",
+                "start": true,
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            create.args["iso_name"],
+            serde_json::json!("Win10_LTSC_2021.iso")
+        );
+        assert_eq!(create.args["disk_bus"], serde_json::json!("sata"));
+        assert_eq!(create.args["nic"], serde_json::json!("none"));
+        assert_eq!(create.args["nic_model"], serde_json::json!("e1000"));
+        assert_eq!(create.args["start"], serde_json::json!(true));
+
+        // 非法 ISO 名称 / 枚举 / 未知字段一律 400。
+        for args in [
+            serde_json::json!({ "name": "x", "iso_name": "../evil.iso" }),
+            serde_json::json!({ "name": "x", "iso_name": "dir/a.iso" }),
+            serde_json::json!({ "name": "x", "iso_name": "a\\b.iso" }),
+            serde_json::json!({ "name": "x", "disk_bus": "scsi" }),
+            serde_json::json!({ "name": "x", "nic": "bridge" }),
+            serde_json::json!({ "name": "x", "nic_model": "rtl8139" }),
+            serde_json::json!({ "name": "x", "iso_name": "a.iso", "unknown": 1 }),
+        ] {
+            assert!(
+                validate_vm_command(request_args("create", args.clone())).is_err(),
+                "should reject {args}"
+            );
+        }
     }
 
     #[test]

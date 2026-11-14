@@ -235,3 +235,134 @@ ready ──finish──> finishing ──(VM shut off)──> making ──(ima
 - **审计/事件**：会话 create/finish/cancel 写 `audit_logs`（resource_type=
   `image_build_session`），done/failed 在状态实际变化时写一条；默认底包变更同时写
   `image_events(room.default.update)`；超时回收写 `image_events(build.session.expired)`。
+
+---
+
+# 附录 A：ISO 安装 / Windows 支持（v2，2026-11-14）
+
+## A.1 目标
+
+教师端「新建镜像」支持两种来源，共用同一套构建会话与后续 image.make → verify → publish：
+
+1. `source=base`：用已发布底包创建差分盘（现状）；
+2. `source=iso`：用目标机器上已有的安装 ISO 创建安装 VM（SATA 磁盘 + CD-ROM 启动），
+   教师通过内嵌 noVNC 安装 Windows/Linux，安装完成后「弹出 ISO → 从硬盘启动 → 结束制作」。
+
+## A.2 完整状态机（image_build_sessions.state）
+
+```text
+base 模式:
+  preparing ──base transfer completed──> creating ──create ok──> ready
+iso 模式:
+  preparing ──iso.list 校验 ISO 存在──> creating ──create ok──> installing
+  installing ──[安装完成，弹出 ISO]──> ejecting ──eject ok──> ready
+全部模式:
+  ready ──finish──> finishing ──VM 关机(destroy 终态)──> making ──image.make ok──> done
+  任意非终态 ──cancel / >2h──> cancelled / expired
+  任一步失败 ──> failed（保留 error / steps 中标记失败步骤；尽量回收 VM）
+```
+
+- `finish` 仅允许 `ready`；iso 模式必须先完成 `ejecting`，UI 引导「先点安装完成，弹出 ISO」；
+- `installing` 是长驻交互态：教师通过 VNC 操作，会话 GET 返回 steps 供 UI 展示；
+- `ready` 后可选择「重启进入系统」（复用 `vm.command reboot`）再结束制作；
+- 取消/失败/超时都会 destroy + delete(remove_disks) 构建 VM；完成后自动回收。
+
+## A.3 新增/扩展接口
+
+### A.3.1 vm.command（qe-api 白名单 + agent 实现）
+
+| op | args | data | 说明 |
+|---|---|---|---|
+| `iso.list` | — | `{isos:[{name,size_bytes}]}` | 列出目标机 `LIBVIRT_ISO_DIR`（默认 `/var/lib/libvirt/images/iso`）下 ISO；name 不含路径分隔符 |
+| `eject` | `{name}` | `{name, ejected:true}` | 弹出 CD-ROM（`virt-crate eject_cdrom`），装完系统后从硬盘启动 |
+| `create`（扩展 args） | 原字段 + `iso_name?`、`disk_bus?`(virtio/sata，默认 virtio)、`nic?`(none/user/default)、`nic_model?`(e1000/virtio) | 原字段 | 有 `iso_name` 时挂 CD-ROM 并按 cdrom 优先启动；Windows 建议 `disk_bus=sata`、`nic=none`（离线安装） |
+
+安全：`iso_name` 只允许文件名（拒绝 `/\`、`..`），agent 解析为 `<LIBVIRT_ISO_DIR>/<name>` 并校验存在；
+ISO 列表只返回文件名/大小，不返回宿主路径。
+
+### A.3.2 image-builds
+
+`POST /admin/image-builds` body 扩展：
+
+```json
+{ "room_id":"…", "machine_serial":"…",
+  "source": "base" | "iso",
+  "base_image_id": "…（source=base 必填）",
+  "iso_name": "Win10_LTSC_2021.iso（source=iso 必填）",
+  "disk_bus": "virtio | sata（可选；iso 默认 sata）",
+  "nic": "none | user | default（可选；默认 none）",
+  "name":"win10-ltsc","version":"0.1.0","platform":"windows/amd64",
+  "vcpus":4,"memory_mib":4096,"disk_gb":40,"description":"…" }
+```
+
+- `preparing`（iso）：先下发 `vm.command iso.list`（记录 `iso_check_request_id`），确认 ISO 存在后再创建 VM；
+  ISO 不存在 → `failed`（error 明确提示）；
+- `creating`：`vm.command create` args 注入 `iso_name/disk_bus/nic/start=true`；
+- `POST /admin/image-builds/{id}/eject-iso`：仅 `installing` 可用，置 `ejecting` 并下发 `vm.command eject`；
+  eject ok → `ready`（`media_ejected=true`）；
+- `GET /admin/image-builds/{id}` 的 steps（iso 模式）：
+  `iso_check`（校验安装 ISO）→ `create_vm` → `install`（远程安装/配置）→ `eject_iso`（弹出 ISO）→
+  `shutdown` → `upload`；
+- 响应增加 `source_mode/iso_name/disk_bus/nic/media_ejected`。
+
+## A.4 Windows 设备兼容
+
+- **磁盘总线**：`virt-crate` VmSpec 增加 `disk_bus`（Virtio 默认 / Sata）；SATA 目标名 `sda/sdb…`，
+  CD-ROM 目标名避让（`sdz` 或按序号）；Windows 安装盘自带 AHCI 驱动，无需 virtio-win；
+- **网卡**：可选 `user`/`default`，Windows 兼容模型 `e1000`（默认 none，离线安装避免微软账号强制）；
+- 显示：现有 VNC + tablet 指针即可，Windows 桌面/键鼠已验证；
+- 后续可选：virtio-win 驱动注入（性能更好），本期 SATA 优先。
+
+## A.5 教师端交互
+
+- 新建镜像 Step1 增加来源 Tab：`已有镜像底包` / `从 ISO 安装`；
+  ISO 模式：选择目标机器 → 拉取 `iso.list` → 选择 ISO → 自动预填（win10/ltsc → windows/amd64、4 vCPU/4GB/40GB、sata、none）；
+- Step2/3：`installing` 状态展示内嵌 VNC + 明确提示「在 VM 内完成系统安装，完成后点『安装完成，弹出 ISO』」；
+  `ejecting` 展示进度；`ready` 展示 [重启进入系统]（调用 vm.command reboot）与 [结束制作并保存]；
+- 结束后流程不变：关机 → image.make → verify → publish dev → 设为房间默认底包；
+- 任务中心/`?active=1` 恢复支持所有新状态。
+
+## A.6 验收
+
+1. 服务端/agent 单测：ISO 名称解析与目录限制、disk_bus XML、iso.list/eject/create(iso) 状态机；
+2. 真机：目标机 `iso.list` 列出 Win10 LTSC ISO → id=iso 会话 → `installing`（VNC 显示 Windows 安装界面）
+   → 取消可回收；eject 流程可用；
+3. Windows 底包复用：把已装好的 win10-ltsc 导出为 `win10-ltsc:0.1.0` 并发布；base 模式 + `disk_bus=sata`
+   创建构建 VM → VNC 直接进 Windows 桌面 → 可键鼠交互 → 结束制作/取消；
+4. 教师端 type-check/lint/build/test 通过；管理台兼容（未知字段忽略）。
+
+## A.7 服务端实现备注（v2，2026-11-14）
+
+- **迁移 0040** `0040_image_build_iso.sql`：`image_build_sessions` 增列
+  `source_mode`（CHECK base|iso）、`iso_name`、`disk_bus`（CHECK virtio|sata，默认 virtio）、
+  `nic`（CHECK none|user|default，默认 none）、`media_ejected`（默认 false）、
+  `iso_check_request_id`、`eject_request_id`；`base_image_id` **DROP NOT NULL**（iso 模式为 NULL）；
+  state CHECK 重建为包含 `installing` / `ejecting` 的 v2 约束。全部幂等（已用真实库事务回滚验证）。
+- **`POST /admin/image-builds`**：`source` 缺省 `base`（向后兼容 v1 请求）；`base_image_id`
+  变为可选 —— base 必填、iso 忽略；`iso_name` base 传非空 → 400、iso 必填；
+  `disk_bus` 缺省按来源（base→virtio、iso→sata），`nic` 缺省 none；iso 模式拒绝 `delta_image_id`。
+- **iso 模式 preparing**：创建会话时**立即**下发 `vm.command iso.list` 并记录
+  `iso_check_request_id`（设备离线/无存活证书 → 请求直接失败，不建会话）；GET 时轮询结果：
+  `isos[].name` 中存在 `iso_name` → 下发 `create`（args 注入 `iso_name/disk_bus/nic/start=true`）
+  并进入 `creating`；ISO 不存在/命令失败 → `failed`（error 明确提示）。
+  （兜底：若历史 iso 会话缺 `iso_check_request_id`，GET 会补发一次 iso.list。）
+- **状态机**：`creating` 命令 ok 后按来源进入 `ready`（base）或 `installing`（iso）；
+  `installing` 只由教师 VNC 操作，GET 原样返回 steps（不自动推进）；
+  `POST /image-builds/{id}/eject-iso`（仅 iso + installing）→ `ejecting` 并下发
+  `vm.command eject`；GET 轮询 eject 结果，ok → `ready` + `media_ejected=true`，失败 → `failed`。
+- **finish**：仍仅 `ready`；iso 模式额外要求 `media_ejected=true`，否则 409
+  「请先完成『安装完成，弹出 ISO』」。
+- **cancel / 超时回收**：`installing`/`ejecting` 均为非终态，cancel 可用；60s worker 的
+  >2h 回收扫描按「非终态」判定，天然覆盖新状态（destroy + delete + expired）。
+- **steps**：iso 模式为 `iso_check → create_vm → install → eject_iso → shutdown → upload`
+  （base 模式保持 v1 的 5 步不变）；`installing` 时 install=running、eject_iso=pending
+  且 detail 提示「安装完成后点『安装完成，弹出 ISO』」。
+- **响应**：会话回复新增 `source_mode/iso_name/disk_bus/nic/media_ejected`；iso 会话的
+  `base_image` / `base_transfer` 为 `null`。
+- **vm.command 扩展**：`iso.list`（无参，data `{isos:[{name,size_bytes}]}`）、`eject`
+  （`{name}`）、`create` 新 args `iso_name/disk_bus/nic/nic_model`；服务端校验
+  iso_name 仅文件名（拒 `/` `\` `..`）、disk_bus∈{virtio,sata}、nic∈{none,user,default}、
+  nic_model∈{e1000,virtio}，非法/未知字段 400。管理台可直接用现有
+  `POST /admin/machines/{serial}/vm/commands` 调 `iso.list` 查看目标机 ISO。
+- **本期不做**：ISO 上传 API（要求 ISO 已由运维/管理台放到目标机 `LIBVIRT_ISO_DIR`，默认
+  `/var/lib/libvirt/images/iso`）；Windows 驱动注入（SATA 优先，virtio-win 后续）。

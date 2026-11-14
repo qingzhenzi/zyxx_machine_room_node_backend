@@ -104,6 +104,11 @@ pub fn router() -> Router<AppState> {
             "/image-builds/{id}/finish",
             post(image_studio::finish_build_session),
         )
+        // ISO 安装（附录 A.3.2）：安装完成后弹出安装介质，再 finish。
+        .route(
+            "/image-builds/{id}/eject-iso",
+            post(image_studio::eject_build_session_iso),
+        )
         .route(
             "/image-builds/{id}/cancel",
             post(image_studio::cancel_build_session),

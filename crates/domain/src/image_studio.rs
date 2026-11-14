@@ -1,8 +1,9 @@
-//! 教师端镜像制作工作台（Image Studio v1）的领域模型与状态机。
+//! 教师端镜像制作工作台（Image Studio v2）的领域模型与状态机。
 //!
-//! 契约见 `docs/image-studio.md` §2 / §3.2.1：
-//! - [`BuildState`]：会话状态机（`preparing → creating → ready → finishing → making → done`，
-//!   任意步骤失败 `failed`，取消 `cancelled`，超时回收 `expired`）；
+//! 契约见 `docs/image-studio.md` §2 / §3.2.1 以及附录 A（ISO 安装 / Windows）：
+//! - [`BuildState`]：会话状态机（base：`preparing → creating → ready → finishing → making → done`；
+//!   iso：`preparing → creating → installing → ejecting → ready → …`；任意步骤失败 `failed`，
+//!   取消 `cancelled`，超时回收 `expired`）；
 //! - [`BuildSession`]：`image_build_sessions` 一行（构建 VM 由服务端会话统一创建/回收）；
 //! - [`RoomImageDefault`]：`room_image_defaults` 一行（房间默认底包 + 可选增量包）；
 //! - [`session_steps`]：GET 会话响应里的 `steps[]`（契约 §3.2.1，教师端直接渲染）。
@@ -34,6 +35,10 @@ pub const SHUTDOWN_GRACE_SECS: i64 = 60;
 pub enum BuildState {
     Preparing,
     Creating,
+    /// ISO 模式：安装 VM 已创建，教师正在通过 VNC 安装系统（长驻交互态）。
+    Installing,
+    /// ISO 模式：已请求弹出 ISO（`vm.command eject`），等待结果。
+    Ejecting,
     Ready,
     Finishing,
     Making,
@@ -48,6 +53,8 @@ impl BuildState {
         match self {
             Self::Preparing => "preparing",
             Self::Creating => "creating",
+            Self::Installing => "installing",
+            Self::Ejecting => "ejecting",
             Self::Ready => "ready",
             Self::Finishing => "finishing",
             Self::Making => "making",
@@ -95,6 +102,8 @@ impl FromStr for BuildState {
         match raw.trim().to_ascii_lowercase().as_str() {
             "preparing" => Ok(Self::Preparing),
             "creating" => Ok(Self::Creating),
+            "installing" => Ok(Self::Installing),
+            "ejecting" => Ok(Self::Ejecting),
             "ready" => Ok(Self::Ready),
             "finishing" => Ok(Self::Finishing),
             "making" => Ok(Self::Making),
@@ -107,6 +116,147 @@ impl FromStr for BuildState {
     }
 }
 
+/// 会话来源（`image_build_sessions.source_mode`，迁移 0040）：
+/// `base` = 已发布底包差分盘；`iso` = 已上传 ISO 安装（Windows/Linux）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceMode {
+    #[default]
+    Base,
+    Iso,
+}
+
+impl SourceMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Iso => "iso",
+        }
+    }
+
+    /// ISO 模式默认磁盘总线：SATA（Windows 安装盘自带 AHCI 驱动，契约 A.4）。
+    pub const fn default_disk_bus(self) -> DiskBus {
+        match self {
+            Self::Base => DiskBus::Virtio,
+            Self::Iso => DiskBus::Sata,
+        }
+    }
+}
+
+impl fmt::Display for SourceMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SourceMode {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "base" => Ok(Self::Base),
+            "iso" => Ok(Self::Iso),
+            _ => Err(()),
+        }
+    }
+}
+
+/// 构建 VM 磁盘总线（`vm.command create` 的 `disk_bus`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskBus {
+    #[default]
+    Virtio,
+    Sata,
+}
+
+impl DiskBus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Virtio => "virtio",
+            Self::Sata => "sata",
+        }
+    }
+}
+
+impl fmt::Display for DiskBus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DiskBus {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "virtio" => Ok(Self::Virtio),
+            "sata" => Ok(Self::Sata),
+            _ => Err(()),
+        }
+    }
+}
+
+/// 构建 VM 网卡模式（`vm.command create` 的 `nic`）：`none` 离线安装（默认），
+/// `user` / `default` 需要网络时使用。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NicMode {
+    #[default]
+    None,
+    User,
+    Default,
+}
+
+impl NicMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::User => "user",
+            Self::Default => "default",
+        }
+    }
+}
+
+impl fmt::Display for NicMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for NicMode {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "user" => Ok(Self::User),
+            "default" => Ok(Self::Default),
+            _ => Err(()),
+        }
+    }
+}
+
+/// 校验 ISO 文件名（契约 A.3.1）：只允许文件名，拒绝路径分隔符与 `..`。
+///
+/// 返回 trim 后的文件名；长度 1..=128，不含控制字符。
+pub fn validate_iso_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("iso_name 不能为空".to_owned());
+    }
+    if name.chars().count() > 128 {
+        return Err("iso_name 不能超过 128 个字符".to_owned());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err("iso_name 只能是 ISO 文件名（不能包含 / \\ 或 ..）".to_owned());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("iso_name 不能包含控制字符".to_owned());
+    }
+    Ok(name.to_owned())
+}
+
 /// 构建会话（`image_build_sessions` 一行）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildSession {
@@ -115,7 +265,20 @@ pub struct BuildSession {
     pub room_id: Uuid,
     pub machine_serial: String,
     pub build_vm_name: String,
-    pub base_image_id: Uuid,
+    /// `base` / `iso`（迁移 0040）；iso 模式没有底包，`base_image_id=None`。
+    pub source_mode: SourceMode,
+    /// iso 模式：目标机器 ISO 目录下的文件名（服务端只存文件名，不存宿主路径）。
+    pub iso_name: Option<String>,
+    pub disk_bus: DiskBus,
+    pub nic: NicMode,
+    /// iso 模式：安装完成后是否已弹出 ISO（eject ok 后置 true，finish 前必须为 true）。
+    pub media_ejected: bool,
+    /// iso 模式 preparing 阶段 `vm.command iso.list` 的 request_id。
+    pub iso_check_request_id: Option<Uuid>,
+    /// iso 模式 ejecting 阶段 `vm.command eject` 的 request_id。
+    pub eject_request_id: Option<Uuid>,
+    /// base 模式必填；iso 模式为 `None`（迁移 0040 已 DROP NOT NULL）。
+    pub base_image_id: Option<Uuid>,
     pub delta_image_id: Option<Uuid>,
     pub base_transfer_id: Option<Uuid>,
     pub name: String,
@@ -152,7 +315,16 @@ pub struct NewBuildSession {
     pub room_id: Uuid,
     pub machine_serial: String,
     pub build_vm_name: String,
-    pub base_image_id: Uuid,
+    /// `base` / `iso`（迁移 0040）；iso 模式没有底包，`base_image_id=None`。
+    pub source_mode: SourceMode,
+    /// iso 模式：目标机器 ISO 目录下的文件名（服务端只存文件名，不存宿主路径）。
+    pub iso_name: Option<String>,
+    pub disk_bus: DiskBus,
+    pub nic: NicMode,
+    /// iso 模式 preparing 阶段 `vm.command iso.list` 的 request_id。
+    pub iso_check_request_id: Option<Uuid>,
+    /// base 模式必填；iso 模式为 `None`（迁移 0040 已 DROP NOT NULL）。
+    pub base_image_id: Option<Uuid>,
     pub delta_image_id: Option<Uuid>,
     pub base_transfer_id: Option<Uuid>,
     pub name: String,
@@ -200,6 +372,45 @@ pub fn preparing_outcome(
         TransferStatus::Failed => Some(Err(error.unwrap_or("基础镜像拉取失败").to_owned())),
         TransferStatus::Expired => Some(Err("基础镜像拉取已过期".to_owned())),
         TransferStatus::Pending | TransferStatus::Running => None,
+    }
+}
+
+/// iso 模式 `preparing` 阶段根据 `vm.command iso.list` 结果判断 ISO 是否存在。
+///
+/// - `pending` → 继续等待（`None`）；
+/// - `ok` 且 `data.isos[]` 里存在同名项 → `Some(Ok(()))`（可以创建安装 VM）；
+/// - `ok` 但列表里没有该 ISO / `error` / `timeout` → `Some(Err(文案))`。
+///
+/// `data` 形状按契约 A.3.1：`{"isos":[{"name","size_bytes"}]}`。
+pub fn iso_check_outcome(
+    command_status: &str,
+    data: Option<&serde_json::Value>,
+    error: Option<&str>,
+    iso_name: &str,
+) -> Option<Result<(), String>> {
+    match command_status.trim().to_ascii_lowercase().as_str() {
+        "pending" => None,
+        "ok" => {
+            let found = data
+                .and_then(|data| data.get("isos"))
+                .and_then(serde_json::Value::as_array)
+                .map(|isos| {
+                    isos.iter()
+                        .filter_map(|iso| iso.get("name").and_then(serde_json::Value::as_str))
+                        .any(|name| name == iso_name)
+                })
+                .unwrap_or(false);
+            Some(if found {
+                Ok(())
+            } else {
+                Err(format!(
+                    "目标机器上没有找到安装 ISO：{iso_name}（请确认已上传到 ISO 目录）"
+                ))
+            })
+        }
+        other => Some(Err(error
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("校验安装 ISO 失败（{other}）")))),
     }
 }
 
@@ -261,8 +472,26 @@ impl BuildStep {
     }
 }
 
-/// `steps[]` 的 key 顺序（契约 §3.2.1）。
+/// base 模式 `steps[]` 的 key 顺序（契约 §3.2.1）。
 pub const STEP_KEYS: [&str; 5] = ["base_pull", "create_vm", "console", "shutdown", "upload"];
+
+/// iso 模式 `steps[]` 的 key 顺序（契约 A.3.2）。
+pub const ISO_STEP_KEYS: [&str; 6] = [
+    "iso_check",
+    "create_vm",
+    "install",
+    "eject_iso",
+    "shutdown",
+    "upload",
+];
+
+/// 会话 `steps[]` 的 key 顺序（按来源模式）。
+pub fn step_keys(source_mode: SourceMode) -> &'static [&'static str] {
+    match source_mode {
+        SourceMode::Base => &STEP_KEYS,
+        SourceMode::Iso => &ISO_STEP_KEYS,
+    }
+}
 
 /// 计算会话响应里的 `steps[]`（纯函数，教师端直接渲染）。
 ///
@@ -270,6 +499,14 @@ pub const STEP_KEYS: [&str; 5] = ["base_pull", "create_vm", "console", "shutdown
 /// 一个已下发的命令定位失败步骤并标 `error`；`cancelled` / `expired` 时未完成步骤
 /// 标 `pending` 且 detail 说明已取消/超时。
 pub fn session_steps(session: &BuildSession, base_transfer: Option<&Transfer>) -> Vec<BuildStep> {
+    match session.source_mode {
+        SourceMode::Base => base_session_steps(session, base_transfer),
+        SourceMode::Iso => iso_session_steps(session),
+    }
+}
+
+/// base 模式 steps（契约 §3.2.1，保持 v1 行为）。
+fn base_session_steps(session: &BuildSession, base_transfer: Option<&Transfer>) -> Vec<BuildStep> {
     let progress = base_transfer.map(|transfer| transfer.progress).unwrap_or(0);
     let pull_status = match base_transfer.map(|transfer| transfer.status) {
         Some(crate::storage::TransferStatus::Completed) => StepStatus::Ok,
@@ -390,6 +627,157 @@ pub fn session_steps(session: &BuildSession, base_transfer: Option<&Transfer>) -
     steps.into_iter().collect()
 }
 
+/// 设置某一步的状态与 detail（越界忽略，避免状态机脏数据 panic）。
+fn set_step(steps: &mut [BuildStep], index: usize, status: StepStatus, detail: &str) {
+    if let Some(step) = steps.get_mut(index) {
+        step.status = status;
+        step.detail = detail.to_owned();
+    }
+}
+
+/// iso 模式 steps（契约 A.3.2）：
+/// `iso_check → create_vm → install → eject_iso → shutdown → upload`。
+fn iso_session_steps(session: &BuildSession) -> Vec<BuildStep> {
+    let iso_name = session.iso_name.as_deref().unwrap_or("");
+    let iso_ok_detail = format!("ISO 已找到：{iso_name}");
+    let mut steps = vec![
+        BuildStep::new("iso_check", "校验安装 ISO", StepStatus::Pending, ""),
+        BuildStep::new("create_vm", "创建安装虚拟机", StepStatus::Pending, ""),
+        BuildStep::new("install", "远程安装/配置", StepStatus::Pending, ""),
+        BuildStep::new("eject_iso", "弹出 ISO", StepStatus::Pending, ""),
+        BuildStep::new("shutdown", "关机", StepStatus::Pending, ""),
+        BuildStep::new("upload", "导出并分片上传", StepStatus::Pending, ""),
+    ];
+
+    match session.state {
+        BuildState::Preparing => set_step(&mut steps, 0, StepStatus::Running, "校验安装 ISO…"),
+        BuildState::Creating => {
+            set_step(&mut steps, 0, StepStatus::Ok, &iso_ok_detail);
+            set_step(&mut steps, 1, StepStatus::Running, "创建中…");
+        }
+        BuildState::Installing => {
+            set_step(&mut steps, 0, StepStatus::Ok, &iso_ok_detail);
+            set_step(
+                &mut steps,
+                1,
+                StepStatus::Ok,
+                session.build_vm_name.as_str(),
+            );
+            set_step(&mut steps, 2, StepStatus::Running, "等待在 VM 内完成安装…");
+            set_step(
+                &mut steps,
+                3,
+                StepStatus::Pending,
+                "安装完成后点『安装完成，弹出 ISO』",
+            );
+        }
+        BuildState::Ejecting => {
+            set_step(&mut steps, 0, StepStatus::Ok, &iso_ok_detail);
+            set_step(
+                &mut steps,
+                1,
+                StepStatus::Ok,
+                session.build_vm_name.as_str(),
+            );
+            set_step(&mut steps, 2, StepStatus::Ok, "安装完成");
+            set_step(&mut steps, 3, StepStatus::Running, "正在弹出 ISO…");
+        }
+        BuildState::Ready | BuildState::Finishing | BuildState::Making | BuildState::Done => {
+            set_step(&mut steps, 0, StepStatus::Ok, &iso_ok_detail);
+            set_step(
+                &mut steps,
+                1,
+                StepStatus::Ok,
+                session.build_vm_name.as_str(),
+            );
+            set_step(&mut steps, 2, StepStatus::Ok, "安装完成");
+            set_step(&mut steps, 3, StepStatus::Ok, "ISO 已弹出");
+        }
+        // 取消/超时：已完成的阶段（由 command id 推断）保留 ok，其余在下面标 pending。
+        BuildState::Cancelled | BuildState::Expired => {
+            if session.create_request_id.is_some() {
+                set_step(&mut steps, 0, StepStatus::Ok, &iso_ok_detail);
+            }
+            if session.eject_request_id.is_some() {
+                set_step(
+                    &mut steps,
+                    1,
+                    StepStatus::Ok,
+                    session.build_vm_name.as_str(),
+                );
+                set_step(&mut steps, 2, StepStatus::Ok, "安装完成");
+            }
+        }
+        _ => {}
+    }
+
+    match session.state {
+        BuildState::Finishing => set_step(&mut steps, 4, StepStatus::Running, "关机中…"),
+        BuildState::Making | BuildState::Done => set_step(&mut steps, 4, StepStatus::Ok, "已关机"),
+        _ => {}
+    }
+    match session.state {
+        BuildState::Making => set_step(&mut steps, 5, StepStatus::Running, "导出并上传中…"),
+        BuildState::Done => {
+            let detail = session
+                .image_id
+                .map(|id| format!("已生成镜像 {id}"))
+                .unwrap_or_else(|| "已完成".to_owned());
+            set_step(&mut steps, 5, StepStatus::Ok, &detail);
+        }
+        _ => {}
+    }
+
+    match session.state {
+        BuildState::Failed => {
+            // 定位失败步骤：make → shutdown → eject → create_vm → iso_check。
+            let failed_index = if session.make_request_id.is_some()
+                || session.image_id.is_some()
+                || session.shutdown_request_id.is_some() && session.destroy_request_id.is_some()
+            {
+                5
+            } else if session.shutdown_request_id.is_some() {
+                4
+            } else if session.eject_request_id.is_some() {
+                3
+            } else if session.create_request_id.is_some() {
+                1
+            } else {
+                0
+            };
+            let error = session
+                .error
+                .clone()
+                .unwrap_or_else(|| "制作失败".to_owned());
+            if let Some(step) = steps.get_mut(failed_index)
+                && step.status != StepStatus::Ok
+            {
+                step.status = StepStatus::Error;
+                step.detail = error;
+            }
+        }
+        BuildState::Cancelled => {
+            for step in steps.iter_mut() {
+                if step.status != StepStatus::Ok {
+                    step.status = StepStatus::Pending;
+                    step.detail = "已取消".to_owned();
+                }
+            }
+        }
+        BuildState::Expired => {
+            for step in steps.iter_mut() {
+                if step.status != StepStatus::Ok {
+                    step.status = StepStatus::Pending;
+                    step.detail = "会话超时已回收".to_owned();
+                }
+            }
+        }
+        _ => {}
+    }
+
+    steps
+}
+
 /// 合并「配置镜像 + 房间默认底包/增量包」并按 image_id 去重、保持首次出现顺序。
 ///
 /// 用于 `/agent/startup`：无论是否配置 startprofile，房间默认底包都要下发
@@ -437,7 +825,14 @@ mod tests {
             room_id: Uuid::new_v4(),
             machine_serial: "0638".to_owned(),
             build_vm_name: build_vm_name(Uuid::nil()),
-            base_image_id: Uuid::new_v4(),
+            source_mode: SourceMode::Base,
+            iso_name: None,
+            disk_bus: DiskBus::Virtio,
+            nic: NicMode::None,
+            media_ejected: false,
+            iso_check_request_id: None,
+            eject_request_id: None,
+            base_image_id: Some(Uuid::new_v4()),
             delta_image_id: None,
             base_transfer_id: None,
             name: "lab-base".to_owned(),
@@ -481,6 +876,8 @@ mod tests {
         for state in [
             BuildState::Preparing,
             BuildState::Creating,
+            BuildState::Installing,
+            BuildState::Ejecting,
             BuildState::Ready,
             BuildState::Finishing,
             BuildState::Making,
@@ -490,6 +887,10 @@ mod tests {
             BuildState::Expired,
         ] {
             assert_eq!(state.as_str().parse::<BuildState>(), Ok(state));
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::json!(state.as_str())
+            );
         }
         assert!("bogus".parse::<BuildState>().is_err());
         for state in [
@@ -504,6 +905,8 @@ mod tests {
         for state in [
             BuildState::Preparing,
             BuildState::Creating,
+            BuildState::Installing,
+            BuildState::Ejecting,
             BuildState::Ready,
             BuildState::Finishing,
             BuildState::Making,
@@ -519,6 +922,8 @@ mod tests {
         for state in [
             BuildState::Preparing,
             BuildState::Creating,
+            BuildState::Installing,
+            BuildState::Ejecting,
             BuildState::Finishing,
             BuildState::Making,
             BuildState::Done,
@@ -533,6 +938,8 @@ mod tests {
         for state in [
             BuildState::Preparing,
             BuildState::Creating,
+            BuildState::Installing,
+            BuildState::Ejecting,
             BuildState::Ready,
             BuildState::Finishing,
             BuildState::Making,
@@ -705,5 +1112,218 @@ mod tests {
         assert!(session.visible_to(owner, false));
         assert!(!session.visible_to(Uuid::new_v4(), false));
         assert!(session.visible_to(Uuid::new_v4(), true));
+    }
+
+    // ---- v2：ISO 安装 / Windows（契约附录 A） ----
+
+    fn iso_session(state: BuildState) -> BuildSession {
+        let mut session = sample_session(state);
+        session.source_mode = SourceMode::Iso;
+        session.iso_name = Some("Win10_LTSC_2021.iso".to_owned());
+        session.disk_bus = DiskBus::Sata;
+        session.nic = NicMode::None;
+        session.base_image_id = None;
+        session.base_transfer_id = None;
+        session
+    }
+
+    fn iso_list_data(names: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "isos": names
+                .iter()
+                .map(|name| serde_json::json!({ "name": name, "size_bytes": 5_368_709_120_i64 }))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    #[test]
+    fn iso_name_validation_rejects_paths_and_accepts_filename() {
+        assert_eq!(
+            validate_iso_name(" Win10_LTSC_2021.iso ").unwrap(),
+            "Win10_LTSC_2021.iso"
+        );
+        assert_eq!(validate_iso_name("debian-13.iso").unwrap(), "debian-13.iso");
+        for bad in [
+            "",
+            "   ",
+            "../etc/passwd",
+            "iso/win.iso",
+            "iso\\win.iso",
+            "a..b.iso",
+            &"x".repeat(129),
+        ] {
+            assert!(validate_iso_name(bad).is_err(), "should reject {bad:?}");
+        }
+        assert!(validate_iso_name("weird\u{0007}.iso").is_err());
+    }
+
+    #[test]
+    fn source_mode_disk_bus_nic_round_trip() {
+        for mode in [SourceMode::Base, SourceMode::Iso] {
+            assert_eq!(mode.as_str().parse::<SourceMode>(), Ok(mode));
+        }
+        assert_eq!(SourceMode::Base.default_disk_bus(), DiskBus::Virtio);
+        assert_eq!(SourceMode::Iso.default_disk_bus(), DiskBus::Sata);
+        for bus in [DiskBus::Virtio, DiskBus::Sata] {
+            assert_eq!(bus.as_str().parse::<DiskBus>(), Ok(bus));
+        }
+        for nic in [NicMode::None, NicMode::User, NicMode::Default] {
+            assert_eq!(nic.as_str().parse::<NicMode>(), Ok(nic));
+        }
+        assert!("sas".parse::<DiskBus>().is_err());
+        assert!("bridge".parse::<NicMode>().is_err());
+        assert_eq!(
+            serde_json::to_value(SourceMode::Iso).unwrap(),
+            serde_json::json!("iso")
+        );
+        assert_eq!(
+            serde_json::to_value(DiskBus::Sata).unwrap(),
+            serde_json::json!("sata")
+        );
+        assert_eq!(
+            serde_json::to_value(NicMode::None).unwrap(),
+            serde_json::json!("none")
+        );
+    }
+
+    #[test]
+    fn iso_check_outcome_requires_iso_in_list() {
+        let data = iso_list_data(&["other.iso", "Win10_LTSC_2021.iso"]);
+        assert!(matches!(
+            iso_check_outcome("ok", Some(&data), None, "Win10_LTSC_2021.iso"),
+            Some(Ok(()))
+        ));
+        let err = iso_check_outcome("ok", Some(&data), None, "missing.iso")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("没有找到"), "{err}");
+        assert!(matches!(
+            iso_check_outcome("pending", Some(&data), None, "x.iso"),
+            None
+        ));
+        let failed = iso_check_outcome("error", None, Some("agent 无响应"), "x.iso")
+            .unwrap()
+            .unwrap_err();
+        assert!(failed.contains("agent 无响应"));
+        // data 缺失 isos 数组 → 视为找不到。
+        let empty = serde_json::json!({});
+        assert!(
+            iso_check_outcome("ok", Some(&empty), None, "x.iso")
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn iso_steps_full_state_machine() {
+        assert_eq!(step_keys(SourceMode::Iso), &ISO_STEP_KEYS);
+        assert_eq!(step_keys(SourceMode::Base), &STEP_KEYS);
+
+        // preparing：校验 ISO 中。
+        let steps = session_steps(&iso_session(BuildState::Preparing), None);
+        let keys: Vec<&str> = steps.iter().map(|step| step.key.as_str()).collect();
+        assert_eq!(keys, ISO_STEP_KEYS);
+        assert_eq!(steps[0].status, StepStatus::Running);
+        assert_eq!(steps[1].status, StepStatus::Pending);
+
+        // creating：ISO 已找到，创建 VM。
+        let mut session = iso_session(BuildState::Creating);
+        session.iso_check_request_id = Some(Uuid::new_v4());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[0].status, StepStatus::Ok);
+        assert!(steps[0].detail.contains("Win10_LTSC_2021.iso"));
+        assert_eq!(steps[1].status, StepStatus::Running);
+
+        // installing：安装中，等待 eject。
+        let mut session = iso_session(BuildState::Installing);
+        session.create_request_id = Some(Uuid::new_v4());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[1].status, StepStatus::Ok);
+        assert_eq!(steps[2].status, StepStatus::Running);
+        assert_eq!(steps[3].status, StepStatus::Pending);
+        assert!(steps[3].detail.contains("弹出 ISO"));
+
+        // ejecting。
+        let mut session = iso_session(BuildState::Ejecting);
+        session.create_request_id = Some(Uuid::new_v4());
+        session.eject_request_id = Some(Uuid::new_v4());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[2].status, StepStatus::Ok);
+        assert_eq!(steps[3].status, StepStatus::Running);
+
+        // ready：ISO 已弹出，等待 finish。
+        let mut session = iso_session(BuildState::Ready);
+        session.create_request_id = Some(Uuid::new_v4());
+        session.eject_request_id = Some(Uuid::new_v4());
+        session.media_ejected = true;
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[3].status, StepStatus::Ok);
+        assert_eq!(steps[4].status, StepStatus::Pending);
+
+        // finishing → making → done。
+        let mut session = iso_session(BuildState::Finishing);
+        session.create_request_id = Some(Uuid::new_v4());
+        session.eject_request_id = Some(Uuid::new_v4());
+        session.shutdown_request_id = Some(Uuid::new_v4());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[3].status, StepStatus::Ok);
+        assert_eq!(steps[4].status, StepStatus::Running);
+        assert_eq!(steps[5].status, StepStatus::Pending);
+
+        let mut session = iso_session(BuildState::Making);
+        session.create_request_id = Some(Uuid::new_v4());
+        session.eject_request_id = Some(Uuid::new_v4());
+        session.shutdown_request_id = Some(Uuid::new_v4());
+        session.make_request_id = Some(Uuid::new_v4());
+        session.image_id = Some(Uuid::new_v4());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[4].status, StepStatus::Ok);
+        assert_eq!(steps[5].status, StepStatus::Running);
+
+        let mut session = iso_session(BuildState::Done);
+        session.create_request_id = Some(Uuid::new_v4());
+        session.eject_request_id = Some(Uuid::new_v4());
+        session.shutdown_request_id = Some(Uuid::new_v4());
+        session.make_request_id = Some(Uuid::new_v4());
+        session.image_id = Some(Uuid::new_v4());
+        let steps = session_steps(&session, None);
+        for step in &steps {
+            assert_eq!(step.status, StepStatus::Ok, "step {} not ok", step.key);
+        }
+        assert!(steps[5].detail.contains("已生成镜像"));
+    }
+
+    #[test]
+    fn iso_steps_mark_failed_step() {
+        // ISO 不存在（preparing 失败）。
+        let mut session = iso_session(BuildState::Failed);
+        session.iso_check_request_id = Some(Uuid::new_v4());
+        session.error = Some("目标机器上没有找到安装 ISO：x.iso".to_owned());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[0].status, StepStatus::Error);
+        assert!(steps[0].detail.contains("没有找到"));
+
+        // create 失败。
+        let mut session = iso_session(BuildState::Failed);
+        session.create_request_id = Some(Uuid::new_v4());
+        session.error = Some("create failed".to_owned());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[1].status, StepStatus::Error);
+
+        // eject 失败。
+        let mut session = iso_session(BuildState::Failed);
+        session.create_request_id = Some(Uuid::new_v4());
+        session.eject_request_id = Some(Uuid::new_v4());
+        session.error = Some("eject failed".to_owned());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[3].status, StepStatus::Error);
+
+        // 取消：未完成步骤提示已取消。
+        let mut session = iso_session(BuildState::Cancelled);
+        session.create_request_id = Some(Uuid::new_v4());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[0].status, StepStatus::Ok);
+        assert_eq!(steps[2].status, StepStatus::Pending);
+        assert_eq!(steps[2].detail, "已取消");
     }
 }
