@@ -105,6 +105,8 @@ pub struct Config {
     /// seed 目录：启动/手动扫描其中的 `.iso` 并登记为预设 ISO。
     /// `ISO_SEED_DIR`，默认 `<data_dir>/iso-seeds`。
     pub iso_seed_dir: std::path::PathBuf,
+    /// 分片上传默认分片大小（MiB，8..=256）；`ISO_UPLOAD_CHUNK_MIB`，默认 64。
+    pub iso_upload_chunk_mib: u32,
 }
 
 /// S3 兼容存储配置（RustFS / MinIO / Ceph 等）。
@@ -268,6 +270,10 @@ impl Config {
             env_optional("ISO_SEED_DIR")
                 .unwrap_or_else(|| data_dir.join("iso-seeds").to_string_lossy().into_owned()),
         );
+        let iso_upload_chunk_mib = env_parse("ISO_UPLOAD_CHUNK_MIB", 64_u32)?;
+        if !(8..=256).contains(&iso_upload_chunk_mib) {
+            bail!("ISO_UPLOAD_CHUNK_MIB 需在 8-256 之间");
+        }
 
         reject_insecure_production_defaults(
             environment,
@@ -344,6 +350,7 @@ impl Config {
             storage,
             data_dir,
             iso_seed_dir,
+            iso_upload_chunk_mib,
         })
     }
 

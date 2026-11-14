@@ -95,7 +95,18 @@ pub fn router() -> Router<AppState> {
         // 不经过全局 2MiB body 限制与 30s 超时。
         .route("/isos", get(isos::list).post(isos::create))
         .route("/isos/seed/scan", post(isos::seed_scan))
+        // 共享审批（附录 C.2）：静态段先于 `/isos/{id}`。
+        .route("/isos/share-requests", get(isos::share_requests))
         .route("/isos/{id}", delete_route(isos::remove))
+        // 分片续传上传（附录 C.1；chunks PUT / complete POST 在 api/mod.rs 长上传路由）。
+        .route(
+            "/isos/{id}/upload",
+            get(isos::get_upload).delete(isos::abort_upload),
+        )
+        .route("/isos/{id}/share-request", post(isos::share_request))
+        .route("/isos/{id}/share-cancel", post(isos::share_cancel))
+        .route("/isos/{id}/share-review", post(isos::share_review))
+        .route("/isos/{id}/unshare", post(isos::unshare))
         // 教师端镜像制作工作台（image-studio.md §3）：
         // 房间默认底包 + 构建会话（服务端统一创建/回收构建 VM）。
         .route(

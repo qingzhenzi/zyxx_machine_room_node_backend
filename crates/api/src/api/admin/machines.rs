@@ -452,8 +452,20 @@ async fn send_wake_packets(macs: &[wol::MacAddress]) -> (Vec<String>, Vec<String
 const VM_COMMAND_DOWNLINK_KIND: &str = "vm.command";
 /// pending 超过该秒数视为超时（GET 时顺手把表更新为 timeout）。
 const VM_COMMAND_PENDING_TIMEOUT_SECS: i64 = 120;
-/// `image.make`（导出→分片上传→登记）的 pending 超时阈值（设计 §8.5：600s）。
-const VM_COMMAND_IMAGE_MAKE_TIMEOUT_SECS: i64 = 600;
+/// `image.make`（导出→分片上传→登记）的 pending 超时默认值（秒）。
+///
+/// 大镜像（Windows 10.5GB）即使并发/压缩后也可能超过 10 分钟；可用
+/// `IMAGE_MAKE_PENDING_TIMEOUT_SECS` 覆盖（60..=21600），默认 1800s。
+const VM_COMMAND_IMAGE_MAKE_TIMEOUT_SECS: i64 = 1800;
+
+/// 读取 `IMAGE_MAKE_PENDING_TIMEOUT_SECS`（越界/非法回退默认值）。
+fn image_make_pending_timeout_secs() -> i64 {
+    std::env::var("IMAGE_MAKE_PENDING_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .filter(|secs| (60..=21_600).contains(secs))
+        .unwrap_or(VM_COMMAND_IMAGE_MAKE_TIMEOUT_SECS)
+}
 
 /// 允许的 VM 操作白名单（阶段 1 + 阶段 1.5 底包/差分盘/快照）。
 const VM_COMMAND_OPS: &[&str] = &[
@@ -1985,7 +1997,7 @@ pub async fn get_vm_command(
         .map(str::to_owned);
     // image.make 要做「导出 qcow2 + 分片上传」，耗时远高于普通命令（设计 §8.5 超时 600s）。
     let pending_timeout_secs = match op.as_deref() {
-        Some("image.make") => VM_COMMAND_IMAGE_MAKE_TIMEOUT_SECS,
+        Some("image.make") => image_make_pending_timeout_secs(),
         _ => VM_COMMAND_PENDING_TIMEOUT_SECS,
     };
     if status == "pending"

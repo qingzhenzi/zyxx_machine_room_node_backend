@@ -198,6 +198,9 @@ async fn import_seed_file(
                 sha256: Some(sha256.clone()),
                 is_preset: true,
                 uploader_user_id: actor,
+                size_bytes: 0,
+                upload_chunk_size: None,
+                upload_total_chunks: None,
             })
             .await
             .map_err(|error| anyhow::anyhow!("登记 ISO 记录失败: {error}"))?;

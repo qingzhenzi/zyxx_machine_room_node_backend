@@ -119,6 +119,13 @@ const navGroups: { label: string; items: NavItem[] }[] = [
         permission: PERMISSIONS.imageRead,
       },
       {
+        name: 'isos',
+        label: 'ISO 库',
+        icon: 'archive',
+        to: '/isos',
+        permission: PERMISSIONS.imageRead,
+      },
+      {
         name: 'storage',
         label: '存储',
         icon: 'database',

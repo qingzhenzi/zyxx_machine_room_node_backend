@@ -127,6 +127,12 @@ export const routes: RouteRecordRaw[] = [
         meta: { title: '镜像详情', permission: PERMISSIONS.imageRead, activeName: 'images' },
       },
       {
+        path: 'isos',
+        name: 'isos',
+        component: () => import('@/views/IsoLibraryView.vue'),
+        meta: { title: 'ISO 库', permission: PERMISSIONS.imageRead },
+      },
+      {
         path: 'storage',
         name: 'storage',
         component: () => import('@/views/StorageView.vue'),

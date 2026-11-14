@@ -18,7 +18,6 @@ import {
   ARTIFACT_STATUS_OPTIONS,
   IMAGE_FORMAT_LABELS,
   IMAGE_KIND_OPTIONS,
-  artifactStatusMeta,
   compressionLabel,
   imageKindLabel,
   imageReadinessMeta,

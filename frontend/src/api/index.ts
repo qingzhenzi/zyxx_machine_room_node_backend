@@ -30,6 +30,13 @@ import type {
   EnsureSchedulesReply,
   EnsureSchedulesRequest,
 } from '@/features/scheduleBoard/boardTypes'
+import type {
+  IsoAsset,
+  IsoListParams,
+  IsoSeedScanReply,
+  IsoShareReviewInput,
+} from '@/features/isos/types'
+import { normalizeIsoList } from '@/features/isos/types'
 
 import type {
   Announcement,
@@ -720,6 +727,39 @@ export const api = {
         `/admin/rooms/${encodeURIComponent(roomId)}/images/${encodeURIComponent(imageId)}`,
       ),
     ),
+
+  // ---- 平台 ISO 资产库（image-studio.md 附录 B / C）----
+  /**
+   * ISO 列表。v3 返回裸数组、v4 契约返回 `elements[]`，`normalizeIsoList` 统一两种形状。
+   * 管理台默认只看 `status=ready` 的可用资产。
+   */
+  listIsos: (params: IsoListParams = {}) =>
+    unwrap<unknown>(http.get('/admin/isos', { params })).then(normalizeIsoList),
+
+  /** 待审批共享列表（admin；服务端返回数组或 elements 包装，统一归一化）。 */
+  listIsoShareRequests: () =>
+    unwrap<unknown>(http.get('/admin/isos/share-requests', { params: { status: 'pending' } })).then(
+      normalizeIsoList,
+    ),
+
+  /** 审批共享申请：approve=true → visibility=shared/approved；false → rejected。 */
+  reviewIsoShare: (id: string, input: IsoShareReviewInput) =>
+    unwrap<unknown>(
+      http.post(`/admin/isos/${encodeURIComponent(id)}/share-review`, input),
+    ) as Promise<IsoAsset | void>,
+
+  /** 撤销共享（private/none）。 */
+  unshareIso: (id: string) =>
+    unwrap<unknown>(
+      http.post(`/admin/isos/${encodeURIComponent(id)}/unshare`),
+    ) as Promise<IsoAsset | void>,
+
+  /** 删除 ISO（非 preset；被进行中构建会话引用时 409）。 */
+  deleteIso: (id: string) => unwrap<void>(http.delete(`/admin/isos/${encodeURIComponent(id)}`)),
+
+  /** 触发预设目录扫描（管理员；scanned/imported/skipped/failed）。 */
+  scanIsoSeed: () =>
+    unwrap<IsoSeedScanReply>(http.post('/admin/isos/seed/scan', undefined, { timeout: 120_000 })),
 
   // ---- 存储 ----
   presignObject: (input: StorageObjectRequest) =>

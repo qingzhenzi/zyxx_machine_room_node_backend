@@ -89,6 +89,14 @@ fn iso_upload_router(state: AppState) -> Router {
             "/api/v1/admin/isos/{id}/content",
             put(admin::isos::upload_content),
         )
+        .route(
+            "/api/v1/admin/isos/{id}/chunks/{index}",
+            put(admin::isos::upload_chunk),
+        )
+        .route(
+            "/api/v1/admin/isos/{id}/complete",
+            post(admin::isos::complete),
+        )
         .layer(
             ServiceBuilder::new()
                 .layer(middleware::from_fn(trace::trace_middleware))

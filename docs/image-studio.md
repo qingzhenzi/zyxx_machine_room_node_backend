@@ -513,3 +513,131 @@ CREATE UNIQUE INDEX install_isos_filename_key ON install_isos (lower(filename));
 - **修复**：`image_build_sessions` INSERT 在新增 `iso_id` 列后绑定顺序错位（vcpus 收到 text）——
   session 创建 500；已修正列/占位符/绑定顺序（与 0040 的 base_image_id 同类问题）。
 - **清理**：取消/完成会话回收构建 VM；测试上传的非预设 ISO 可由上传者/admin DELETE（有非终态会话引用 409）。
+
+---
+
+# 附录 C：ISO 分片续传 / 共享审批 / 镜像导出优化（v4，2026-11-14）
+
+## C.1 分片可续传 ISO 上传（替换单次 PUT）
+
+### DDL（migration 0042）
+
+```sql
+ALTER TABLE install_isos
+  ADD COLUMN upload_chunk_size bigint,
+  ADD COLUMN upload_total_chunks int,
+  ADD COLUMN upload_updated_at timestamptz;
+
+CREATE TABLE install_iso_chunks (
+  iso_id uuid NOT NULL REFERENCES install_isos(id) ON DELETE CASCADE,
+  chunk_index int NOT NULL CHECK (chunk_index >= 0),
+  size_bytes bigint NOT NULL CHECK (size_bytes > 0),
+  sha256 text NOT NULL,
+  received_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (iso_id, chunk_index)
+);
+```
+
+- 默认 chunk_size = 64 MiB（服务端可配 `ISO_UPLOAD_CHUNK_MIB`，8..256），总上限 16 GiB；
+- 每个 chunk 允许 1..chunk_size 字节（最后一块可小）；服务端按请求体实际长度校验并记录 SHA-256；
+- 分片文件落 `DATA_DIR/iso-uploads/<iso_id>/<index>.part`，finalize 时按序流式拼接→整体 SHA-256→S3→ready；
+- 并发写不同 part 文件，天然支持多连接并发上传；重复 chunk 幂等覆盖；
+- 目标：4.7GB ISO 可断点续传、可并发、可暂停/取消；失败只重传失败分片。
+
+### API
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/admin/isos` | body 增 `size_bytes`（必填，>0、≤16GiB）与可选 `chunk_size_mib`；返回 `{id, upload:{chunk_size,total_chunks,received:[]}}`；同名同 size 且属于当前用户且 uploading → 幂等返回原记录（用于续传）；同名 ready → 409 |
+| GET | `/admin/isos/{id}/upload` | 上传状态：`{status,size_bytes,chunk_size,total_chunks,received:[indices],received_bytes,sha256?}`（owner/admin） |
+| PUT | `/admin/isos/{id}/chunks/{index}` | 原始 body（1..chunk_size）；校验 index、长度、SHA-256；落 part 文件 + 记 chunk 行；返回 `{received_count,received_bytes}` |
+| POST | `/admin/isos/{id}/complete` | body `{sha256?}`；校验所有 chunk 齐全、大小和=size_bytes；拼接+校验（若传 sha 必须匹配）→ S3 `isos/<id>/<filename>` → ready；缺片 409 并返回缺失索引 |
+| DELETE | `/admin/isos/{id}/upload` | 中止上传：删除 part 目录/chunk 行，记录 failed（或删除，owner/admin 可选）；释放同名占用 |
+| PUT | `/admin/isos/{id}/content` | **保留 v3 单次 PUT 兼容**（≤16GiB，最终仍可完成），但教师端改用分片 |
+
+- 可见性/权限沿用：owner/admin 可操作；`preset` 不允许上传/删除；
+- 失败/超时上传保留 part 与已收 chunk，供续传；`DELETE /admin/isos/{id}` 仍可彻底删除。
+
+## C.2 ISO 共享与审批
+
+### DDL（同 0042）
+
+```sql
+ALTER TABLE install_isos
+  ADD COLUMN visibility text NOT NULL DEFAULT 'private'
+    CHECK (visibility IN ('private','shared')),
+  ADD COLUMN share_status text NOT NULL DEFAULT 'none'
+    CHECK (share_status IN ('none','pending','approved','rejected')),
+  ADD COLUMN share_requested_by uuid REFERENCES users(id),
+  ADD COLUMN share_reviewed_by uuid REFERENCES users(id),
+  ADD COLUMN share_reviewed_at timestamptz,
+  ADD COLUMN share_note text;
+```
+
+- 可见/可用：`is_preset` → 所有人；owner/admin → 自己/全部；`visibility=shared AND share_status=approved` → 所有 `image:read` 教师；
+- 共享需管理员审批：owner 发起申请 → pending；admin approve → `visibility=shared, share_status=approved`；reject → rejected（可再次申请）；
+- 审批人与时间/备注留痕；撤销共享 → private/none。
+
+### API
+
+| 方法 | 路径 | 权限 | 说明 |
+|---|---|---|---|
+| POST | `/admin/isos/{id}/share-request` | owner/admin/image:manage | 申请共享（幂等：pending 返回现有状态） |
+| POST | `/admin/isos/{id}/share-cancel` | owner/admin | 取消 pending |
+| GET | `/admin/isos/share-requests?status=pending` | admin | 待审批列表（含 filename/size/uploader/申请时间） |
+| POST | `/admin/isos/{id}/share-review` | admin | `{approve: bool, note?}` → approved/shared 或 rejected |
+| POST | `/admin/isos/{id}/unshare` | owner/admin | 撤销共享（private/none） |
+
+- 列表响应增加 `visibility/share_status/is_shared`；教师端可看到共享徽标与申请入口；
+- 管理台新增「ISO 库」页：全部 ISO、待审批（批准/拒绝）、预设扫描、删除/共享状态。
+
+## C.3 Windows 镜像导出优化（image.make）
+
+- **并发分片上传**：agent `image_make` 按 `IMAGE_MAKE_CONCURRENCY`（默认 8，1..16）并发 PUT 分片；
+  `IMAGE_MAKE_CHUNK_MIB`（默认 64，8..256）分片大小；失败分片重试（默认 3 次）；
+- **压缩导出**：`IMAGE_MAKE_COMPRESS=1`（默认开）时 `qemu-img convert -c`，Windows 10.5GB 预计压到 ~6-7GB；
+  （qcow2 压缩镜像可直接作为 libvirt 卷/backing，导入逻辑无需改）
+- **零分片跳过**：全零 chunk 标记为 skipped（manifest 已支持 skipped_chunks），减少无效上传；
+- **服务端 pending 超时**：`IMAGE_MAKE_PENDING_TIMEOUT_SECS` 默认 1800s（原 600s），`image.make` 命令/结果逻辑不变；
+- **进度**：agent 每 N 个分片记录日志（chunk/total/字节/耗时/吞吐）；服务端仍按 request_id 轮询；
+- **验收**：用已装好的 Windows 10 LTSC（10.5GB）导出，记录导出/上传耗时；服务端 verify/publish 通过；
+  并验证 Windows 底包用 `disk_bus=sata` 创建构建 VM 能进桌面。
+
+## C.4 服务端实现备注（v4，2026-11-14）
+
+- **迁移 0042** `0042_iso_chunks_sharing.sql`：`install_isos` 增
+  `upload_chunk_size/upload_total_chunks/upload_updated_at` 与
+  `visibility/share_status/share_requested_by/share_reviewed_by/share_reviewed_at/share_note`；
+  新表 `install_iso_chunks(iso_id, chunk_index, size_bytes, sha256, received_at, PK(iso_id,chunk_index))`；
+  `visibility` / `share_status` 命名 CHECK + pending 审批索引；幂等（真实库事务内双次 apply + SQL 冒烟后 ROLLBACK）。
+- **分片计划**：`POST /admin/isos` 必填 `size_bytes`（>0、≤16 GiB）、可选
+  `chunk_size_mib`（8..256，缺省 `ISO_UPLOAD_CHUNK_MIB`，默认 64）；返回
+  `{id, upload_url, upload:{chunk_size(字节), chunk_size_mib, total_chunks, received[]}}`。
+  同名同 owner + 同 size + `uploading` → **200 幂等返回原记录**用于续传；同名 `ready` → 409。
+- **分片文件**：`<DATA_DIR>/iso-uploads/<iso_id>/<index>.part`（先写 `.part.tmp` 再原子 rename）；
+  `PUT /admin/isos/{id}/chunks/{index}` 原始 body，长度必须等于
+  `min(chunk_size, size - index*chunk_size)`（非末片必须满片）；可选 `x-chunk-sha256` 头或
+  `?sha256=` 查询参数校验；重复 index 幂等覆盖；返回 `{received_count, received_bytes}`。
+  允许 `uploading|failed`（失败后保留分片可续传）。
+- **complete**：`POST /admin/isos/{id}/complete` body `{sha256?}`（`{}` 亦可）；校验片数齐全，
+  缺片 → 409 `{"error":{"code":"missing_chunks","message":...,"missing":[索引]}}`；
+  各分片大小和必须等于 `size_bytes`；按 index 顺序 1 MiB 缓冲流式拼接 + 整体 SHA-256（可选
+  sha 必须匹配，否则 400）→ `put_file` S3 → ready → 清理分片行/目录。任一步失败置 failed
+  **保留分片**供续传（临时合并文件会清理）。
+- **中止**：`DELETE /admin/isos/{id}/upload` 仅 `uploading|failed`，owner/admin，preset 拒绝；
+  删除分片行 + 目录 + 记录本身（释放同名可立即重新上传）。
+- **v3 兼容**：`PUT /admin/isos/{id}/content` 保留；若 POST 声明了 size，单次 PUT 结束会校验
+  实际大小一致；成功后清理可能残留的分片数据。
+- **共享/审批**：可见性 = preset 全员 / owner / admin / `visibility=shared AND share_status=approved`；
+  owner 或 admin 可 `share-request`（pending 幂等，preset/非 ready 拒绝）→ 管理员
+  `share-review {approve,note?}`（仅 pending；approve→shared+approved，reject→rejected）→
+  `share-cancel`/`unshare` 回到 none/private；`GET /admin/isos/share-requests?status=pending`
+  仅 admin（status 支持 pending/approved/rejected/none/all）。审批列表的「申请时间」用
+  `updated_at`（DDL 未单列 requested_at）。
+- **preset 保护**：预设 ISO 不可删除、不可上传/中止、不可申请共享；仅管理员可 seed 扫描。
+- **响应**：列表/审批响应增加 `visibility/share_status/is_shared/share_note/
+  share_requested_by/share_reviewed_by/share_reviewed_at`（不暴露 `storage_key`）。
+- **长请求路由**：`PUT /chunks/{index}`、`POST /complete` 与 v3 `/content` 同属独立长上传路由
+  （免全局 2 MiB body / 30s 超时；body 上限 16 GiB、超时 2h）。
+- **本期不做**：分片并发上限/限速、跨进程分片锁（写不同 index 天然并发安全，同 index 幂等覆盖）、
+  断点元数据压缩/清理 worker（中断记录由用户 DELETE /upload 释放）。
