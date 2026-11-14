@@ -236,3 +236,36 @@ reboot
 tar xzf /root/qe-backup/1panel-*.tgz -C /
 systemctl daemon-reload && systemctl enable --now 1panel-core 1panel-agent
 ```
+
+## 8. RDP 内自动化（本次实测）
+
+窗口化 RDP 可以用 X11 截图/键鼠驱动，便于在 Windows 内操作：
+
+```bash
+# 启动窗口化 RDP（non-fullscreen，便于 import 截图）
+XAUTH=$(ls /run/user/1000/xauth_* | head -1)
+runuser -u roomuser -- env DISPLAY=:0 XAUTHORITY=$XAUTH \
+  XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 GDK_BACKEND=x11 \
+  xfreerdp3 /v:10.77.148.174 /u:qe /p:'QeStudio2026' /size:1600x900 /cert:ignore +clipboard &
+
+ID=$(runuser -u roomuser -- env DISPLAY=:0 XAUTHORITY=$XAUTH xdotool search --name FreeRDP | head -1)
+runuser -u roomuser -- env DISPLAY=:0 XAUTHORITY=$XAUTH import -window "$ID" /tmp/rdp.png
+runuser -u roomuser -- env DISPLAY=:0 XAUTHORITY=$XAUTH xdotool mousemove --window "$ID" 164 811 click 1
+```
+
+已确认 Windows 内 VF 出现在设备管理器：
+
+```text
+PCI\VEN_8086&DEV_4690&SUBSYS_89B4103C
+描述: Microsoft 基本显示适配器
+问题代码 31 (CM_PROB_FAILED_ADD)
+```
+
+说明 VF 已成功分配给 Windows；下一步是安装 Intel 桌面显卡驱动（LTSC 2021 21H2 可能需要 30.x/31.x 版本），
+Windows Update 自动搜索当前返回“最佳驱动已安装”，需要手动 Intel 驱动包。
+
+## 9. 当前未闭环
+
+- Windows Intel VF 驱动未安装（QSV/3D 尚未验证）；
+- Sunshine/Moonlight 未安装；
+- RDP kiosk 当前直连 `10.77.148.174`，IP 变需同步。
