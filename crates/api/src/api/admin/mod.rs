@@ -7,6 +7,7 @@ pub mod devices;
 pub mod federation;
 pub mod image_studio;
 pub mod images;
+pub mod isos;
 pub mod live_metrics;
 pub mod machines;
 pub mod roles;
@@ -89,6 +90,12 @@ pub fn router() -> Router<AppState> {
             "/rooms/{room_id}/startup",
             get(startup::get).put(startup::update),
         )
+        // 平台 ISO 资产库（image-studio.md 附录 B）：上传/预设/列表/删除/seed 扫描。
+        // 注意：PUT /isos/{id}/content 是长上传（16GiB），注册在 api/mod.rs 的独立路由，
+        // 不经过全局 2MiB body 限制与 30s 超时。
+        .route("/isos", get(isos::list).post(isos::create))
+        .route("/isos/seed/scan", post(isos::seed_scan))
+        .route("/isos/{id}", delete_route(isos::remove))
         // 教师端镜像制作工作台（image-studio.md §3）：
         // 房间默认底包 + 构建会话（服务端统一创建/回收构建 VM）。
         .route(

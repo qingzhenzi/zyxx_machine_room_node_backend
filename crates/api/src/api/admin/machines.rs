@@ -33,7 +33,7 @@ use crate::{
         storage::{
             ArtifactStatus, Compression, ImageEventActorKind, ImageFormat, ImageKind,
             ImageVisibility, NewImage, NewImageBuildRequest, NewImageEvent, name_conflict,
-            validate_image_name, validate_image_version, validate_platform,
+            validate_image_name, validate_image_version, validate_platform, validate_sha256_hex,
         },
         validation, wol,
     },
@@ -476,6 +476,8 @@ const VM_COMMAND_OPS: &[&str] = &[
     // ISO 安装（契约附录 A.3.1）。
     "iso.list",
     "eject",
+    // ISO 资产分发（契约附录 B.4）。
+    "iso.pull",
 ];
 
 /// 容器命令下行 kind（与 agent `container_control` 对齐）。
@@ -897,6 +899,46 @@ fn build_image_make_args(
     Ok(out)
 }
 
+/// 校验 `iso.pull` 的 args（契约附录 B.4）：
+/// `{name, url, sha256?, size_bytes?}`，`url` 必须是 http(s)。
+fn build_iso_pull_args(
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> AppResult<serde_json::Map<String, serde_json::Value>> {
+    reject_unknown_args(args, &["name", "url", "sha256", "size_bytes"])?;
+    let mut out = serde_json::Map::new();
+
+    let name = expect_string(args, "name")?.ok_or_else(|| bad_arg("缺少 ISO 文件名 name"))?;
+    let name = qe_domain::image_studio::validate_iso_name(&name).map_err(bad_arg)?;
+    out.insert("name".to_owned(), serde_json::json!(name));
+
+    let url = expect_string(args, "url")?.ok_or_else(|| bad_arg("缺少下载地址 url"))?;
+    let parsed = reqwest::Url::parse(&url)
+        .map_err(|_| bad_arg("url 不是合法 URL（应为 presigned HTTP(S) 地址）"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(bad_arg("url 必须是 http(s) 地址"));
+    }
+    if parsed.host_str().is_none() {
+        return Err(bad_arg("url 必须包含主机名"));
+    }
+    if url.chars().count() > 4096 || url.contains('\r') || url.contains('\n') {
+        return Err(bad_arg("url 非法（过长或包含控制字符）"));
+    }
+    out.insert("url".to_owned(), serde_json::json!(url));
+
+    if let Some(sha256) = expect_string(args, "sha256")?.filter(|value| !value.is_empty()) {
+        let sha256 = sha256.trim().to_ascii_lowercase();
+        let sha256 = validate_sha256_hex(&sha256).map_err(|error| bad_arg(error.to_string()))?;
+        out.insert("sha256".to_owned(), serde_json::json!(sha256));
+    }
+    if let Some(size_bytes) = expect_u64(args, "size_bytes")? {
+        if size_bytes == 0 {
+            return Err(bad_arg("size_bytes 必须大于 0"));
+        }
+        out.insert("size_bytes".to_owned(), serde_json::json!(size_bytes));
+    }
+    Ok(out)
+}
+
 /// 校验 op 白名单与各 op 的 args（纯函数，便于单测）。
 fn validate_vm_command(request: VmCommandRequest) -> AppResult<ValidatedVmCommand> {
     let op = request.op.trim().to_ascii_lowercase();
@@ -980,6 +1022,7 @@ fn validate_vm_command(request: VmCommandRequest) -> AppResult<ValidatedVmComman
             out
         }
         "image.make" => build_image_make_args(&args)?,
+        "iso.pull" => build_iso_pull_args(&args)?,
         "delete" => {
             reject_unknown_args(&args, &["name", "remove_disks"])?;
             let mut out = serde_json::Map::new();
@@ -2162,6 +2205,7 @@ mod tests {
             "vnc.info",
             "iso.list",
             "eject",
+            "iso.pull",
         ] {
             assert!(VM_COMMAND_OPS.contains(&op), "缺少 op：{op}");
         }
@@ -2499,6 +2543,46 @@ mod tests {
         ] {
             assert!(
                 validate_vm_command(request_args("create", args.clone())).is_err(),
+                "should reject {args}"
+            );
+        }
+    }
+
+    #[test]
+    fn iso_pull_args_validate_and_normalize() {
+        let ok = validate_vm_command(request_args(
+            "iso.pull",
+            serde_json::json!({
+                "name": "Win10_LTSC_2021.iso",
+                "url": "http://192.168.8.231:9000/qestudio/isos/x/Win10.iso?X-Amz-Signature=abc",
+                "sha256": "A".repeat(64),
+                "size_bytes": 5_368_709_120_u64,
+            }),
+        ))
+        .unwrap();
+        assert_eq!(ok.op, "iso.pull");
+        assert_eq!(ok.args["name"], serde_json::json!("Win10_LTSC_2021.iso"));
+        assert_eq!(ok.args["sha256"], serde_json::json!("a".repeat(64)));
+        assert_eq!(ok.args["size_bytes"], serde_json::json!(5_368_709_120_u64));
+        // sha256 可选。
+        let minimal = validate_vm_command(request_args(
+            "iso.pull",
+            serde_json::json!({"name": "a.iso", "url": "https://s3.example/a.iso"}),
+        ))
+        .unwrap();
+        assert!(minimal.args.get("sha256").is_none());
+        // 非法：路径名、非 http(s)、未知字段、坏 sha、0 大小。
+        for args in [
+            serde_json::json!({"name": "../a.iso", "url": "http://x/a.iso"}),
+            serde_json::json!({"name": "a.iso", "url": "file:///etc/passwd"}),
+            serde_json::json!({"name": "a.iso", "url": "not-a-url"}),
+            serde_json::json!({"name": "a.iso", "url": "http://x/a.iso", "extra": 1}),
+            serde_json::json!({"name": "a.iso", "url": "http://x/a.iso", "sha256": "zz"}),
+            serde_json::json!({"name": "a.iso", "url": "http://x/a.iso", "size_bytes": 0}),
+            serde_json::json!({"url": "http://x/a.iso"}),
+        ] {
+            assert!(
+                validate_vm_command(request_args("iso.pull", args.clone())).is_err(),
                 "should reject {args}"
             );
         }

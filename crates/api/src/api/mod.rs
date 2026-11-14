@@ -15,7 +15,7 @@ use axum::{
     http::{HeaderName, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde_json::{Value, json};
 use tower::ServiceBuilder;
@@ -31,12 +31,14 @@ use tower_http::{
 use crate::{error::AppError, state::AppState};
 
 pub fn router(state: AppState) -> Router {
+    // 长上传路由单独构建（16 GiB / 2h），不能进入下面的全局 body 限制/超时层。
+    let iso_upload = iso_upload_router(state.clone());
     let cors = build_cors(&state);
     let timeout = state.config.request_timeout();
     let max_body_bytes = state.config.max_body_bytes;
     let production = state.config.environment.is_production();
 
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/api-docs/openapi.json", get(openapi::json_spec))
@@ -60,6 +62,48 @@ pub fn router(state: AppState) -> Router {
                 .layer(TimeoutLayer::with_status_code(
                     StatusCode::REQUEST_TIMEOUT,
                     timeout,
+                )),
+        )
+        .with_state(state);
+    router.merge(iso_upload)
+}
+
+/// ISO 内容上传专用路由：`PUT /api/v1/admin/isos/{id}/content`。
+///
+/// 大 ISO（4.7GB / 上限 16 GiB）需要远大于普通接口的 body 上限与超时，因此**不**
+/// 经过主路由的 `DefaultBodyLimit`（2 MiB）与 `TimeoutLayer`（30s）；其余安全头/
+/// CORS/追踪/禁缓存能力保持一致。
+fn iso_upload_router(state: AppState) -> Router {
+    use qe_domain::install_iso::MAX_ISO_BYTES;
+
+    // 多留 1 MiB：超限时让 handler 的流式计数先触发 413（语义更明确），
+    // 而不是被 body limit 层直接拒绝。
+    let max_body_bytes = usize::try_from(MAX_ISO_BYTES)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1024 * 1024);
+    let upload_timeout = Duration::from_secs(2 * 60 * 60);
+    let cors = build_cors(&state);
+    let production = state.config.environment.is_production();
+    Router::new()
+        .route(
+            "/api/v1/admin/isos/{id}/content",
+            put(admin::isos::upload_content),
+        )
+        .layer(
+            ServiceBuilder::new()
+                .layer(middleware::from_fn(trace::trace_middleware))
+                .layer(middleware::from_fn(move |request, next| {
+                    security_headers(request, next, production)
+                }))
+                .layer(SetResponseHeaderLayer::overriding(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("no-store"),
+                ))
+                .layer(DefaultBodyLimit::max(max_body_bytes))
+                .layer(cors)
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::REQUEST_TIMEOUT,
+                    upload_timeout,
                 )),
         )
         .with_state(state)

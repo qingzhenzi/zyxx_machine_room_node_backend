@@ -379,3 +379,137 @@ ISO 列表只返回文件名/大小，不返回宿主路径。
 - **ISO 上传**：本期只支持目标机 ISO 目录已有文件；`iso.list` 只读、不暴露宿主路径。
 - **Windows 镜像导出**：大磁盘（~10GB）按当前 S3 分片速度约 25–35 分钟，且 image.make pending
   超时 600s 会先超时；Windows 制作建议后续启用分片并发/压缩或放宽该 op 的超时。
+
+---
+
+# 附录 B：ISO 资产库与自动分发（v3，2026-11-14）
+
+目标：教师端不再手工把 ISO 拷到目标机。ISO 作为平台一等资产：**上传/预设 → ISO 库 → 构建时自动分发到目标 agent → 安装**。
+
+## B.1 数据模型（migration 0041）
+
+```sql
+CREATE TABLE install_isos (
+  id uuid PRIMARY KEY,
+  filename text NOT NULL,            -- 安全文件名，目标机 ISO 目录最终文件名（唯一）
+  display_name text NOT NULL,
+  description text,
+  size_bytes bigint NOT NULL DEFAULT 0,
+  sha256 text,
+  status text NOT NULL DEFAULT 'uploading'
+    CHECK (status IN ('uploading','ready','failed')),
+  storage_key text,                  -- S3: isos/<id>/<filename>
+  is_preset boolean NOT NULL DEFAULT false,
+  uploader_user_id uuid REFERENCES users(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  uploaded_at timestamptz
+);
+CREATE UNIQUE INDEX install_isos_filename_key ON install_isos (lower(filename));
+```
+
+- `is_preset=true` 表示系统预设 ISO（seed 目录扫描/管理员上传），所有教师可见；
+- 非 preset 的 ISO 仅上传者与 admin 可见/可用；
+- filename 必须匹配 `[A-Za-z0-9._-]{1,128}` 且以 `.iso` 结尾（大小写不敏感）；
+- 本期不实现分片上传：单次 HTTP PUT 流式接收（上限 16 GiB），服务端落临时文件→校验大小/SHA→上传 S3→置 ready。
+
+## B.2 API（admin，需 image:manage；读取需 image:read）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/admin/isos?status=ready` | 列表：id/filename/display_name/size_bytes/sha256/is_preset/uploader/created_at |
+| POST | `/admin/isos` | body `{filename, display_name?, description?, sha256?}` → 建 uploading 记录，返回 `{id, upload_url:"/api/v1/admin/isos/{id}/content"}` |
+| PUT | `/admin/isos/{id}/content` | 原始 body 流式写入；仅 uploading 状态；边写边算 SHA-256；大小上限 16GiB；完成后上传 S3（`isos/<id>/<filename>`）并置 ready（返回记录） |
+| DELETE | `/admin/isos/{id}` | 删除记录 + S3 对象；有非终态会话引用 → 409 |
+| POST | `/admin/isos/seed/scan` | 扫描 `ISO_SEED_DIR`（默认 `/var/lib/qe-control/iso-seeds`）下的 `.iso`，计算大小/SHA，已存在同 filename+sha 跳过，否则上传 S3 并登记 preset ISO；返回 `{scanned, imported, skipped, failed:[...]}` |
+
+- qe-api 启动时后台执行一次 seed 扫描（失败只 warn，不阻塞启动）；
+- 预设 ISO 的 filename 冲突规则：同 filename 且 sha 相同则跳过；不同 sha 同名 → 记录失败并在返回中列出。
+
+## B.3 构建会话扩展
+
+`POST /admin/image-builds` 新增 `iso_id`（与 `iso_name` 二选一）：
+
+- `iso_id`：ISO 库资产（推荐）。服务端校验 ready、可见性；filename 取库记录；preparing 阶段：
+  1. `iso_check`：校验 ISO 资产 + 生成一次性下载 URL（presigned GET，TTL ≥ 1h）；
+  2. 入队 `vm.command iso.pull {name, url, sha256, size_bytes}` 记录 `iso_pull_request_id`；
+  3. 轮询结果为 ok → 入队 `create`；失败 → `failed`；
+  4. steps：`iso_check → iso_distribute → create_vm → install → eject_iso → shutdown → upload`；
+- `iso_name`：保留 v2 兼容（目标机已有 ISO），steps 仍为 6 步。
+- 会话回复增加 `iso_id`；迁移 0041 增加 `iso_id uuid NULL`、`iso_pull_request_id uuid NULL`。
+- 分发是幂等的：目标机已有同名且 SHA 匹配的 ISO 时 agent 返回 `skipped=true`，会话直接进入创建 VM。
+
+## B.4 agent `iso.pull`
+
+`vm.command op=iso.pull args {name,url,sha256?,size_bytes?}`：
+
+- name 规则同 create（仅文件名），目录 `LIBVIRT_ISO_DIR`；
+- 目标文件已存在：若提供 sha256 且匹配（或未提供 sha 但 size 匹配）→ 返回 `{name,size_bytes,sha256,pulled:false,skipped:true}`；
+- 否则流式下载到 `<dir>/.<name>.part`，限制大小（≤16GiB）、超时 ≥1800s；校验 size/sha 后原子 rename；
+- 返回 `{name,size_bytes,sha256,pulled:true,skipped:false}`；失败清理 .part 并给出明确错误。
+
+## B.5 教师端
+
+- 「从 ISO 安装」优先展示 **平台 ISO 库**（GET /admin/isos?status=ready）：预设徽标、大小、上传时间；
+- 「上传 ISO」：文件选择 → POST /admin/isos → XHR PUT 到 upload_url（显示进度/速度/失败重试）→ 刷新列表；
+- 选择库内 ISO → 创建会话带 `iso_id`；preparing 步骤展示「校验 ISO → 分发到目标机（iso.pull）→ 创建安装 VM」；
+- 兼容入口：折叠「目标机已有 ISO」，仍可用 `iso_name`（v2 路径）；
+- 上传/分发/安装/取消错误提示与 409 一致。
+
+## B.6 验收
+
+1. `cargo test`：ISO 名称/状态机/权限/seed 解析/分发编排单测；agent iso.pull 单测；
+2. 真机：把 Win10 LTSC ISO 放入 `ISO_SEED_DIR` → 启动扫描登记 preset → 教师端库中可见；
+   构建会话 `iso_id` → preparing 显示分发（目标机已有则 skipped）→ installing（VNC Windows 安装界面）；
+3. 上传一个较小 ISO（如 virtio-win 754MB）→ ready；用其创建会话 → agent 通过 presigned URL 下载到 ISO 目录（pulled=true）→ VM 创建；取消回收；
+4. 教师端 type-check/lint/test/build 通过。
+
+## B.7 服务端实现备注（v3，2026-11-14）
+
+- **迁移 0041** `0041_install_isos.sql`：`install_isos`（filename、display_name、
+  description、size_bytes、sha256、status uploading|ready|failed、storage_key、
+  is_preset、uploader_user_id、时间戳；`lower(filename)` 唯一索引）+
+  `image_build_sessions.iso_id`（`ON DELETE SET NULL`）/`iso_pull_request_id` 与索引；
+  全部幂等（真实库事务回滚验证）。
+- **S3 能力**（`qe-storage`）：新增 `presign_get_with_ttl(key, ttl)`（TTL 60s..86400s，
+  ISO 分发用 7200s/2h）与 `put_file(key, path, content_type, timeout)`（`ReaderStream`
+  流式上传 + Content-Length，默认客户端 60s 超时被单请求 timeout 覆盖）。
+- **上传接口**：`PUT /admin/isos/{id}/content` 注册在 **独立长上传路由**（`api/mod.rs`
+  `iso_upload_router`），不经过全局 2 MiB body 限制 / 30s 超时；上限 16 GiB、
+  超时 2h。handler 边收边写 `<DATA_DIR>/iso-uploads/<id>.part` 并计算 SHA-256，
+  完成后流式上传 S3 并置 ready；任一步失败置 failed + 清理临时文件（超限 413）。
+- **seed 扫描**：`ISO_SEED_DIR`（默认 `<DATA_DIR>/iso-seeds`，`DATA_DIR` 默认
+  `/var/lib/qe-control`）；`sha256_file` 1 MiB 流式读取（4.7GB 不占内存），
+  `put_file` 流式上传；同 filename 同 size+sha → skipped，同名不同内容/状态 → failed
+  项（不覆盖已有记录），否则登记 preset ready。启动时后台跑一次（失败只 warn），
+  `POST /admin/isos/seed/scan` 管理员手动触发。
+- **构建会话**：`iso_id` 与 `iso_name` 二选一（同时给/都不给 → 400）；`iso_id` 需
+  ISO `ready` 且可见（preset 所有人、非 preset uploader/admin）。preparing 首步在
+  POST 时生成 presigned GET（TTL 2h）并 `vm.command iso.pull`
+  `{name,url,sha256,size_bytes}`，记录 `iso_pull_request_id`；GET 轮询 ok → `create`，
+  失败 → failed，pending 超过 30 分钟 → failed。steps（iso_id）为
+  `iso_check → iso_distribute → create_vm → install → eject_iso → shutdown → upload`
+  （iso_name 兼容路径仍 6 步）；回复新增 `iso_id`。
+- **删除保护**：仅拦非终态会话引用（`iso_id` + state 非终态）；已结束会话经
+  `ON DELETE SET NULL` 保留历史但不阻塞删除。S3 对象删除失败只 warn（记录仍删）。
+- **vm.command**：白名单新增 `iso.pull`；服务端校验 `name`（安全文件名）、`url`
+  （http/https + host）、`sha256`（可选 64 hex，自动小写）、`size_bytes`（可选 >0），
+  非法/未知字段 400。
+- **本期不做**：分片/断点续传上传（单次 HTTP PUT）、ISO 内容去重（同内容不同文件名
+  各自一份）、上传进度服务端记录（前端按 HTTP 上传进度展示）。
+
+## B.8 集成备注（2026-11-14 真机联调）
+
+- **qe-api 启动配置**：ISO 分发依赖 presigned GET 的 host，`S3_ENDPOINT` 必须是远程 agent 可访问的控制节点 LAN 地址
+  （本环境 `http://192.168.8.231:9000`；`.env` 已同步），否则 agent 下载 `127.0.0.1` 失败；
+  `DATA_DIR=/var/lib/qe-control`、`ISO_SEED_DIR=/var/lib/qe-control/iso-seeds` 需进程可写。
+- **系统预设 ISO**：把 ISO 放入 `ISO_SEED_DIR` → qe-api 启动后台扫描或 `POST /admin/isos/seed/scan`；
+  首次 4.7GB 文件流式 SHA-256 + S3 上传约 3-4 分钟（不阻塞 HTTP），登记为 `is_preset=true` 后所有教师可见。
+- **上传**：`POST /admin/isos` → `PUT /admin/isos/{id}/content`（单次原始 body，16GiB/2h 级长上传路由，
+  免全局 2MiB/30s 限制）；服务端流式落临时文件 → SHA-256 → S3 → ready。实测 754MB 约 43s（约 18MB/s）。
+- **分发**：iso_id 会话 preparing 先 `iso_check` 生成 2h presigned GET → `iso_distribute` 下发
+  `vm.command iso.pull`；目标机已有同 SHA 文件时 agent 秒回 skipped；754MB 上传 ISO 首次分发约 70s；
+  之后才创建安装 VM。
+- **修复**：`image_build_sessions` INSERT 在新增 `iso_id` 列后绑定顺序错位（vcpus 收到 text）——
+  session 创建 500；已修正列/占位符/绑定顺序（与 0040 的 base_image_id 同类问题）。
+- **清理**：取消/完成会话回收构建 VM；测试上传的非预设 ISO 可由上传者/admin DELETE（有非终态会话引用 409）。

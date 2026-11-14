@@ -38,6 +38,7 @@ use crate::{
             build_vm_name, iso_check_outcome, preparing_outcome, session_steps,
             shutdown_grace_expired, validate_iso_name,
         },
+        install_iso::{ISO_PRESIGN_TTL_SECS, is_iso_usable},
         rbac::permissions,
         storage::{
             ArtifactStatus, ImageArtifact, ImageArtifactView, ImageEventActorKind, NewImageEvent,
@@ -114,6 +115,41 @@ fn parse_nic_mode(raw: Option<&str>) -> AppResult<NicMode> {
     }
 }
 
+/// ISO 来源二选一校验（契约 B.3）：`iso_id`（平台库）与 `iso_name`（目标机已有）
+/// 互斥；iso 模式必须给其一，base 模式都不允许。
+fn validate_iso_source_selection(
+    source_mode: SourceMode,
+    iso_id: Option<Uuid>,
+    iso_name: Option<&str>,
+) -> AppResult<()> {
+    let has_name = iso_name
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    match source_mode {
+        SourceMode::Base => {
+            if iso_id.is_some() || has_name {
+                return Err(AppError::bad_request(
+                    "source=base 不支持 iso_id / iso_name（仅 source=iso 使用）",
+                ));
+            }
+            Ok(())
+        }
+        SourceMode::Iso => {
+            if iso_id.is_some() && has_name {
+                return Err(AppError::bad_request(
+                    "iso_id 与 iso_name 只能二选一（推荐使用平台 ISO 库 iso_id）",
+                ));
+            }
+            if iso_id.is_none() && !has_name {
+                return Err(AppError::bad_request(
+                    "source=iso 需要 iso_id（平台 ISO 库）或 iso_name（目标机已有 ISO）",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// 创建 VM 成功后进入的状态：iso 进入 `installing`（等教师安装），base 进入 `ready`。
 pub(crate) fn state_after_create(source_mode: SourceMode) -> BuildState {
     match source_mode {
@@ -168,7 +204,10 @@ pub struct CreateBuildSessionRequest {
     /// source=base 必填；source=iso 时忽略。
     #[serde(default)]
     pub base_image_id: Option<Uuid>,
-    /// source=iso 必填：目标机 ISO 目录下的文件名（不允许路径分隔符）。
+    /// source=iso 且使用平台 ISO 资产库时必填（与 iso_name 二选一）。
+    #[serde(default)]
+    pub iso_id: Option<Uuid>,
+    /// source=iso 且使用目标机已有 ISO 时必填（不允许路径分隔符）。
     #[serde(default)]
     pub iso_name: Option<String>,
     /// iso 模式磁盘总线；缺省 base→virtio、iso→sata。
@@ -205,6 +244,8 @@ pub struct BuildSessionReply {
     /// `base` / `iso`（契约附录 A.3.2）。
     pub source_mode: SourceMode,
     pub iso_name: Option<String>,
+    /// iso 资产模式（v3）引用的 ISO 库记录 id。
+    pub iso_id: Option<Uuid>,
     pub disk_bus: DiskBus,
     pub nic: NicMode,
     /// iso 模式：安装完成后是否已弹出 ISO（finish 前必须为 true）。
@@ -243,6 +284,7 @@ impl BuildSessionReply {
             build_vm_name: session.build_vm_name,
             source_mode: session.source_mode,
             iso_name: session.iso_name,
+            iso_id: session.iso_id,
             disk_bus: session.disk_bus,
             nic: session.nic,
             media_ejected: session.media_ejected,
@@ -605,9 +647,116 @@ async fn advance_preparing(state: &AppState, session: BuildSession) -> AppResult
     }
 }
 
+/// v3 ISO 资产分发（幂等）：生成 presigned GET（TTL≥1h）→ 入队 `vm.command iso.pull`
+/// → 记录 `iso_pull_request_id`（状态仍 `preparing`）。GET 也会调用它做失败重试。
+async fn start_iso_distribution(
+    state: &AppState,
+    session: BuildSession,
+) -> AppResult<BuildSession> {
+    if session.iso_pull_request_id.is_some() {
+        return Ok(session);
+    }
+    let Some(iso_id) = session.iso_id else {
+        return Ok(session);
+    };
+    let iso = state
+        .isos
+        .get(iso_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("ISO 资产不存在"))?;
+    if !is_iso_usable(&iso) {
+        return transition_failed(
+            state,
+            &session,
+            format!("ISO 资产未就绪（status={}）", iso.status),
+        )
+        .await;
+    }
+    let Some(storage_key) = iso.storage_key.as_deref() else {
+        return transition_failed(state, &session, "ISO 资产缺少存储对象").await;
+    };
+    // 未配置对象存储 → 503（POST 已在创建会话前断言过一次；GET 重试时同样可能遇到）。
+    let storage = super::storage::service(state)?;
+    let presigned = storage
+        .presign_get_with_ttl(storage_key, ISO_PRESIGN_TTL_SECS)
+        .map_err(|error| AppError::internal(format!("生成 ISO 下载链接失败: {error}")))?;
+    let args = json!({
+        "name": iso.filename,
+        "url": presigned.url,
+        "sha256": iso.sha256,
+        "size_bytes": iso.size_bytes,
+    });
+    let request_id =
+        enqueue_session_vm_command(state, &session.machine_serial, "iso.pull", args).await?;
+    let update = SessionUpdate::new(&[BuildState::Preparing], BuildState::Preparing)
+        .with_iso_pull_request(request_id);
+    match state
+        .image_studio
+        .update_session(session.id, &update)
+        .await?
+    {
+        Some(updated) => Ok(updated),
+        None => reload_session(state, session.id).await,
+    }
+}
+
+/// `preparing`（iso 资产）：确保 iso.pull 已下发 → 轮询结果 → ok 后进入创建 VM。
+///
+/// 分发是幂等的：目标机已有同名且 sha 匹配的 ISO 时 agent 返回 `skipped=true`（仍为 ok），
+/// 会话直接进入创建 VM。超过 30 分钟未完成 → failed（契约 B.3）。
+async fn advance_preparing_iso_asset(
+    state: &AppState,
+    session: BuildSession,
+) -> AppResult<BuildSession> {
+    let Some(request_id) = session.iso_pull_request_id else {
+        return start_iso_distribution(state, session).await;
+    };
+    match command_outcome(state, request_id).await? {
+        CommandOutcome::Pending => {
+            if Utc::now() - session.updated_at > chrono::Duration::minutes(30) {
+                return transition_failed(
+                    state,
+                    &session,
+                    "ISO 分发超时（>30 分钟），请检查目标机网络或稍后重试",
+                )
+                .await;
+            }
+            Ok(session)
+        }
+        CommandOutcome::Ok(_) => {
+            let iso_name = session.iso_name.clone().unwrap_or_default();
+            let args = iso_create_vm_args(&session, &iso_name);
+            let create_request_id =
+                match enqueue_session_vm_command(state, &session.machine_serial, "create", args)
+                    .await
+                {
+                    Ok(request_id) => request_id,
+                    Err(error) => {
+                        return transition_failed(state, &session, error.to_string()).await;
+                    }
+                };
+            let update = SessionUpdate::new(&[BuildState::Preparing], BuildState::Creating)
+                .with_create_request(create_request_id);
+            match state
+                .image_studio
+                .update_session(session.id, &update)
+                .await?
+            {
+                Some(updated) => Ok(updated),
+                None => reload_session(state, session.id).await,
+            }
+        }
+        CommandOutcome::Failed(error) => transition_failed(state, &session, error).await,
+    }
+}
+
 /// `preparing`（iso）：轮询 `iso.list`；ISO 存在 → 发 `create`（iso_name/disk_bus/nic/
 /// start=true）并进入 `creating`；ISO 不存在/命令失败 → `failed`。
 async fn advance_preparing_iso(state: &AppState, session: BuildSession) -> AppResult<BuildSession> {
+    // v3：平台 ISO 库资产 → 先分发（iso.pull）再创建 VM；v2 的 iso_name 路径保持原逻辑。
+    if session.iso_id.is_some() {
+        return advance_preparing_iso_asset(state, session).await;
+    }
     let iso_name = session.iso_name.clone().unwrap_or_default();
     let Some(request_id) = session.iso_check_request_id else {
         // 兜底：v1 数据/人工写入的 iso 会话没有校验 id，直接补发一次 iso.list。
@@ -1114,25 +1263,43 @@ pub async fn create_build_session(
         // iso 模式没有底包（迁移 0040：base_image_id 可空）；忽略客户端传来的 base_image_id。
         SourceMode::Iso => None,
     };
-    let iso_name = match source_mode {
-        SourceMode::Base => {
-            if request
-                .iso_name
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty())
-            {
-                return Err(AppError::bad_request("source=base 不支持 iso_name"));
+    validate_iso_source_selection(source_mode, request.iso_id, request.iso_name.as_deref())?;
+    // iso_id：查平台 ISO 库（ready + 可见），filename 取库记录；iso_name：兼容 v2。
+    let iso_asset = match (source_mode, request.iso_id) {
+        (SourceMode::Iso, Some(iso_id)) => {
+            let iso = state
+                .isos
+                .get(iso_id)
+                .await?
+                .ok_or_else(|| AppError::not_found("ISO 资产不存在"))?;
+            let is_admin = super::images::actor_is_admin(&state, id).await?;
+            if !crate::domain::install_iso::is_iso_visible(&iso, id, is_admin) {
+                return Err(AppError::forbidden("无权使用他人的私有 ISO"));
             }
-            None
+            if !is_iso_usable(&iso) {
+                return Err(AppError::conflict(format!(
+                    "ISO 资产未就绪（status={}，需为 ready）",
+                    iso.status
+                )));
+            }
+            // 提前断言对象存储可用，避免创建会话后才发现无法生成下载链接。
+            super::storage::service(&state)?;
+            Some(iso)
         }
-        SourceMode::Iso => {
-            let raw = request
-                .iso_name
-                .as_deref()
-                .ok_or_else(|| AppError::bad_request("source=iso 时 iso_name 必填"))?;
-            Some(validate_iso_name(raw).map_err(AppError::bad_request)?)
-        }
+        _ => None,
+    };
+    let iso_name = match source_mode {
+        SourceMode::Base => None,
+        SourceMode::Iso => match &iso_asset {
+            Some(iso) => Some(iso.filename.clone()),
+            None => {
+                let raw = request
+                    .iso_name
+                    .as_deref()
+                    .ok_or_else(|| AppError::bad_request("source=iso 时 iso_name 必填"))?;
+                Some(validate_iso_name(raw).map_err(AppError::bad_request)?)
+            }
+        },
     };
     if source_mode == SourceMode::Iso && request.delta_image_id.is_some() {
         return Err(AppError::bad_request("source=iso 不支持 delta_image_id"));
@@ -1245,13 +1412,17 @@ pub async fn create_build_session(
                 None,
             )
         }
-        SourceMode::Iso => {
-            // preparing 的第一步：确认目标机 ISO 目录里存在该 ISO（记录 request_id，
-            // GET 时轮询结果）。下发失败（设备离线/无存活证书）直接返回错误且不建会话。
-            let request_id =
-                enqueue_session_vm_command(&state, serial, "iso.list", json!({})).await?;
-            (None, None, None, Some(request_id))
-        }
+        SourceMode::Iso => match &iso_asset {
+            // v3：平台 ISO 库。preparing 首步生成 presigned GET 并下发 iso.pull，
+            // 由会话创建后的 start_iso_distribution 完成（GET 幂等重试）。
+            Some(_) => (None, None, None, None),
+            // v2 兼容：确认目标机 ISO 目录里存在该 ISO（记录 request_id，GET 时轮询）。
+            None => {
+                let request_id =
+                    enqueue_session_vm_command(&state, serial, "iso.list", json!({})).await?;
+                (None, None, None, Some(request_id))
+            }
+        },
     };
 
     // ---- 写会话 ----
@@ -1264,6 +1435,7 @@ pub async fn create_build_session(
         build_vm_name: build_vm_name(session_id),
         source_mode,
         iso_name: iso_name.clone(),
+        iso_id: iso_asset.as_ref().map(|iso| iso.id),
         disk_bus,
         nic,
         base_image_id,
@@ -1279,6 +1451,12 @@ pub async fn create_build_session(
         description,
     };
     let session = state.image_studio.create_session(&new_session).await?;
+    // v3：平台 ISO 库会话 → 立即生成 presigned GET 并下发 iso.pull（失败由 GET 重试）。
+    let session = if session.iso_id.is_some() {
+        start_iso_distribution(&state, session).await?
+    } else {
+        session
+    };
 
     record_session_audit(
         &state,
@@ -1290,6 +1468,7 @@ pub async fn create_build_session(
             "machine_serial": session.machine_serial,
             "source_mode": session.source_mode.as_str(),
             "iso_name": session.iso_name,
+            "iso_id": session.iso_id,
             "disk_bus": session.disk_bus.as_str(),
             "nic": session.nic.as_str(),
             "base_image_id": session.base_image_id,
@@ -1601,6 +1780,37 @@ mod tests {
         assert!(iso.base_image_id.is_none());
         assert_eq!(iso.iso_name.as_deref(), Some("Win10_LTSC_2021.iso"));
         assert_eq!(iso.disk_bus.as_deref(), Some("sata"));
+
+        // v3：iso_id（平台 ISO 库）也可用，且与 iso_name 二选一。
+        let iso_asset: CreateBuildSessionRequest = serde_json::from_value(json!({
+            "room_id": Uuid::nil(),
+            "machine_serial": "dev-b104",
+            "source": "iso",
+            "iso_id": Uuid::nil(),
+            "name": "win10-ltsc",
+            "version": "0.2.0",
+        }))
+        .expect("iso_id request");
+        assert_eq!(iso_asset.iso_id, Some(Uuid::nil()));
+        assert!(iso_asset.iso_name.is_none());
+    }
+
+    #[test]
+    fn iso_source_selection_requires_exactly_one() {
+        // base：两个都不能给。
+        assert!(validate_iso_source_selection(SourceMode::Base, None, None).is_ok());
+        assert!(
+            validate_iso_source_selection(SourceMode::Base, Some(Uuid::new_v4()), None).is_err()
+        );
+        assert!(validate_iso_source_selection(SourceMode::Base, None, Some("a.iso")).is_err());
+        // iso：必须二选一，同时给报错。
+        let iso_id = Uuid::new_v4();
+        assert!(validate_iso_source_selection(SourceMode::Iso, Some(iso_id), None).is_ok());
+        assert!(validate_iso_source_selection(SourceMode::Iso, None, Some("a.iso")).is_ok());
+        assert!(
+            validate_iso_source_selection(SourceMode::Iso, Some(iso_id), Some("a.iso")).is_err()
+        );
+        assert!(validate_iso_source_selection(SourceMode::Iso, None, None).is_err());
     }
 
     #[test]
@@ -1640,6 +1850,8 @@ mod tests {
             build_vm_name: "qe-build-a1b2c3d4".to_owned(),
             source_mode,
             iso_name: (source_mode == SourceMode::Iso).then(|| "Win10_LTSC_2021.iso".to_owned()),
+            iso_id: None,
+            iso_pull_request_id: None,
             disk_bus: source_mode.default_disk_bus(),
             nic: NicMode::None,
             media_ejected: false,
@@ -1689,6 +1901,28 @@ mod tests {
         ] {
             assert!(!state.is_terminal(), "{state}");
         }
+    }
+
+    #[test]
+    fn iso_asset_session_steps_flow() {
+        // iso_id 会话：7 步含 iso_distribute；preparing 未发 iso.pull 时校验中。
+        let mut session = session_with(SourceMode::Iso, BuildState::Preparing);
+        session.iso_id = Some(Uuid::new_v4());
+        let steps = crate::domain::image_studio::session_steps(&session, None);
+        let keys: Vec<&str> = steps.iter().map(|step| step.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            crate::domain::image_studio::ISO_ID_STEP_KEYS,
+            "iso_id 会话应有 7 步"
+        );
+        // 已发 iso.pull → 分发中。
+        session.iso_pull_request_id = Some(Uuid::new_v4());
+        let steps = crate::domain::image_studio::session_steps(&session, None);
+        assert_eq!(steps[1].key, "iso_distribute");
+        assert_eq!(
+            steps[1].status,
+            crate::domain::image_studio::StepStatus::Running
+        );
     }
 
     #[test]
@@ -1791,6 +2025,7 @@ mod tests {
             "build_vm_name",
             "source_mode",
             "iso_name",
+            "iso_id",
             "disk_bus",
             "nic",
             "media_ejected",
@@ -1817,6 +2052,7 @@ mod tests {
         assert_eq!(value["nic"], json!("none"));
         assert_eq!(value["media_ejected"], json!(false));
         assert!(value["iso_name"].is_null());
+        assert!(value["iso_id"].is_null());
         assert!(value["image_id"].is_null());
         assert!(value["base_transfer"].is_null());
         assert_eq!(value["steps"].as_array().unwrap().len(), 5);

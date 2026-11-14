@@ -8,6 +8,7 @@ pub mod email;
 pub mod error;
 pub mod image_build;
 pub mod image_studio_worker;
+pub mod iso_seed;
 pub mod presence;
 pub mod scheduler;
 pub mod state;
@@ -83,6 +84,13 @@ pub async fn run() -> anyhow::Result<()> {
     // 镜像构建会话超时回收：>2h 非终态会话 → 回收构建 VM + expired（契约 image-studio.md §3.2）。
     let _image_studio_reaper = image_studio_worker::spawn(state.clone());
     tracing::info!("镜像构建会话超时回收已启动（60s/轮）");
+
+    // 平台 ISO 资产库：启动时后台扫描一次 ISO_SEED_DIR（不阻塞启动，失败只 warn）。
+    iso_seed::spawn_initial_scan(state.clone());
+    tracing::info!(
+        dir = %state.config.iso_seed_dir.display(),
+        "ISO seed 目录启动扫描已排队"
+    );
 
     if config.device_presence_enabled {
         let _presence = presence::spawn(state.clone());

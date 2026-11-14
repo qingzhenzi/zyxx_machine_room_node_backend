@@ -269,6 +269,11 @@ pub struct BuildSession {
     pub source_mode: SourceMode,
     /// iso 模式：目标机器 ISO 目录下的文件名（服务端只存文件名，不存宿主路径）。
     pub iso_name: Option<String>,
+    /// iso 模式（v3）：引用平台 ISO 资产库（`install_isos.id`）；None = 兼容 v2 的
+    /// 「目标机已有 ISO」路径。
+    pub iso_id: Option<Uuid>,
+    /// iso 资产分发命令（`vm.command iso.pull`）的 request_id。
+    pub iso_pull_request_id: Option<Uuid>,
     pub disk_bus: DiskBus,
     pub nic: NicMode,
     /// iso 模式：安装完成后是否已弹出 ISO（eject ok 后置 true，finish 前必须为 true）。
@@ -319,6 +324,9 @@ pub struct NewBuildSession {
     pub source_mode: SourceMode,
     /// iso 模式：目标机器 ISO 目录下的文件名（服务端只存文件名，不存宿主路径）。
     pub iso_name: Option<String>,
+    /// iso 模式（v3）：引用平台 ISO 资产库（`install_isos.id`）；None = 兼容 v2 的
+    /// 「目标机已有 ISO」路径。
+    pub iso_id: Option<Uuid>,
     pub disk_bus: DiskBus,
     pub nic: NicMode,
     /// iso 模式 preparing 阶段 `vm.command iso.list` 的 request_id。
@@ -475,7 +483,7 @@ impl BuildStep {
 /// base 模式 `steps[]` 的 key 顺序（契约 §3.2.1）。
 pub const STEP_KEYS: [&str; 5] = ["base_pull", "create_vm", "console", "shutdown", "upload"];
 
-/// iso 模式 `steps[]` 的 key 顺序（契约 A.3.2）。
+/// iso 模式 `steps[]` 的 key 顺序（契约 A.3.2：目标机已有 ISO）。
 pub const ISO_STEP_KEYS: [&str; 6] = [
     "iso_check",
     "create_vm",
@@ -485,10 +493,22 @@ pub const ISO_STEP_KEYS: [&str; 6] = [
     "upload",
 ];
 
-/// 会话 `steps[]` 的 key 顺序（按来源模式）。
-pub fn step_keys(source_mode: SourceMode) -> &'static [&'static str] {
+/// iso 资产模式 `steps[]` 的 key 顺序（契约 B.3：平台 ISO 库需先分发到目标机）。
+pub const ISO_ID_STEP_KEYS: [&str; 7] = [
+    "iso_check",
+    "iso_distribute",
+    "create_vm",
+    "install",
+    "eject_iso",
+    "shutdown",
+    "upload",
+];
+
+/// 会话 `steps[]` 的 key 顺序（按来源模式；iso 资产模式多一步 `iso_distribute`）。
+pub fn step_keys(source_mode: SourceMode, iso_id: Option<Uuid>) -> &'static [&'static str] {
     match source_mode {
         SourceMode::Base => &STEP_KEYS,
+        SourceMode::Iso if iso_id.is_some() => &ISO_ID_STEP_KEYS,
         SourceMode::Iso => &ISO_STEP_KEYS,
     }
 }
@@ -635,113 +655,197 @@ fn set_step(steps: &mut [BuildStep], index: usize, status: StepStatus, detail: &
     }
 }
 
-/// iso 模式 steps（契约 A.3.2）：
-/// `iso_check → create_vm → install → eject_iso → shutdown → upload`。
+/// iso 模式 steps（契约 A.3.2 / B.3）：
+/// - 目标机已有 ISO（v2）：`iso_check → create_vm → install → eject_iso → shutdown → upload`；
+/// - 平台 ISO 资产（v3）：多一步 `iso_distribute`（vm.command iso.pull）。
 fn iso_session_steps(session: &BuildSession) -> Vec<BuildStep> {
     let iso_name = session.iso_name.as_deref().unwrap_or("");
     let iso_ok_detail = format!("ISO 已找到：{iso_name}");
-    let mut steps = vec![
-        BuildStep::new("iso_check", "校验安装 ISO", StepStatus::Pending, ""),
-        BuildStep::new("create_vm", "创建安装虚拟机", StepStatus::Pending, ""),
-        BuildStep::new("install", "远程安装/配置", StepStatus::Pending, ""),
-        BuildStep::new("eject_iso", "弹出 ISO", StepStatus::Pending, ""),
-        BuildStep::new("shutdown", "关机", StepStatus::Pending, ""),
-        BuildStep::new("upload", "导出并分片上传", StepStatus::Pending, ""),
-    ];
+    let has_distribute = session.iso_id.is_some();
+    // 各步骤索引（资产模式整体后移一位）。
+    let (create_index, install_index, eject_index, shutdown_index, upload_index) = if has_distribute
+    {
+        (2, 3, 4, 5, 6)
+    } else {
+        (1, 2, 3, 4, 5)
+    };
+    let mut steps = Vec::with_capacity(if has_distribute { 7 } else { 6 });
+    steps.push(BuildStep::new(
+        "iso_check",
+        "校验安装 ISO",
+        StepStatus::Pending,
+        "",
+    ));
+    if has_distribute {
+        steps.push(BuildStep::new(
+            "iso_distribute",
+            "分发 ISO 到目标机",
+            StepStatus::Pending,
+            "",
+        ));
+    }
+    steps.push(BuildStep::new(
+        "create_vm",
+        "创建安装虚拟机",
+        StepStatus::Pending,
+        "",
+    ));
+    steps.push(BuildStep::new(
+        "install",
+        "远程安装/配置",
+        StepStatus::Pending,
+        "",
+    ));
+    steps.push(BuildStep::new(
+        "eject_iso",
+        "弹出 ISO",
+        StepStatus::Pending,
+        "",
+    ));
+    steps.push(BuildStep::new("shutdown", "关机", StepStatus::Pending, ""));
+    steps.push(BuildStep::new(
+        "upload",
+        "导出并分片上传",
+        StepStatus::Pending,
+        "",
+    ));
 
     match session.state {
-        BuildState::Preparing => set_step(&mut steps, 0, StepStatus::Running, "校验安装 ISO…"),
+        BuildState::Preparing => {
+            if session.iso_pull_request_id.is_some() {
+                // v3：iso.list 校验已完成，正在分发 ISO。
+                set_step(&mut steps, 0, StepStatus::Ok, &iso_ok_detail);
+                set_step(&mut steps, 1, StepStatus::Running, "分发中…");
+            } else if has_distribute {
+                // 校验 ISO 资产 + 生成下载链接（还未入队 iso.pull）。
+                set_step(&mut steps, 0, StepStatus::Running, "校验 ISO 资产…");
+            } else {
+                set_step(&mut steps, 0, StepStatus::Running, "校验安装 ISO…");
+            }
+        }
         BuildState::Creating => {
             set_step(&mut steps, 0, StepStatus::Ok, &iso_ok_detail);
-            set_step(&mut steps, 1, StepStatus::Running, "创建中…");
+            if has_distribute {
+                set_step(&mut steps, 1, StepStatus::Ok, "ISO 已分发到目标机");
+            }
+            set_step(&mut steps, create_index, StepStatus::Running, "创建中…");
         }
         BuildState::Installing => {
             set_step(&mut steps, 0, StepStatus::Ok, &iso_ok_detail);
+            if has_distribute {
+                set_step(&mut steps, 1, StepStatus::Ok, "ISO 已分发到目标机");
+            }
             set_step(
                 &mut steps,
-                1,
+                create_index,
                 StepStatus::Ok,
                 session.build_vm_name.as_str(),
             );
-            set_step(&mut steps, 2, StepStatus::Running, "等待在 VM 内完成安装…");
             set_step(
                 &mut steps,
-                3,
+                install_index,
+                StepStatus::Running,
+                "等待在 VM 内完成安装…",
+            );
+            set_step(
+                &mut steps,
+                eject_index,
                 StepStatus::Pending,
                 "安装完成后点『安装完成，弹出 ISO』",
             );
         }
         BuildState::Ejecting => {
             set_step(&mut steps, 0, StepStatus::Ok, &iso_ok_detail);
+            if has_distribute {
+                set_step(&mut steps, 1, StepStatus::Ok, "ISO 已分发到目标机");
+            }
             set_step(
                 &mut steps,
-                1,
+                create_index,
                 StepStatus::Ok,
                 session.build_vm_name.as_str(),
             );
-            set_step(&mut steps, 2, StepStatus::Ok, "安装完成");
-            set_step(&mut steps, 3, StepStatus::Running, "正在弹出 ISO…");
+            set_step(&mut steps, install_index, StepStatus::Ok, "安装完成");
+            set_step(
+                &mut steps,
+                eject_index,
+                StepStatus::Running,
+                "正在弹出 ISO…",
+            );
         }
         BuildState::Ready | BuildState::Finishing | BuildState::Making | BuildState::Done => {
             set_step(&mut steps, 0, StepStatus::Ok, &iso_ok_detail);
+            if has_distribute {
+                set_step(&mut steps, 1, StepStatus::Ok, "ISO 已分发到目标机");
+            }
             set_step(
                 &mut steps,
-                1,
+                create_index,
                 StepStatus::Ok,
                 session.build_vm_name.as_str(),
             );
-            set_step(&mut steps, 2, StepStatus::Ok, "安装完成");
-            set_step(&mut steps, 3, StepStatus::Ok, "ISO 已弹出");
+            set_step(&mut steps, install_index, StepStatus::Ok, "安装完成");
+            set_step(&mut steps, eject_index, StepStatus::Ok, "ISO 已弹出");
         }
-        // 取消/超时：已完成的阶段（由 command id 推断）保留 ok，其余在下面标 pending。
-        BuildState::Cancelled | BuildState::Expired => {
-            if session.create_request_id.is_some() {
+        BuildState::Failed => {
+            // 已完成的阶段（由 command id 推断）保留 ok；失败步骤在下面标 error。
+            if session.iso_pull_request_id.is_some() {
                 set_step(&mut steps, 0, StepStatus::Ok, &iso_ok_detail);
             }
-            if session.eject_request_id.is_some() {
-                set_step(
-                    &mut steps,
-                    1,
-                    StepStatus::Ok,
-                    session.build_vm_name.as_str(),
-                );
-                set_step(&mut steps, 2, StepStatus::Ok, "安装完成");
+            let distributed = session.create_request_id.is_some()
+                || session.eject_request_id.is_some()
+                || session.shutdown_request_id.is_some()
+                || session.make_request_id.is_some();
+            if has_distribute && distributed {
+                set_step(&mut steps, 1, StepStatus::Ok, "ISO 已分发到目标机");
             }
         }
         _ => {}
     }
 
     match session.state {
-        BuildState::Finishing => set_step(&mut steps, 4, StepStatus::Running, "关机中…"),
-        BuildState::Making | BuildState::Done => set_step(&mut steps, 4, StepStatus::Ok, "已关机"),
+        BuildState::Finishing => {
+            set_step(&mut steps, shutdown_index, StepStatus::Running, "关机中…")
+        }
+        BuildState::Making | BuildState::Done => {
+            set_step(&mut steps, shutdown_index, StepStatus::Ok, "已关机")
+        }
         _ => {}
     }
     match session.state {
-        BuildState::Making => set_step(&mut steps, 5, StepStatus::Running, "导出并上传中…"),
+        BuildState::Making => set_step(
+            &mut steps,
+            upload_index,
+            StepStatus::Running,
+            "导出并上传中…",
+        ),
         BuildState::Done => {
             let detail = session
                 .image_id
                 .map(|id| format!("已生成镜像 {id}"))
                 .unwrap_or_else(|| "已完成".to_owned());
-            set_step(&mut steps, 5, StepStatus::Ok, &detail);
+            set_step(&mut steps, upload_index, StepStatus::Ok, &detail);
         }
         _ => {}
     }
 
     match session.state {
         BuildState::Failed => {
-            // 定位失败步骤：make → shutdown → eject → create_vm → iso_check。
+            // 定位失败步骤：make → shutdown → eject → create_vm → distribute → iso_check。
             let failed_index = if session.make_request_id.is_some()
                 || session.image_id.is_some()
                 || session.shutdown_request_id.is_some() && session.destroy_request_id.is_some()
             {
-                5
+                upload_index
             } else if session.shutdown_request_id.is_some() {
-                4
+                shutdown_index
             } else if session.eject_request_id.is_some() {
-                3
+                eject_index
             } else if session.create_request_id.is_some() {
-                1
+                create_index
+            } else if !has_distribute || session.iso_pull_request_id.is_some() {
+                // 资产模式：已发 iso.pull 但没到 create → 分发失败；v2 未到 create → 校验失败。
+                if has_distribute { 1 } else { 0 }
             } else {
                 0
             };
@@ -757,6 +861,22 @@ fn iso_session_steps(session: &BuildSession) -> Vec<BuildStep> {
             }
         }
         BuildState::Cancelled => {
+            // 已完成的阶段（由 command id 推断）保留 ok，其余标 pending。
+            if session.create_request_id.is_some() {
+                set_step(&mut steps, 0, StepStatus::Ok, &iso_ok_detail);
+                if has_distribute {
+                    set_step(&mut steps, 1, StepStatus::Ok, "ISO 已分发到目标机");
+                }
+            }
+            if session.eject_request_id.is_some() {
+                set_step(
+                    &mut steps,
+                    create_index,
+                    StepStatus::Ok,
+                    session.build_vm_name.as_str(),
+                );
+                set_step(&mut steps, install_index, StepStatus::Ok, "安装完成");
+            }
             for step in steps.iter_mut() {
                 if step.status != StepStatus::Ok {
                     step.status = StepStatus::Pending;
@@ -827,6 +947,8 @@ mod tests {
             build_vm_name: build_vm_name(Uuid::nil()),
             source_mode: SourceMode::Base,
             iso_name: None,
+            iso_id: None,
+            iso_pull_request_id: None,
             disk_bus: DiskBus::Virtio,
             nic: NicMode::None,
             media_ejected: false,
@@ -1216,8 +1338,12 @@ mod tests {
 
     #[test]
     fn iso_steps_full_state_machine() {
-        assert_eq!(step_keys(SourceMode::Iso), &ISO_STEP_KEYS);
-        assert_eq!(step_keys(SourceMode::Base), &STEP_KEYS);
+        assert_eq!(step_keys(SourceMode::Iso, None), &ISO_STEP_KEYS);
+        assert_eq!(step_keys(SourceMode::Base, None), &STEP_KEYS);
+        assert_eq!(
+            step_keys(SourceMode::Iso, Some(Uuid::new_v4())),
+            &ISO_ID_STEP_KEYS
+        );
 
         // preparing：校验 ISO 中。
         let steps = session_steps(&iso_session(BuildState::Preparing), None);
@@ -1291,6 +1417,75 @@ mod tests {
             assert_eq!(step.status, StepStatus::Ok, "step {} not ok", step.key);
         }
         assert!(steps[5].detail.contains("已生成镜像"));
+    }
+
+    fn iso_asset_session(state: BuildState) -> BuildSession {
+        let mut session = iso_session(state);
+        session.iso_id = Some(Uuid::new_v4());
+        session
+    }
+
+    #[test]
+    fn iso_asset_steps_include_distribute() {
+        // preparing（未发 iso.pull）：校验 ISO 资产中。
+        let session = iso_asset_session(BuildState::Preparing);
+        let steps = session_steps(&session, None);
+        let keys: Vec<&str> = steps.iter().map(|step| step.key.as_str()).collect();
+        assert_eq!(keys, ISO_ID_STEP_KEYS);
+        assert_eq!(steps[0].status, StepStatus::Running);
+        assert_eq!(steps[1].status, StepStatus::Pending);
+
+        // preparing（已发 iso.pull）：校验 ok，分发中。
+        let mut session = iso_asset_session(BuildState::Preparing);
+        session.iso_pull_request_id = Some(Uuid::new_v4());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[0].status, StepStatus::Ok);
+        assert_eq!(steps[1].status, StepStatus::Running);
+        assert!(steps[1].detail.contains("分发"));
+
+        // creating：分发完成，创建 VM。
+        let mut session = iso_asset_session(BuildState::Creating);
+        session.iso_pull_request_id = Some(Uuid::new_v4());
+        session.create_request_id = Some(Uuid::new_v4());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[1].status, StepStatus::Ok);
+        assert_eq!(steps[2].status, StepStatus::Running);
+
+        // installing：安装中（eject_iso 在索引 4）。
+        let mut session = iso_asset_session(BuildState::Installing);
+        session.create_request_id = Some(Uuid::new_v4());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[3].status, StepStatus::Running);
+        assert_eq!(steps[4].status, StepStatus::Pending);
+
+        // done：全部 ok。
+        let mut session = iso_asset_session(BuildState::Done);
+        session.create_request_id = Some(Uuid::new_v4());
+        session.eject_request_id = Some(Uuid::new_v4());
+        session.shutdown_request_id = Some(Uuid::new_v4());
+        session.make_request_id = Some(Uuid::new_v4());
+        session.image_id = Some(Uuid::new_v4());
+        let steps = session_steps(&session, None);
+        for step in &steps {
+            assert_eq!(step.status, StepStatus::Ok, "step {} not ok", step.key);
+        }
+    }
+
+    #[test]
+    fn iso_asset_steps_mark_distribute_failure() {
+        let mut session = iso_asset_session(BuildState::Failed);
+        session.iso_pull_request_id = Some(Uuid::new_v4());
+        session.error = Some("presign 失败".to_owned());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[0].status, StepStatus::Ok);
+        assert_eq!(steps[1].status, StepStatus::Error);
+        assert!(steps[1].detail.contains("presign"));
+
+        // 未发 iso.pull 的失败（资产不可用）→ iso_check 失败。
+        let mut session = iso_asset_session(BuildState::Failed);
+        session.error = Some("ISO 不可用".to_owned());
+        let steps = session_steps(&session, None);
+        assert_eq!(steps[0].status, StepStatus::Error);
     }
 
     #[test]

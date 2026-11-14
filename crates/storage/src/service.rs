@@ -150,6 +150,16 @@ impl StorageService {
         object_key: &str,
         timestamp: DateTime<Utc>,
     ) -> Result<PresignedUrl> {
+        self.presign_with_ttl(method, object_key, timestamp, self.options.presign_ttl_secs)
+    }
+
+    fn presign_with_ttl(
+        &self,
+        method: &str,
+        object_key: &str,
+        timestamp: DateTime<Utc>,
+        ttl_secs: u64,
+    ) -> Result<PresignedUrl> {
         let path = self.object_path(object_key)?;
         let host = self.object_host();
         let url = sigv4::presign_url(&QueryPresign {
@@ -161,12 +171,25 @@ impl StorageService {
             secret_key: &self.options.secret_key,
             region: &self.options.region,
             timestamp,
-            expires_secs: self.options.presign_ttl_secs,
+            expires_secs: ttl_secs,
         });
         Ok(PresignedUrl {
             url,
-            expires_at: timestamp + TimeDelta::seconds(self.options.presign_ttl_secs as i64),
+            expires_at: timestamp + TimeDelta::seconds(ttl_secs as i64),
         })
+    }
+
+    /// 自定义 TTL 的预签名 GET（用于 ISO 分发等大文件下载）。
+    ///
+    /// TTL 同样受 60s..=86400s 约束（SigV4 query 预签名上限 7 天，这里沿用存储配置范围）。
+    /// 不修改全局 `presign_ttl_secs`，避免影响镜像分片等短 TTL 场景。
+    pub fn presign_get_with_ttl(&self, object_key: &str, ttl_secs: u64) -> Result<PresignedUrl> {
+        if !(MIN_PRESIGN_TTL_SECS..=MAX_PRESIGN_TTL_SECS).contains(&ttl_secs) {
+            bail!(
+                "presign ttl 需在 {MIN_PRESIGN_TTL_SECS}-{MAX_PRESIGN_TTL_SECS} 秒之间，收到 {ttl_secs}"
+            );
+        }
+        self.presign_with_ttl("GET", object_key, Utc::now(), ttl_secs)
     }
 
     /// 服务端读取：内部用预签名 GET + reqwest，返回完整字节（上限 64 MiB）。
@@ -226,7 +249,9 @@ impl StorageService {
             .header(reqwest::header::RANGE, "bytes=0-0")
             .send()
             .await
-            .map_err(|error| transport_error("读取 S3 对象大小失败（range 回退）", object_key, error))?;
+            .map_err(|error| {
+                transport_error("读取 S3 对象大小失败（range 回退）", object_key, error)
+            })?;
         let status = response.status();
         if status.as_u16() == 404 {
             return Ok(None);
@@ -314,6 +339,49 @@ impl StorageService {
             bail!("写入 S3 对象失败：{object_key}（HTTP {}）", status.as_u16());
         }
         Ok(())
+    }
+
+    /// 服务端流式上传本地文件（ISO 等大文件，不读入内存）。
+    ///
+    /// - 用预签名 PUT + `ReaderStream` 流式 body，并显式带 `Content-Length`；
+    /// - `timeout` 覆盖整个上传（大文件需要远长于普通请求的 60s）；
+    /// - 返回上传的字节数（以本地文件大小为准，调用方据此回填记录）。
+    pub async fn put_file(
+        &self,
+        object_key: &str,
+        path: &std::path::Path,
+        content_type: &str,
+        timeout: Duration,
+    ) -> Result<u64> {
+        let file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("打开待上传文件失败：{}", path.display()))?;
+        let size = file
+            .metadata()
+            .await
+            .with_context(|| format!("读取待上传文件大小失败：{}", path.display()))?
+            .len();
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let body = reqwest::Body::wrap_stream(stream);
+        let presigned = self.presign_put(object_key, Some(content_type))?;
+        let response = self
+            .client
+            .put(&presigned.url)
+            .timeout(timeout)
+            .header(CONTENT_TYPE, content_type)
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| transport_error("流式写入 S3 对象失败", object_key, error))?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!(
+                "流式写入 S3 对象失败：{object_key}（HTTP {}）",
+                status.as_u16()
+            );
+        }
+        Ok(size)
     }
 
     /// Ed25519 对 manifest 原始字节签名，返回 64 字节。
@@ -612,6 +680,32 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn custom_ttl_presign_bounds_and_expiry() {
+        let service = build_service(options());
+        // 默认 900s。
+        let default = service.presign_get("isos/x/a.iso").unwrap();
+        assert!(default.url.contains("X-Amz-Expires=900"));
+        // 自定义 2h：用于 ISO 分发（契约要求 >=1h）。
+        let long = service.presign_get_with_ttl("isos/x/a.iso", 7_200).unwrap();
+        assert!(long.url.contains("X-Amz-Expires=7200"));
+        assert!(long.url.contains("X-Amz-Signature="));
+        let now = Utc::now();
+        assert!(
+            long.expires_at > now + chrono::TimeDelta::seconds(3_600),
+            "TTL 应 >= 1h"
+        );
+        // 越界 TTL 拒绝（SigV4 范围）。
+        assert!(service.presign_get_with_ttl("isos/x/a.iso", 10).is_err());
+        assert!(
+            service
+                .presign_get_with_ttl("isos/x/a.iso", 86_401)
+                .is_err()
+        );
+        // 非法 key 仍然被拒绝。
+        assert!(service.presign_get_with_ttl("/abs.iso", 7_200).is_err());
     }
 
     #[test]

@@ -33,6 +33,8 @@ tokio = { version = "1", features = [
     "net",
     "sync",
     "time",
+    "fs",
+    "io-util",
 ] }
 tower = "0.5"
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }

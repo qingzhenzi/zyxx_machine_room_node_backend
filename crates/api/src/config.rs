@@ -98,6 +98,13 @@ pub struct Config {
     pub machine_snapshot_keep: i64,
     /// 未配置 `S3_ENDPOINT` + `S3_BUCKET` 时为 None，存储/镜像接口返回 503。
     pub storage: Option<StorageConfig>,
+    // ---- 平台 ISO 资产库（image-studio 附录 B）----
+    /// 服务端数据目录（ISO 上传临时文件落在 `<data_dir>/iso-uploads`）。
+    /// `DATA_DIR`，默认 `/var/lib/qe-control`。
+    pub data_dir: std::path::PathBuf,
+    /// seed 目录：启动/手动扫描其中的 `.iso` 并登记为预设 ISO。
+    /// `ISO_SEED_DIR`，默认 `<data_dir>/iso-seeds`。
+    pub iso_seed_dir: std::path::PathBuf,
 }
 
 /// S3 兼容存储配置（RustFS / MinIO / Ceph 等）。
@@ -254,6 +261,14 @@ impl Config {
 
         let storage = parse_storage_config()?;
 
+        let data_dir = std::path::PathBuf::from(
+            env_optional("DATA_DIR").unwrap_or_else(|| "/var/lib/qe-control".to_owned()),
+        );
+        let iso_seed_dir = std::path::PathBuf::from(
+            env_optional("ISO_SEED_DIR")
+                .unwrap_or_else(|| data_dir.join("iso-seeds").to_string_lossy().into_owned()),
+        );
+
         reject_insecure_production_defaults(
             environment,
             &jwt_secret,
@@ -327,6 +342,8 @@ impl Config {
                 .trim_end_matches('/')
                 .to_owned(),
             storage,
+            data_dir,
+            iso_seed_dir,
         })
     }
 

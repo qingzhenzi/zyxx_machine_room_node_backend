@@ -26,6 +26,8 @@ pub enum AppError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    PayloadTooLarge(String),
+    #[error("{0}")]
     UnprocessableEntity(String),
     #[error("{0}")]
     TooManyRequests(String),
@@ -62,6 +64,11 @@ impl AppError {
         Self::Conflict(message.into())
     }
 
+    /// 413：请求体超过接口允许的大小（如 ISO 上传超过 16 GiB）。
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self::PayloadTooLarge(message.into())
+    }
+
     /// 422：请求语义合法，但当前资源状态无法完成操作（如机器没有可用 MAC）。
     pub fn unprocessable_entity(message: impl Into<String>) -> Self {
         Self::UnprocessableEntity(message.into())
@@ -92,6 +99,7 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
@@ -108,6 +116,7 @@ impl AppError {
             Self::NotFound(_) => "not_found",
             Self::MethodNotAllowed(_) => "method_not_allowed",
             Self::Conflict(_) => "conflict",
+            Self::PayloadTooLarge(_) => "payload_too_large",
             Self::UnprocessableEntity(_) => "unprocessable_entity",
             Self::TooManyRequests(_) => "too_many_requests",
             Self::BadGateway(_) => "bad_gateway",

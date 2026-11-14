@@ -28,7 +28,7 @@ use crate::error::{DbError, DbResult};
 const TERMINAL_STATES: [&str; 4] = ["done", "failed", "cancelled", "expired"];
 
 const SESSION_COLUMNS: &str = "id, user_id, room_id, machine_serial, build_vm_name,
-     source_mode, iso_name, disk_bus, nic, media_ejected,
+     source_mode, iso_name, iso_id, iso_pull_request_id, disk_bus, nic, media_ejected,
      base_image_id, delta_image_id, base_transfer_id, name, version, platform,
      vcpus, memory_mib, disk_gb, description, state, error,
      create_request_id, shutdown_request_id, destroy_request_id, make_request_id, image_id,
@@ -36,7 +36,8 @@ const SESSION_COLUMNS: &str = "id, user_id, room_id, machine_serial, build_vm_na
 
 /// `expire_stale_sessions` 的 `UPDATE ... FROM stale` 需要带表别名的列。
 const SESSION_COLUMNS_QUALIFIED: &str = "s.id, s.user_id, s.room_id, s.machine_serial,
-     s.build_vm_name, s.source_mode, s.iso_name, s.disk_bus, s.nic, s.media_ejected,
+     s.build_vm_name, s.source_mode, s.iso_name, s.iso_id, s.iso_pull_request_id,
+     s.disk_bus, s.nic, s.media_ejected,
      s.base_image_id, s.delta_image_id, s.base_transfer_id, s.name,
      s.version, s.platform, s.vcpus, s.memory_mib, s.disk_gb, s.description, s.state,
      s.error, s.create_request_id, s.shutdown_request_id, s.destroy_request_id,
@@ -89,6 +90,8 @@ struct BuildSessionRow {
     build_vm_name: String,
     source_mode: String,
     iso_name: Option<String>,
+    iso_id: Option<Uuid>,
+    iso_pull_request_id: Option<Uuid>,
     disk_bus: String,
     nic: String,
     media_ejected: bool,
@@ -126,6 +129,8 @@ impl From<BuildSessionRow> for BuildSession {
             build_vm_name: row.build_vm_name,
             source_mode: source_mode_from_str(&row.source_mode),
             iso_name: row.iso_name,
+            iso_id: row.iso_id,
+            iso_pull_request_id: row.iso_pull_request_id,
             disk_bus: disk_bus_from_str(&row.disk_bus),
             nic: nic_mode_from_str(&row.nic),
             media_ejected: row.media_ejected,
@@ -223,6 +228,8 @@ pub struct SessionUpdate {
     pub iso_check_request_id: Option<Uuid>,
     /// iso 模式：ejecting 阶段 `vm.command eject` 的 request_id。
     pub eject_request_id: Option<Uuid>,
+    /// iso 资产模式（v3）：preparing 阶段 `vm.command iso.pull` 的 request_id。
+    pub iso_pull_request_id: Option<Uuid>,
     /// iso 模式：eject ok 后置 true（`Some(false)` 可显式复位，主要用于测试）。
     pub media_ejected: Option<bool>,
 }
@@ -241,6 +248,7 @@ impl SessionUpdate {
             image_id: None,
             iso_check_request_id: None,
             eject_request_id: None,
+            iso_pull_request_id: None,
             media_ejected: None,
         }
     }
@@ -291,6 +299,11 @@ impl SessionUpdate {
         self.media_ejected = Some(media_ejected);
         self
     }
+
+    pub fn with_iso_pull_request(mut self, request_id: Uuid) -> Self {
+        self.iso_pull_request_id = Some(request_id);
+        self
+    }
 }
 
 /// `ensure_image_assigned` 的结果：本次（或已存在的）download transfer。
@@ -317,13 +330,13 @@ impl ImageStudioRepo {
         let sql = format!(
             "INSERT INTO image_build_sessions
                 (id, user_id, room_id, machine_serial, build_vm_name,
-                 source_mode, iso_name, disk_bus, nic,
+                 source_mode, iso_name, iso_id, disk_bus, nic,
                  base_image_id, delta_image_id, base_transfer_id, iso_check_request_id,
                  name, version, platform,
                  vcpus, memory_mib, disk_gb, description, state)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::uuid, $11::uuid,
-                     $12::uuid, $13::uuid,
-                     $14, $15, $16, $17, $18, $19, $20, 'preparing')
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::uuid, $9, $10,
+                     $11::uuid, $12::uuid, $13::uuid, $14::uuid,
+                     $15, $16, $17, $18, $19, $20, $21, 'preparing')
              RETURNING {SESSION_COLUMNS}"
         );
         let row = sqlx::query_as::<_, BuildSessionRow>(&sql)
@@ -334,6 +347,7 @@ impl ImageStudioRepo {
             .bind(&input.build_vm_name)
             .bind(input.source_mode.as_str())
             .bind(input.iso_name.as_deref())
+            .bind(input.iso_id)
             .bind(input.disk_bus.as_str())
             .bind(input.nic.as_str())
             .bind(input.base_image_id)
@@ -435,12 +449,13 @@ impl ImageStudioRepo {
                     iso_check_request_id = COALESCE($9, iso_check_request_id),
                     eject_request_id = COALESCE($10, eject_request_id),
                     media_ejected = COALESCE($11, media_ejected),
+                    iso_pull_request_id = COALESCE($12, iso_pull_request_id),
                     updated_at = now(),
                     finished_at = CASE
-                        WHEN $2 = ANY($12::text[]) THEN COALESCE(finished_at, now())
+                        WHEN $2 = ANY($13::text[]) THEN COALESCE(finished_at, now())
                         ELSE finished_at
                     END
-              WHERE id = $1 AND state = ANY($13::text[])
+              WHERE id = $1 AND state = ANY($14::text[])
               RETURNING {SESSION_COLUMNS}"
         );
         let row = sqlx::query_as::<_, BuildSessionRow>(&sql)
@@ -455,6 +470,7 @@ impl ImageStudioRepo {
             .bind(update.iso_check_request_id)
             .bind(update.eject_request_id)
             .bind(update.media_ejected)
+            .bind(update.iso_pull_request_id)
             .bind(terminal_states.as_slice())
             .bind(from_states.as_slice())
             .fetch_optional(&self.db)
