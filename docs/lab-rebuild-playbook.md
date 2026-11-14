@@ -269,3 +269,75 @@ Windows Update 自动搜索当前返回“最佳驱动已安装”，需要手�
 - Windows Intel VF 驱动未安装（QSV/3D 尚未验证）；
 - Sunshine/Moonlight 未安装；
 - RDP kiosk 当前直连 `10.77.148.174`，IP 变需同步。
+
+## 10. Windows VF 驱动安装（实测 2026-11-14）
+
+Windows 设备管理器已看到 VF：
+
+```text
+PCI\VEN_8086&DEV_4690&SUBSYS_89B4103C
+```
+
+但初始为 Microsoft 基本显示适配器，问题代码 31。Windows Update 自动搜索返回“最佳驱动已安装”，
+需要手动装 Intel DCH 驱动。
+
+### 10.1 驱动包
+
+Microsoft Update Catalog（Windows 10 Vibranium/21H2 匹配）：
+
+- UpdateID：`402bba47-2671-43c4-9088-4421dcc1ce4e`
+- 版本：**32.0.101.7088**
+- CAB 直链：
+  `https://catalog.s.download.windowsupdate.com/d/msdownload/update/driver/drvs/2026/09/258793aa-b29f-4640-bee8-dedfec94faba_fc5b16dc2adfc2c14dedeba820fbaffb5027a44b.cab`
+- 大小约 550MB。
+
+### 10.2 送进 guest
+
+主机上启动临时 HTTP（仅演示 LAN/隔离网）：
+
+```bash
+cd /tmp; python3 -m http.server 18080 --bind 0.0.0.0 --directory /tmp
+# 允许 guest 访问宿主 18080
+nft insert rule inet qe_vm input iifname qevm-0945adec ip daddr 10.77.148.1 tcp dport 18080 accept
+```
+
+Windows（管理员 cmd）：
+
+```bat
+curl -L -o C:\Users\qe\driver.cab http://10.77.148.1:18080/intel-driver.cab
+mkdir C:\Users\qe\driver
+expand -F:* C:\Users\qe\driver.cab C:\Users\qe\driver
+pnputil /add-driver C:\Users\qe\driver\*.inf /install /subdirs
+```
+
+安装输出：
+
+```text
+驱动程序包已安装在设备上: PCI\VEN_8086&DEV_4690&SUBSYS_89B4103C...
+已添加驱动程序包数: 6
+```
+
+### 10.3 生效验证
+
+重启 guest 后：
+
+```bat
+wmic path win32_VideoController get Name,DriverVersion
+```
+
+实测输出：
+
+```text
+10.0.19041.868  Microsoft Remote Display Adapter
+10.0.19041.868  Microsoft 基本显示适配器
+32.0.101.7088    Intel(R) UHD Graphics 770
+```
+
+`pnputil /enum-devices /problem` 中 Intel VF 不再出现（仅剩 QEMU ACPI 和 virtio 未装的两项）。
+
+### 10.4 下一步
+
+- QSV 验证：任务管理器 GPU / `ffmpeg -encoders | findstr qsv` + 实际编码；
+- Sunshine 安装并选 QuickSync；
+- 若 Sunshine 捕获黑屏，加 `ramfb=on` 或虚拟显示驱动；
+- 当前 RDP kiosk 仍可用，作为回退。
