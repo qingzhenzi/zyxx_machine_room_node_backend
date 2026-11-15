@@ -10,7 +10,11 @@
 //!   字段名与下行 `image.pull` payload 保持一致，agent 可直接复用 `ImagePullJob`；
 //! - `transfer_id` 取该房间该镜像最新一条 `direction='download'` 的 transfer
 //!   （没有则 `null`，agent 可用本地随机 UUID 上报，服务端查不到即忽略）；
-//! - `vms[]` 原样透传配置（`base_volume` 可为 `null`，由 agent 侧推导）。
+//! - `vms[]` 原样透传配置（`base_volume` 可为 `null`，由 agent 侧推导）；
+//! - `fallback_enabled` / `fallback_image`：房间启动配置里的 fallback 镜像
+//!   （设备本地缓存、控制面不可达时兜底，契约见 `docs/fallback-image.md`）。
+//!   关闭（`fallback_enabled=false`）时 `fallback_image` 恒为 `null`，不下发条目；
+//!   旧配置反序列化后缺省即关闭。
 //!
 //! 本 crate 不依赖 `qe-api`，因此用 `sqlx::query_as` 直查；配置 JSON 的形状复用
 //! `qe_db::startup::StartupConfig`（与写入端同一 serde 定义，避免两端漂移）。
@@ -65,6 +69,11 @@ pub struct StartupReply {
     pub auto_start_vm: bool,
     pub images: Vec<StartupImage>,
     pub vms: Vec<StartupVm>,
+    /// 是否启用 fallback 镜像（设备本地缓存）；旧服务端/旧配置缺省 false。
+    pub fallback_enabled: bool,
+    /// fallback 镜像条目（字段与 `images[]` 完全同形，可直接复用 `image.pull` 链路）；
+    /// 未启用 / 未选择 / 镜像未发布时为 `null`。
+    pub fallback_image: Option<StartupImage>,
 }
 
 impl StartupReply {
@@ -78,6 +87,8 @@ impl StartupReply {
             auto_start_vm: true,
             images: Vec::new(),
             vms: Vec::new(),
+            fallback_enabled: false,
+            fallback_image: None,
         }
     }
 }
@@ -170,6 +181,38 @@ pub async fn get_startup(State(st): State<AppState>, peer: PeerCert) -> Result<J
     } else {
         load_published_images(&st.db, room_id, &effective.image_ids).await?
     };
+    // fallback 镜像单独下发：关闭时一定不进响应（"fallback 必须可配置关闭"）。
+    let fallback_image = if effective.fallback_enabled {
+        match effective.fallback_image_id {
+            Some(image_id) => {
+                let mut found = load_published_images(&st.db, room_id, &[image_id]).await?;
+                match found.pop() {
+                    Some(image) => Some(image),
+                    None => {
+                        tracing::warn!(
+                            %serial,
+                            %slot,
+                            %room_id,
+                            %image_id,
+                            "startup: fallback 镜像未发布或不存在，本次不下发"
+                        );
+                        None
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    %serial,
+                    %slot,
+                    %room_id,
+                    "startup: fallback_enabled=true 但缺少 fallback_image_id，本次不下发"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // 周期 reconcile 每 60s 一次，成功路径用 debug 避免把日志刷满。
     tracing::debug!(
@@ -180,6 +223,7 @@ pub async fn get_startup(State(st): State<AppState>, peer: PeerCert) -> Result<J
         images = images.len(),
         vms = effective.vms.len(),
         from_defaults = defaults.is_some(),
+        fallback = fallback_image.is_some(),
         "startup 配置下发"
     );
 
@@ -191,6 +235,8 @@ pub async fn get_startup(State(st): State<AppState>, peer: PeerCert) -> Result<J
         auto_start_vm: effective.auto_start_vm,
         images,
         vms: effective.vms,
+        fallback_enabled: effective.fallback_enabled,
+        fallback_image,
     }))
 }
 
@@ -203,6 +249,8 @@ struct EffectiveStartup {
     auto_start_vm: bool,
     image_ids: Vec<Uuid>,
     vms: Vec<StartupVm>,
+    fallback_enabled: bool,
+    fallback_image_id: Option<Uuid>,
 }
 
 impl EffectiveStartup {
@@ -214,6 +262,8 @@ impl EffectiveStartup {
             auto_start_vm: true,
             image_ids: Vec::new(),
             vms: Vec::new(),
+            fallback_enabled: false,
+            fallback_image_id: None,
         }
     }
 }
@@ -245,6 +295,13 @@ fn effective_startup(
                 auto_start_vm: profile.config.auto_start_vm,
                 image_ids: merge_default_image_ids(&configured, defaults),
                 vms: profile.config.vms.clone(),
+                // fallback 只来自 startup profile 的 config；禁用/未选择时不下发。
+                fallback_enabled: profile.config.fallback_enabled,
+                fallback_image_id: if profile.config.fallback_enabled {
+                    profile.config.fallback_image_id
+                } else {
+                    None
+                },
             }
         }
         Some(_) => EffectiveStartup::disabled(),
@@ -256,6 +313,8 @@ fn effective_startup(
                 auto_start_vm: true,
                 image_ids: merge_default_image_ids(&[], Some(defaults)),
                 vms: Vec::new(),
+                fallback_enabled: false,
+                fallback_image_id: None,
             },
             None => EffectiveStartup::disabled(),
         },
@@ -354,6 +413,9 @@ mod tests {
         assert_eq!(value["auto_start_vm"], serde_json::json!(true));
         assert_eq!(value["images"], serde_json::json!([]));
         assert_eq!(value["vms"], serde_json::json!([]));
+        // fallback 关闭时明确下发 enabled=false + image=null（不泄漏条目）。
+        assert_eq!(value["fallback_enabled"], serde_json::json!(false));
+        assert!(value["fallback_image"].is_null());
     }
 
     #[test]
@@ -430,6 +492,8 @@ mod tests {
             auto_start_vm: config.auto_start_vm,
             images: vec![image_row().into_reply()],
             vms: config.vms,
+            fallback_enabled: false,
+            fallback_image: None,
         };
         assert!(!reply.auto_pull);
         assert!(reply.auto_start_vm);
@@ -477,6 +541,8 @@ mod tests {
                     auto_start: true,
                     network: None,
                 }],
+                fallback_enabled: false,
+                fallback_image_id: None,
             },
             revision,
             updated_by: Some(Uuid::new_v4()),
@@ -548,6 +614,90 @@ mod tests {
         assert!(!empty.enabled);
         assert_eq!(empty.revision, 0);
         assert!(empty.image_ids.is_empty());
+    }
+
+    #[test]
+    fn effective_startup_propagates_fallback_only_when_enabled() {
+        let fallback_id = Uuid::new_v4();
+
+        // 启用 fallback：effective 带上 id，供主流程单独下发。
+        let mut enabled_profile = profile(true, 7, vec![]);
+        enabled_profile.config.fallback_enabled = true;
+        enabled_profile.config.fallback_image_id = Some(fallback_id);
+        let effective = effective_startup(Some(&enabled_profile), None);
+        assert!(effective.fallback_enabled);
+        assert_eq!(effective.fallback_image_id, Some(fallback_id));
+
+        // 关闭 fallback：即使配置里还留着 id，也不下发（可配置关闭）。
+        let mut fallback_off = profile(true, 7, vec![]);
+        fallback_off.config.fallback_enabled = false;
+        fallback_off.config.fallback_image_id = Some(fallback_id);
+        let effective = effective_startup(Some(&fallback_off), None);
+        assert!(!effective.fallback_enabled);
+        assert_eq!(effective.fallback_image_id, None);
+
+        // profile 显式停用：fallback 一并清空。
+        let mut disabled_profile = profile(false, 7, vec![]);
+        disabled_profile.config.fallback_enabled = true;
+        disabled_profile.config.fallback_image_id = Some(fallback_id);
+        let effective = effective_startup(Some(&disabled_profile), None);
+        assert!(!effective.enabled);
+        assert!(!effective.fallback_enabled);
+        assert_eq!(effective.fallback_image_id, None);
+
+        // 只有房间默认底包、没有 startup profile：没有 fallback 来源。
+        let effective = effective_startup(
+            None,
+            Some(&defaults(Uuid::new_v4(), None, chrono::Utc::now())),
+        );
+        assert!(effective.enabled);
+        assert!(!effective.fallback_enabled);
+        assert_eq!(effective.fallback_image_id, None);
+    }
+
+    #[test]
+    fn reply_serializes_fallback_entry_like_normal_image() {
+        let fallback_id = Uuid::new_v4();
+        let mut row = image_row();
+        row.image_id = fallback_id;
+        row.transfer_id = None;
+        let reply = StartupReply {
+            room_id: Some(Uuid::new_v4()),
+            revision: 4,
+            enabled: true,
+            auto_pull: true,
+            auto_start_vm: true,
+            images: Vec::new(),
+            vms: Vec::new(),
+            fallback_enabled: true,
+            fallback_image: Some(row.into_reply()),
+        };
+        let value = serde_json::to_value(&reply).expect("serialize");
+        assert_eq!(value["fallback_enabled"], serde_json::json!(true));
+        assert_eq!(
+            value["fallback_image"]["image_id"],
+            serde_json::json!(fallback_id)
+        );
+        // 条目形状与 images[] 相同：agent 可直接构造 image.pull。
+        for key in [
+            "transfer_id",
+            "name",
+            "version",
+            "kind",
+            "format",
+            "platform",
+            "manifest_digest",
+            "total_size",
+            "chunk_count",
+            "presign_endpoint",
+        ] {
+            assert!(value["fallback_image"].get(key).is_some(), "missing {key}");
+        }
+        assert!(value["fallback_image"]["transfer_id"].is_null());
+        assert_eq!(
+            value["fallback_image"]["presign_endpoint"],
+            serde_json::json!("/resources/presign")
+        );
     }
 
     #[test]

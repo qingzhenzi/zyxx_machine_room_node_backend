@@ -74,6 +74,9 @@ const form = reactive({
   autoStartVm: true,
   imageIds: [] as string[],
   vms: [] as VmFormRow[],
+  /** fallback 镜像（设备本地缓存）：启用后 agent 长期缓存、离线兜底。 */
+  fallbackEnabled: false,
+  fallbackImageId: '',
 })
 
 /** 已发布 vm_disk 镜像 → 底包卷名候选（`<name>-<version>`，导入器落盘规则）。 */
@@ -90,6 +93,17 @@ const targets = computed<RoomStartupTarget[]>(() => profile.value?.targets ?? []
 const activeTargets = computed(() => targets.value.filter((target) => target.serial))
 const savedImages = computed(() => profile.value?.images ?? [])
 const savedVms = computed(() => profile.value?.config.vms ?? [])
+const savedFallbackImage = computed(() => profile.value?.fallback_image ?? null)
+
+/** fallback 镜像候选：当前页已发布 vm_disk + 已保存但不在候选里的镜像。 */
+const fallbackOptions = computed(() => {
+  const options = vmDiskOptions.value.map((option) => ({ id: option.id, label: option.label }))
+  const saved = savedFallbackImage.value
+  if (saved && !options.some((option) => option.id === saved.image_id)) {
+    options.unshift({ id: saved.image_id, label: `${saved.name}-${saved.version}` })
+  }
+  return options
+})
 
 const statusLabel = computed(() => {
   if (!profile.value) return '未配置'
@@ -108,6 +122,8 @@ function resetForm() {
   form.autoPull = config?.auto_pull ?? true
   form.autoStartVm = config?.auto_start_vm ?? true
   form.imageIds = (config?.images ?? []).map((image) => image.image_id)
+  form.fallbackEnabled = config?.fallback_enabled ?? false
+  form.fallbackImageId = config?.fallback_image_id ?? ''
   form.vms = (config?.vms ?? []).map((vm) => ({
     name: vm.name,
     vcpus: vm.vcpus,
@@ -277,6 +293,9 @@ function parseGpu(raw: string): string[] {
 function validate(): string {
   if (form.imageIds.length > MAX_IMAGES) return `镜像最多 ${MAX_IMAGES} 个`
   if (form.vms.length > MAX_VMS) return `VM 最多 ${MAX_VMS} 台`
+  if (form.fallbackEnabled && !form.fallbackImageId) {
+    return 'fallback 镜像：启用后必须选择一个镜像'
+  }
   const seen = new Set<string>()
   for (const [index, vm] of form.vms.entries()) {
     const label = `第 ${index + 1} 台 VM`
@@ -339,6 +358,8 @@ function buildConfig(): RoomStartupConfig {
     auto_pull: form.autoPull,
     auto_start_vm: form.autoStartVm,
     images: form.imageIds.map((imageId) => ({ image_id: imageId })),
+    fallback_enabled: form.fallbackEnabled,
+    fallback_image_id: form.fallbackImageId || null,
     vms: form.vms.map((vm) => {
       const gpu = parseGpu(vm.gpu)
       const network: RoomStartupVmNetwork | null =
@@ -465,6 +486,22 @@ onMounted(() => void load())
               </li>
             </ul>
             <p v-else class="mt-1.5 text-[11px] text-faint">未配置镜像（agent 不会自动拉取）</p>
+            <div class="mt-3 text-[10.5px] font-medium text-faint">
+              fallback 镜像（设备本地缓存）
+            </div>
+            <p class="mt-1 text-[11.5px] leading-5 text-ink-soft">
+              <template v-if="profile?.config.fallback_enabled">
+                <span v-if="savedFallbackImage" class="text-ink">
+                  {{ savedFallbackImage.name }}-{{ savedFallbackImage.version }}
+                </span>
+                <span v-else class="text-amber-600">
+                  已启用，但镜像不可用（未发布/已删除），agent 不会缓存
+                </span>
+              </template>
+              <template v-else>
+                <span class="text-faint">未启用（agent 不缓存、不下载 fallback 镜像）</span>
+              </template>
+            </p>
           </div>
 
           <div>
@@ -555,6 +592,37 @@ onMounted(() => void load())
             </div>
             <p v-else class="mt-1.5 text-[11px] text-faint">
               暂无已发布 vm_disk 镜像：先到「镜像」页发布 VM 磁盘镜像。
+            </p>
+          </div>
+
+          <div class="rounded-lg border border-line/70 bg-canvas/30 px-3 py-2.5">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <label class="flex items-center gap-2 text-[11.5px] text-ink-soft">
+                <ToggleSwitch v-model="form.fallbackEnabled" :disabled="!form.enabled" />
+                启用 fallback 镜像（设备本地缓存）
+              </label>
+              <span class="text-[10.5px] text-faint">
+                控制面不可达时用本地缓存兜底；关闭即停止下发
+              </span>
+            </div>
+            <div class="mt-2 grid grid-cols-2 gap-2">
+              <label class="flex flex-col gap-1 text-[10.5px] text-muted">
+                fallback 镜像（已发布 vm_disk）
+                <select
+                  v-model="form.fallbackImageId"
+                  :disabled="!form.enabled || !form.fallbackEnabled"
+                  class="h-8 rounded-md border border-line bg-surface px-2.5 text-[12px] text-ink outline-none focus:border-accent disabled:opacity-50"
+                >
+                  <option value="">未选择</option>
+                  <option v-for="option in fallbackOptions" :key="option.id" :value="option.id">
+                    {{ option.label }}
+                  </option>
+                </select>
+              </label>
+            </div>
+            <p class="mt-1 text-[10px] text-faint">
+              保存时会自动把该镜像分配到本房间并创建 transfer；设备本地缓存的位置/清理策略由
+              agent 负责（见 docs/fallback-image.md）。
             </p>
           </div>
 

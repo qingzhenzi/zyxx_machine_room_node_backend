@@ -78,9 +78,16 @@ CREATE TABLE IF NOT EXISTS room_startup_profiles (
         "allow_same_room": false
       }
     }
-  ]
+  ],
+  "fallback_enabled": true,
+  "fallback_image_id": "9f1d0f9a-7c2e-4a51-9d1c-3b0f7a2a1c77"
 }
 ```
+
+`fallback_enabled` / `fallback_image_id` 是**可选**字段（缺省 `false` / `null`）：
+启用后 agent 把该镜像长期缓存在设备本地，控制面不可达时用本地缓存兜底；关闭时
+`/agent/startup` 不再下发 fallback 条目。旧 JSONB 配置无需迁移即可反序列化。
+语义、设备缓存职责与禁用方式见 [`fallback-image.md`](fallback-image.md)。
 
 `network` 是**可选**字段：缺省（字段不存在 / `null`）表示**不配网**，agent 不创建
 隔离桥、VM 也不挂网卡，与接入该字段之前的行为完全一致（旧 JSONB 配置无需迁移）。
@@ -111,6 +118,8 @@ CREATE TABLE IF NOT EXISTS room_startup_profiles (
 | `vms[].network.allow_same_room` | bool，缺省 false（同房间 VM 默认也互相隔离） |
 | 房间一致性 | 同一房间所有 VM 的 `network` 必须完全一致（共享一张房间桥），否则 400 |
 | `auto_pull` / `auto_start_vm` | bool，缺省 true |
+| `fallback_enabled` | bool，缺省 false；旧配置缺省即关闭（兼容） |
+| `fallback_image_id` | UUID 或 null；`fallback_enabled=true` 时必填；启用时与 `images[].image_id` 同等级校验（存在、published、manifest 完整），并自动补 `image_assignments` + download transfer |
 
 `base_volume` 缺省语义：若 `vms[].base_volume` 与 `base_path` 都为空，且 `images` 中恰好
 有一个 `kind=vm_disk` 的镜像，服务端不填；**agent 侧**按下式推导
@@ -202,7 +211,21 @@ CREATE TABLE IF NOT EXISTS room_startup_profiles (
       "presign_endpoint": "/resources/presign"
     }
   ],
-  "vms": [ "…同 §2 vms，base_volume 可为 null…" ]
+  "vms": [ "…同 §2 vms，base_volume 可为 null…" ],
+  "fallback_enabled": true,
+  "fallback_image": {
+    "image_id": "9f1d0f9a-7c2e-4a51-9d1c-3b0f7a2a1c77",
+    "transfer_id": "a105a24f-cc3e-48dc-ad37-2c3368a36829",
+    "name": "win10-fallback",
+    "version": "1.0.0",
+    "kind": "vm_disk",
+    "format": "qcow2",
+    "platform": "windows/amd64",
+    "manifest_digest": "sha256:...",
+    "total_size": 5960000000,
+    "chunk_count": 91,
+    "presign_endpoint": "/resources/presign"
+  }
 }
 ```
 
@@ -213,6 +236,12 @@ CREATE TABLE IF NOT EXISTS room_startup_profiles (
 * 字段名与 `image.pull` payload 保持一致（`name/version/kind/format/platform/
   manifest_digest/total_size/chunk_count/presign_endpoint`），agent 可直接转成
   `image.pull` payload 复用现有 `ImagePullJob`。
+* `fallback_enabled` / `fallback_image`：房间启动配置里的 fallback 镜像（可选）。
+  条目形状与 `images[]` 完全相同，agent 可复用同一 `ImagePullJob` 拉取并缓存到设备
+  本地；`fallback_enabled=false`（缺省）时 `fallback_image` 恒为 `null`，不下发条目。
+  启用但镜像已下架/删除时 `fallback_enabled=true` + `fallback_image=null`，agent 应
+  告警并保留本地旧缓存。旧 agent 会忽略这两个新字段（serde 向后兼容）。
+  详见 [`fallback-image.md`](fallback-image.md)。
 
 ### 4.2 下行 `startup.update`（device_downlink kind）
 
@@ -285,7 +314,14 @@ reconcile 本身幂等，重复/漏收都由周期 reconcile 兜底）。
 }
 ```
 
-6. 日志：`startup 拉取成功 revision=…`、`镜像已存在，跳过 name=…`、
+   fallback 镜像接入后，建议在 state 中追加
+   `"fallback": { "image_id": "...", "manifest_digest": "sha256:...", "local_volume": "..." }`；
+6. **fallback 镜像（服务端已下发，agent 侧接入待实现）**：`fallback_enabled && auto_pull`
+   时用 §4.1 的 `fallback_image` 条目按普通镜像链路拉取并校验，缓存到设备持久目录
+   （建议 `<data_dir>/fallback/`），供 `qe-local-fallback` 离线兜底使用；
+   `fallback_enabled=false` 时停止下载/更新（本地缓存不远程删除）。见
+   [`fallback-image.md`](fallback-image.md) §5。
+7. 日志：`startup 拉取成功 revision=…`、`镜像已存在，跳过 name=…`、
    `开始拉取镜像 name=…`、`startup 房间网络已 ensure room=… bridge=…`、
    `自动创建并启动 VM name=…`、`存量 VM 已接入隔离桥（hotplug）`、
    `VM 已在运行，跳过 name=…` 等，

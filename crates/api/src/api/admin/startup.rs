@@ -15,7 +15,11 @@
 //!   网段且至少 /30，allowlist 不允许 `0.0.0.0/0`、端口必须显式；同一房间的
 //!   所有 VM 共享一张房间桥，因此 `network` 配置必须完全一致；
 //! - 缺省 `network=null` = 不配网（旧配置语义不变）；
-//! - `auto_pull` / `auto_start_vm` 缺省 true。
+//! - `auto_pull` / `auto_start_vm` 缺省 true；
+//! - `fallback_enabled`（缺省 false）/ `fallback_image_id`：设备本地缓存的 fallback
+//!   镜像；启用时镜像必须与 `images[]` 同等级校验（published + manifest 完整），
+//!   并同样确保 transfer/assignment；`fallback_enabled=true` 时 id 必填。
+//!   详见 `docs/fallback-image.md`。
 //!
 //! 缺省值由 `qe_db::startup` 的 serde 默认值负责，因此落库与回显的配置总是完整形状。
 
@@ -94,6 +98,9 @@ pub struct StartupReply {
     /// 无配置行时为 null。
     pub updated_at: Option<String>,
     pub images: Vec<StartupImageReply>,
+    /// 配置里选中的 fallback 镜像（设备本地缓存用）；未选择 / 镜像已删除时为 null。
+    /// `config.fallback_enabled` 为 false 时仍可能回显已选镜像，便于管理端再次启用。
+    pub fallback_image: Option<StartupImageReply>,
     pub targets: Vec<StartupTargetReply>,
 }
 
@@ -150,6 +157,8 @@ pub async fn update(
             "revision": revision,
             "images": config.images.iter().map(|image| image.image_id).collect::<Vec<_>>(),
             "vms": config.vms.iter().map(|vm| &vm.name).collect::<Vec<_>>(),
+            "fallback_enabled": config.fallback_enabled,
+            "fallback_image_id": config.fallback_image_id,
         }),
         ip.as_deref(),
     )
@@ -211,11 +220,21 @@ fn validate_config(config: StartupConfig) -> AppResult<StartupConfig> {
         }
     }
 
+    // fallback 镜像：启用时必须选镜像；禁用时保留已选 id（便于再次启用），
+    // 但不做存在性校验，避免“镜像被删后连关闭都保存不了”。
+    if config.fallback_enabled && config.fallback_image_id.is_none() {
+        return Err(AppError::bad_request(
+            "config.fallback_image_id 启用 fallback 镜像时必须提供",
+        ));
+    }
+
     Ok(StartupConfig {
         auto_pull: config.auto_pull,
         auto_start_vm: config.auto_start_vm,
         images,
         vms,
+        fallback_enabled: config.fallback_enabled,
+        fallback_image_id: config.fallback_image_id,
     })
 }
 
@@ -542,32 +561,44 @@ fn check_count(value: u32, field: &str, range: (u64, u64)) -> AppResult<u32> {
 }
 
 /// 校验配置引用的镜像都存在、`published` 且 manifest 完整（契约 §2 / §3.2 步骤 1）。
+///
+/// fallback 镜像与 `images[]` 同等级校验；仅在 `fallback_enabled=true` 时校验，
+/// 禁用状态允许保留已失效的 id（否则镜像下架后无法保存“关闭”）。
 async fn validate_published_images(state: &AppState, config: &StartupConfig) -> AppResult<()> {
     for (index, image) in config.images.iter().enumerate() {
         let field = format!("config.images[{index}].image_id");
-        let artifact = state
-            .storage_repo
-            .get_image(image.image_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::bad_request(format!("{field} 引用的镜像不存在（{}）", image.image_id))
-            })?;
-        if artifact.status != ArtifactStatus::Published {
-            return Err(AppError::bad_request(format!(
-                "{field} 引用的镜像未发布（status={}，需为 published）",
-                artifact.status
-            )));
-        }
-        let manifest_ok = artifact
-            .manifest_digest
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|digest| !digest.is_empty());
-        if !manifest_ok {
-            return Err(AppError::bad_request(format!(
-                "{field} 引用的镜像缺少 manifest_digest"
-            )));
-        }
+        validate_published_image(state, image.image_id, &field).await?;
+    }
+    if config.fallback_enabled
+        && let Some(fallback_image_id) = config.fallback_image_id
+    {
+        validate_published_image(state, fallback_image_id, "config.fallback_image_id").await?;
+    }
+    Ok(())
+}
+
+/// 单个镜像的发布状态校验；错误信息使用调用方给的字段路径。
+async fn validate_published_image(state: &AppState, image_id: Uuid, field: &str) -> AppResult<()> {
+    let artifact = state
+        .storage_repo
+        .get_image(image_id)
+        .await?
+        .ok_or_else(|| AppError::bad_request(format!("{field} 引用的镜像不存在（{image_id}）")))?;
+    if artifact.status != ArtifactStatus::Published {
+        return Err(AppError::bad_request(format!(
+            "{field} 引用的镜像未发布（status={}，需为 published）",
+            artifact.status
+        )));
+    }
+    let manifest_ok = artifact
+        .manifest_digest
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|digest| !digest.is_empty());
+    if !manifest_ok {
+        return Err(AppError::bad_request(format!(
+            "{field} 引用的镜像缺少 manifest_digest"
+        )));
     }
     Ok(())
 }
@@ -589,6 +620,13 @@ async fn build_reply(
     };
 
     let images = load_images(state, room_id, &config).await?;
+    // 禁用时也回显已选 fallback 镜像（若仍可用），便于管理端展示当前选择。
+    let fallback_image = match config.fallback_image_id {
+        Some(image_id) => {
+            load_image_reply(state, room_id, image_id, "config.fallback_image_id").await?
+        }
+        None => None,
+    };
     let targets = load_targets(state, room_id).await?;
 
     Ok(StartupReply {
@@ -598,6 +636,7 @@ async fn build_reply(
         config,
         updated_at,
         images,
+        fallback_image,
         targets,
     })
 }
@@ -610,32 +649,47 @@ async fn load_images(
 ) -> AppResult<Vec<StartupImageReply>> {
     let mut images = Vec::with_capacity(config.images.len());
     for image in &config.images {
-        let Some(artifact) = state.storage_repo.get_image(image.image_id).await? else {
-            tracing::warn!(
-                %room_id,
-                image_id = %image.image_id,
-                "启动配置引用的镜像已不存在，响应中跳过"
-            );
-            continue;
-        };
-        let transfer_id = state
-            .startup
-            .latest_download_transfer_id(room_id, artifact.id)
-            .await?;
-        let assigned = state.startup.is_assigned(room_id, artifact.id).await?;
-        images.push(StartupImageReply {
-            image_id: artifact.id,
-            name: artifact.name,
-            version: artifact.version,
-            kind: artifact.kind.as_str().to_owned(),
-            status: artifact.status.as_str().to_owned(),
-            manifest_digest: artifact.manifest_digest,
-            total_size: artifact.total_size,
-            transfer_id,
-            assigned,
-        });
+        if let Some(reply) =
+            load_image_reply(state, room_id, image.image_id, "config.images").await?
+        {
+            images.push(reply);
+        }
     }
     Ok(images)
+}
+
+/// 回查单个镜像并拼出摘要；镜像不存在时 warn 并返回 `None`。
+async fn load_image_reply(
+    state: &AppState,
+    room_id: Uuid,
+    image_id: Uuid,
+    field: &str,
+) -> AppResult<Option<StartupImageReply>> {
+    let Some(artifact) = state.storage_repo.get_image(image_id).await? else {
+        tracing::warn!(
+            %room_id,
+            %image_id,
+            field,
+            "启动配置引用的镜像已不存在，响应中跳过"
+        );
+        return Ok(None);
+    };
+    let transfer_id = state
+        .startup
+        .latest_download_transfer_id(room_id, artifact.id)
+        .await?;
+    let assigned = state.startup.is_assigned(room_id, artifact.id).await?;
+    Ok(Some(StartupImageReply {
+        image_id: artifact.id,
+        name: artifact.name,
+        version: artifact.version,
+        kind: artifact.kind.as_str().to_owned(),
+        status: artifact.status.as_str().to_owned(),
+        manifest_digest: artifact.manifest_digest,
+        total_size: artifact.total_size,
+        transfer_id,
+        assigned,
+    }))
 }
 
 /// 目标设备：房间主设备槽位（`rooms.device_slot`）+ `room_devices` 子机。
@@ -1063,6 +1117,7 @@ mod tests {
                 transfer_id: Some(transfer_id),
                 assigned: true,
             }],
+            fallback_image: None,
             targets: vec![StartupTargetReply {
                 device_slot: "dev-b104".to_owned(),
                 serial: Some("0638".to_owned()),
@@ -1088,12 +1143,113 @@ mod tests {
             config: StartupConfig::default(),
             updated_at: None,
             images: Vec::new(),
+            fallback_image: None,
             targets: Vec::new(),
         };
         let value = serde_json::to_value(&empty).expect("serialize");
         assert!(value["updated_at"].is_null());
         assert_eq!(value["revision"], json!(0));
         assert_eq!(value["enabled"], json!(false));
+    }
+
+    #[test]
+    fn validate_config_requires_fallback_image_when_enabled() {
+        // 启用 fallback 但未选镜像 → 400（纯函数校验，不查库）。
+        let error = validate_config(config_from_json(serde_json::json!({
+            "fallback_enabled": true
+        })))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("config.fallback_image_id"),
+            "error={error}"
+        );
+
+        // 启用且给了 id → 通过（存在性由 validate_published_images 查库校验）。
+        let image_id = Uuid::new_v4();
+        let config = validate_config(config_from_json(serde_json::json!({
+            "fallback_enabled": true,
+            "fallback_image_id": image_id
+        })))
+        .expect("valid");
+        assert!(config.fallback_enabled);
+        assert_eq!(config.fallback_image_id, Some(image_id));
+
+        // 禁用时允许不选；也允许保留已选 id（便于再次启用）。
+        let config = validate_config(config_from_json(serde_json::json!({
+            "fallback_enabled": false
+        })))
+        .expect("valid");
+        assert!(!config.fallback_enabled);
+        assert_eq!(config.fallback_image_id, None);
+
+        let config = validate_config(config_from_json(serde_json::json!({
+            "fallback_enabled": false,
+            "fallback_image_id": image_id
+        })))
+        .expect("valid");
+        assert!(!config.fallback_enabled);
+        assert_eq!(config.fallback_image_id, Some(image_id));
+    }
+
+    #[test]
+    fn reply_serializes_fallback_fields() {
+        let fallback_id = Uuid::new_v4();
+        let config = config_from_json(serde_json::json!({
+            "fallback_enabled": true,
+            "fallback_image_id": fallback_id
+        }));
+        assert!(config.fallback_enabled);
+        assert_eq!(config.fallback_image_id, Some(fallback_id));
+
+        let reply = StartupReply {
+            room_id: Uuid::nil(),
+            enabled: true,
+            revision: 1,
+            config,
+            updated_at: None,
+            images: Vec::new(),
+            fallback_image: Some(StartupImageReply {
+                image_id: fallback_id,
+                name: "win10-fallback".to_owned(),
+                version: "1.0.0".to_owned(),
+                kind: "vm_disk".to_owned(),
+                status: "published".to_owned(),
+                manifest_digest: Some("sha256:def".to_owned()),
+                total_size: 1024,
+                transfer_id: None,
+                assigned: true,
+            }),
+            targets: Vec::new(),
+        };
+        let value = serde_json::to_value(&reply).expect("serialize");
+        assert_eq!(value["config"]["fallback_enabled"], serde_json::json!(true));
+        assert_eq!(
+            value["config"]["fallback_image_id"],
+            serde_json::json!(fallback_id)
+        );
+        assert_eq!(
+            value["fallback_image"]["image_id"],
+            serde_json::json!(fallback_id)
+        );
+        assert_eq!(value["fallback_image"]["assigned"], serde_json::json!(true));
+
+        // 未选择 fallback 时明确回显 null（前端据此展示“未启用/未选择”）。
+        let empty = StartupReply {
+            room_id: Uuid::nil(),
+            enabled: false,
+            revision: 0,
+            config: StartupConfig::default(),
+            updated_at: None,
+            images: Vec::new(),
+            fallback_image: None,
+            targets: Vec::new(),
+        };
+        let value = serde_json::to_value(&empty).expect("serialize");
+        assert!(value["fallback_image"].is_null());
+        assert_eq!(
+            value["config"]["fallback_enabled"],
+            serde_json::json!(false)
+        );
     }
 
     #[test]
@@ -1104,6 +1260,8 @@ mod tests {
             auto_start_vm: true,
             images: vec![StartupImageRef { image_id }],
             vms: Vec::new(),
+            fallback_enabled: false,
+            fallback_image_id: None,
         };
         let value = serde_json::to_value(&config).expect("serialize");
         assert_eq!(value["images"][0]["image_id"], json!(image_id));

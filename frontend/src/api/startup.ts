@@ -47,6 +47,14 @@ export interface RoomStartupConfig {
   auto_start_vm: boolean
   images: RoomStartupImageRef[]
   vms: RoomStartupVm[]
+  /**
+   * fallback 镜像开关：启用后 agent 把该镜像长期缓存在设备本地，
+   * 控制面不可达时用本地缓存兜底（见 docs/fallback-image.md）。
+   * 旧配置缺省 false。
+   */
+  fallback_enabled: boolean
+  /** fallback 镜像 id；`fallback_enabled=true` 时必填。 */
+  fallback_image_id?: string | null
 }
 
 /** 管理端读取启动配置时回查出的镜像信息；`assigned` 表示已分配到该房间（预签名授权前提）。 */
@@ -75,6 +83,8 @@ export interface RoomStartupProfile {
   config: RoomStartupConfig
   updated_at?: string | null
   images: RoomStartupImageInfo[]
+  /** 配置里选中的 fallback 镜像（未选择 / 镜像已删除时为 null）。 */
+  fallback_image?: RoomStartupImageInfo | null
   targets: RoomStartupTarget[]
 }
 

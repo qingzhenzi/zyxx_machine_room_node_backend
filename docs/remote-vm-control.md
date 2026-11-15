@@ -175,6 +175,9 @@ agent 启动 / 收到 startup.update / 周期触发
   `revision=0, enabled=false`；`images[]` 只含已发布且 manifest 完整的镜像，字段名与
   `image.pull` payload 一致；`vms[]` 原样透传（`base_volume` 可为 null，由 agent 推导
   `<image.name>-<image.version>`）。
+- fallback 镜像：`config.fallback_enabled` / `config.fallback_image_id` 声明设备本地
+  缓存的兜底镜像（与正常镜像同级校验/分配；关闭时 `/agent/startup` 不下发）。语义与
+  禁用方式见 [`fallback-image.md`](fallback-image.md)。
 - 已知边界：启动配置只声明「确保存在 + 启动」，agent 绝不 delete/shutdown；镜像或底包
   缺失时该轮跳过并告警，下轮 reconcile 重试。
 

@@ -63,6 +63,16 @@ pub struct StartupConfig {
     /// 需要保证存在并自动启动的 VM（0..=32 个）。
     #[serde(default)]
     pub vms: Vec<StartupVm>,
+    /// 是否启用「fallback 镜像」：设备把该镜像长期缓存在本地，控制面不可达时
+    /// 用本地缓存兜底（契约见 `docs/fallback-image.md`；旧配置缺省 false）。
+    #[serde(default)]
+    pub fallback_enabled: bool,
+    /// fallback 镜像 id；`fallback_enabled=true` 时必填（API 校验），否则可为 null。
+    ///
+    /// 与 `images[]` 同等级：同样要求 published + manifest 完整，并确保
+    /// transfer/assignment；但它单独标记、单独下发，不挤占 `images` 的 8 个名额。
+    #[serde(default)]
+    pub fallback_image_id: Option<Uuid>,
 }
 
 impl Default for StartupConfig {
@@ -72,6 +82,8 @@ impl Default for StartupConfig {
             auto_start_vm: true,
             images: Vec::new(),
             vms: Vec::new(),
+            fallback_enabled: false,
+            fallback_image_id: None,
         }
     }
 }
@@ -250,13 +262,16 @@ impl RoomStartupRepo {
 
     /// 写入（或整体替换）房间启动配置：首次 `revision = 1`，之后 `revision + 1`。
     ///
-    /// 同一事务内为每个引用镜像补齐：
+    /// 同一事务内为每个引用镜像（`images[]` + 启用时的 `fallback_image_id`）补齐：
     /// 1. 一条 `transfers(direction='download', status='pending')`（已有 download transfer
     ///    时复用最新一条，不新建），供 agent 上报 transfer 进度；
     /// 2. 一条 `image_assignments(room_id, image_id)` 幂等 upsert（`channel='prod'`），
     ///    供 device-pki `/resources/presign` 的 `authorize_image` 放行——否则自动拉镜像
     ///    会在预签名阶段 403（镜像未分配到设备所在房间）。已存在的分配不覆盖 channel，
     ///    只刷新 `rollout_state='pending'` / `assigned_by` / `updated_at`。
+    ///
+    /// fallback 镜像只在 `fallback_enabled=true` 且给了 id 时补齐；禁用状态保留 id
+    /// 但不产生新的 transfer/assignment（避免“关闭后仍自动拉镜像”）。
     ///
     /// 调用方需先确认房间存在（否则外键错误会变成 400）。
     pub async fn upsert(
@@ -290,37 +305,12 @@ impl RoomStartupRepo {
             .await?;
 
         for image in &config.images {
-            sqlx::query(
-                "INSERT INTO transfers (direction, room_id, image_id, manifest_digest, status, progress)
-                 SELECT 'download', $1, $2,
-                        (SELECT manifest_digest FROM image_artifacts WHERE id = $2),
-                        'pending', 0
-                  WHERE NOT EXISTS (
-                      SELECT 1 FROM transfers
-                       WHERE room_id = $1 AND image_id = $2 AND direction = 'download'
-                  )",
-            )
-            .bind(room_id)
-            .bind(image.image_id)
-            .execute(&mut *tx)
-            .await?;
-
-            // presign 授权（device-pki resource::authorize_image）依赖这张表；
-            // 与 assign_room 相同的幂等 upsert。已存在的分配保留原 channel。
-            sqlx::query(
-                "INSERT INTO image_assignments
-                     (image_id, room_id, channel, rollout_state, assigned_by, assigned_at, updated_at)
-                 VALUES ($2, $1, 'prod', 'pending', $3, now(), now())
-                 ON CONFLICT (room_id, image_id) DO UPDATE
-                    SET rollout_state = 'pending',
-                        assigned_by = EXCLUDED.assigned_by,
-                        updated_at = now()",
-            )
-            .bind(room_id)
-            .bind(image.image_id)
-            .bind(actor)
-            .execute(&mut *tx)
-            .await?;
+            ensure_image_ready(&mut tx, room_id, image.image_id, actor).await?;
+        }
+        if config.fallback_enabled
+            && let Some(fallback_image_id) = config.fallback_image_id
+        {
+            ensure_image_ready(&mut tx, room_id, fallback_image_id, actor).await?;
         }
 
         tx.commit().await?;
@@ -364,6 +354,52 @@ impl RoomStartupRepo {
     }
 }
 
+/// 为房间 + 镜像补齐 download transfer 与 image assignment（幂等，事务内调用）。
+///
+/// 两条记录缺一不可：
+/// - `transfers`：agent 上报 `transfer.progress/completed` 的关联对象；
+/// - `image_assignments`：device-pki `/resources/presign` 的 `authorize_image`
+///   只放行「已分配到设备所在房间」的镜像，缺它会在预签名阶段 403。
+async fn ensure_image_ready(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    room_id: Uuid,
+    image_id: Uuid,
+    actor: Uuid,
+) -> DbResult<()> {
+    sqlx::query(
+        "INSERT INTO transfers (direction, room_id, image_id, manifest_digest, status, progress)
+         SELECT 'download', $1, $2,
+                (SELECT manifest_digest FROM image_artifacts WHERE id = $2),
+                'pending', 0
+          WHERE NOT EXISTS (
+              SELECT 1 FROM transfers
+               WHERE room_id = $1 AND image_id = $2 AND direction = 'download'
+          )",
+    )
+    .bind(room_id)
+    .bind(image_id)
+    .execute(&mut **tx)
+    .await?;
+
+    // presign 授权（device-pki resource::authorize_image）依赖这张表；
+    // 与 assign_room 相同的幂等 upsert。已存在的分配保留原 channel。
+    sqlx::query(
+        "INSERT INTO image_assignments
+             (image_id, room_id, channel, rollout_state, assigned_by, assigned_at, updated_at)
+         VALUES ($2, $1, 'prod', 'pending', $3, now(), now())
+         ON CONFLICT (room_id, image_id) DO UPDATE
+            SET rollout_state = 'pending',
+                assigned_by = EXCLUDED.assigned_by,
+                updated_at = now()",
+    )
+    .bind(room_id)
+    .bind(image_id)
+    .bind(actor)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +419,8 @@ mod tests {
                 "auto_start_vm": true,
                 "images": [],
                 "vms": [],
+                "fallback_enabled": false,
+                "fallback_image_id": null,
             })
         );
     }
@@ -594,6 +632,44 @@ mod tests {
             updated_at: Utc::now(),
         };
         assert!(matches!(row.into_domain(), Err(DbError::Internal(_))));
+    }
+
+    #[test]
+    fn legacy_config_without_fallback_fields_still_parses() {
+        // 0035 时代的旧 JSONB 没有 fallback 字段：反序列化必须不崩且默认关闭。
+        let old = serde_json::json!({
+            "auto_pull": true,
+            "auto_start_vm": true,
+            "images": [{ "image_id": "204cb75d-ac1b-4492-b8b3-808d2270070b" }],
+            "vms": [{ "name": "lab-1" }]
+        });
+        let config: StartupConfig = serde_json::from_value(old).expect("legacy config");
+        assert!(!config.fallback_enabled);
+        assert_eq!(config.fallback_image_id, None);
+        assert_eq!(config.images.len(), 1);
+        assert_eq!(config.vms.len(), 1);
+
+        // 反序列化后再序列化会补齐 fallback 字段，旧行读一次写回即完成形状升级。
+        let value = serde_json::to_value(&config).expect("serialize");
+        assert_eq!(value["fallback_enabled"], serde_json::json!(false));
+        assert!(value["fallback_image_id"].is_null());
+    }
+
+    #[test]
+    fn fallback_fields_roundtrip() {
+        let image_id = Uuid::new_v4();
+        let config: StartupConfig = serde_json::from_value(serde_json::json!({
+            "fallback_enabled": true,
+            "fallback_image_id": image_id,
+            "images": [],
+            "vms": []
+        }))
+        .expect("parse");
+        assert!(config.fallback_enabled);
+        assert_eq!(config.fallback_image_id, Some(image_id));
+        let value = serde_json::to_value(&config).expect("serialize");
+        assert_eq!(value["fallback_enabled"], serde_json::json!(true));
+        assert_eq!(value["fallback_image_id"], serde_json::json!(image_id));
     }
 
     #[test]
