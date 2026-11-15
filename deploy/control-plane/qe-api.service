@@ -1,0 +1,15 @@
+[Unit]
+Description=QEStudio control API
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/qingzhenzi/Projects/QEStudio/room_node
+EnvironmentFile=/home/qingzhenzi/Projects/QEStudio/room_node/.env
+ExecStart=/home/qingzhenzi/Projects/QEStudio/room_node/target/debug/qe-api
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=QEStudio device PKI (enroll + mTLS)
+After=network-online.target qe-api.service
+Wants=network-online.target
+Requires=qe-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/qingzhenzi/Projects/QEStudio/room_node
+EnvironmentFile=/etc/qe-control-device-pki.env
+ExecStart=/home/qingzhenzi/Projects/QEStudio/room_node/target/debug/qe-device-pki
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
