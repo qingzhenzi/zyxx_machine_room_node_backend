@@ -373,3 +373,56 @@ Video Decode / Video Processing / 3D 可见
 因此 QuickSync 硬件编码路径已具备；下一步是首次打开 `https://localhost:47990/welcome`
 设置 Sunshine 用户名/密码，配置 encoder = QuickSync，再用 Moonlight 1080p60 实测。
 当前未配置 Sunshine 凭据/串流参数，不能宣称已通过 QSV 串流验收。
+
+## 12. Sunshine 配对 / Moonlight 1080p60 实测与 QSV 限制
+
+### 12.1 已完成
+
+- Sunshine 首次凭据已通过 `/welcome` 设置（演示账号 `qe / QeStudio2026`）；
+- Moonlight 6.2.0 与 Sunshine 配对成功；
+- Moonlight `list` 能看到 `Desktop` / `Steam Big Picture`；
+- 实际串流参数：
+
+```text
+1920x1080x60
+Video bitrate 20000 kbps
+Video port 47998
+```
+
+- Moonlight 端日志确认 1080p60 流建立，并选择 VAAPI 硬件解码。
+
+### 12.2 QSV 未通过
+
+Sunshine 日志实测：
+
+```text
+Device Description : Microsoft Basic Render Driver
+Device Vendor ID   : 0x00001414
+Trying encoder [quicksync]
+Creating encoder [h264_qsv]
+Error: Failed to create encoder D3D11 device [0x887A0004]
+Encoder [quicksync] failed
+Found H.264 encoder: libx264 [software]
+```
+
+即当前串流实际是 **软件 x264**，不是 QuickSync。
+
+尝试过：
+
+1. 在 Sunshine 配置里设置 `adapter_name = Intel(R) UHD Graphics 770` 并 Apply；
+2. 停止 `SunshineService`，改为用户会话启动（离线 RunOnce）：
+   - 用户会话下变成 `Failed to locate an output device`；
+   - Web UI 资源路径也不完整；
+3. 已恢复 `SunshineService` 服务模式（可用软件编码串流）。
+
+### 12.3 根因/下一步
+
+Intel VF 已绑定驱动，但 **没有真实/虚拟显示输出**；Sunshine 在服务会话里只能拿到
+Microsoft Basic Render Driver（WARP），`h264_qsv` 的 D3D11 设备创建失败。
+QSV 需要 Intel 适配器拥有可用 display/output。
+
+下一步（赛后/维护窗口）：
+
+- 给 Intel VF 增加虚拟显示（Virtual Display Driver/IddSampleDriver），或
+- 把 VF 作为主 GPU + Intel GOP ROM（runbook §7），并处理 UEFI/BIOS；
+- 验证通过前，1080p60 串流可用但走软件 x264。
